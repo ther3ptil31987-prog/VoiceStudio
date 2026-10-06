@@ -8,6 +8,14 @@ metadata and the backend fallback mirror it.
 
 ## [Unreleased]
 
+**Highlights**
+
+- MCP speech tools stay connected through cold starts and slow, progressing renders (#2612)
+
+### Fixed
+
+- MCP speech tools wait through model loading and progress-extended CPU renders instead of timing out before the backend (#2609)
+
 ## [0.5.7] — 2026-10-05
 
 **VoiceStudio now runs on PCs without a GPU and recovers instead of giving up.** Voice cloning uses the speech-to-text model you installed from Model Catalogue, GPU-less computers get the small CPU PyTorch build, and slow or busy backends are no longer reported as failed.
