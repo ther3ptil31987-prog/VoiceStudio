@@ -59,6 +59,14 @@ TTS, fitting, mixing and export. Electron reuses Tauri's speaker binding and
 segment generation helpers. A stream close without a terminal event is a failure,
 not success. Cancellation aborts the HTTP stream and requests backend task/job
 cancellation. Edits, target language, track metadata and task IDs persist locally across reloads.
+A generation publishes its track only once it finishes: cancelling it, or importing or
+re-transcribing subtitles while it runs, keeps the previous track (the latter asks for a new
+generation). Fresh segment speech enters the cache behind segment previews and partial
+regeneration only when its track is published, together with its fingerprint; a new track starts
+without the previous track's QC marks, and a dub that finishes as cancellation arrives reports
+done. Subtitles imported, or a dub published, during transcription replace its result, and
+imported cues keep their matched voice references: each transcription writes its references to
+its own folder.
 Interrupted preparation/generation offers Resume, which reads the existing task
 and replays its stream; generation is never resubmitted just because the UI reloaded.
 Interrupted transcription offers an explicit Retry against the existing prepared
