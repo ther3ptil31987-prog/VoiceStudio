@@ -411,7 +411,8 @@
     "addHfToken": "Hugging Face belirteci ekle",
     "gatedAccessReady": "Erişim hazır. Bu model artık kurulabilir.",
     "gatedAccessStillRequired": "Erişim veya jeton hâlâ eksik. Adımları tamamlayıp tekrar kontrol edin.",
-    "checkAccess": "Erişimi kontrol edin"
+    "checkAccess": "Erişimi kontrol edin",
+    "mirrorGatedAccess": "Bu modelin erişimi kısıtlıdır ve aynalar Hugging Face belirtecinizi asla almaz. Ayna ayarlarında Hugging Face (official) seçeneğine geçin ve yeniden deneyin."
   },
   "transcriptions": {
     "mode_label": "Transkripsiyon kalitesi",

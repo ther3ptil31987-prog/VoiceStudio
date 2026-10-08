@@ -411,7 +411,8 @@
     "addHfToken": "Lägg till Hugging Face-token",
     "gatedAccessReady": "Tillgången är klar. Denna modell kan nu installeras.",
     "gatedAccessStillRequired": "Åtkomst eller en token saknas fortfarande. Slutför stegen och kontrollera sedan igen.",
-    "checkAccess": "Kontrollera åtkomst"
+    "checkAccess": "Kontrollera åtkomst",
+    "mirrorGatedAccess": "Den här modellen har begränsad åtkomst och speglar får aldrig din Hugging Face-token. Byt till Hugging Face (official) i spegelinställningarna och försök igen."
   },
   "transcriptions": {
     "mode_label": "Transkriptionskvalitet",

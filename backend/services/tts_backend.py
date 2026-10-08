@@ -816,8 +816,13 @@ def _reference_duration_cached(path: str, _mtime_ns: int, _size: int) -> Optiona
     except Exception:  # noqa: BLE001 — fall through to ffmpeg
         pass
     try:
+        from core.url_safety import is_manifest_file
         from pydub import AudioSegment
 
+        # pydub's ffmpeg call cannot take input options, so a playlist named
+        # like audio is refused here rather than given to ffmpeg to follow.
+        if is_manifest_file(path):
+            return None
         return float(AudioSegment.from_file(path).duration_seconds)
     except Exception:  # noqa: BLE001 — unknown length: callers keep old behavior
         return None
@@ -1078,8 +1083,11 @@ def _read_reference_mono(path: str):
     if audio is None:
         try:
             import numpy as np
+            from core.url_safety import is_manifest_file
             from pydub import AudioSegment
 
+            if is_manifest_file(path):  # never hand a playlist to ffmpeg
+                return None
             segment = AudioSegment.from_file(path)
             sr = int(segment.frame_rate)
             samples = np.array(segment.get_array_of_samples(), dtype=np.float32)

@@ -411,7 +411,8 @@
     "addHfToken": "添加Hugging Face代幣",
     "gatedAccessReady": "存取權限已就緒，現在可以安裝此模型。",
     "gatedAccessStillRequired": "仍缺少存取權限或權杖。請完成步驟後重新檢查。",
-    "checkAccess": "檢查存取權限"
+    "checkAccess": "檢查存取權限",
+    "mirrorGatedAccess": "此模型需要授權存取，而鏡像絕不會收到你的 Hugging Face 權杖。請在鏡像設定中切換為 Hugging Face (official)，然後重試。"
   },
   "transcriptions": {
     "mode_label": "轉錄品質",

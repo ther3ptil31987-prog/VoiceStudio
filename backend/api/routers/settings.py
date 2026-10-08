@@ -21,6 +21,7 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from core.browser_guard import reject_cross_site_get
 from core.logging_utils import log_safe
 from core.nvidia_smi import find_nvidia_smi
 from core.engine_licenses import LICENSE_GATED_ENGINES
@@ -79,7 +80,7 @@ def clear_hf_token(also_clear_hf_cli: bool = Query(False)):
     return _state_response()
 
 
-@router.get("/hf-token/state")
+@router.get("/hf-token/state", dependencies=[Depends(reject_cross_site_get)])
 def get_hf_token_state(fresh: bool = Query(False)):
     """3-source HF token cascade state for the Settings UI.
 
@@ -230,7 +231,8 @@ def _offload_after_generation_state() -> dict:
     }
 
 
-@router.get("/perf/offload-after-generation")
+# The device probe can start torch/GPU initialisation, so refuse cross-site loads.
+@router.get("/perf/offload-after-generation", dependencies=[Depends(reject_cross_site_get)])
 def get_offload_after_generation():
     """Whether the in-process TTS model moves to system RAM after generation."""
     return _offload_after_generation_state()
@@ -1104,7 +1106,7 @@ def set_models_dir(body: _ModelsDirBody):
 # router-level dep like every sibling.
 
 
-@router.get("/storage")
+@router.get("/storage", dependencies=[Depends(reject_cross_site_get)])
 async def get_storage_report(refresh: bool = Query(False)):
     """Disk + per-category storage usage for the Settings → Storage panel.
 
@@ -1209,6 +1211,37 @@ def _hf_mirror_state() -> dict:
     }
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _hf_mirror_url_problem(url: str) -> str | None:
+    """Why ``url`` cannot be a Hugging Face endpoint, or None when it can.
+
+    Requires a well-formed HTTPS origin (optionally with a path prefix) and no
+    embedded credentials, query or fragment. Plain HTTP is accepted only for a
+    loopback host, such as a local caching proxy.
+    """
+    from urllib.parse import urlsplit
+
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F or ch == "\\" for ch in url):
+        return "Mirror URL contains invalid characters"
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        parsed.port  # raises ValueError on a malformed port
+    except ValueError:
+        return "Mirror URL is not a valid URL"
+    if parsed.scheme not in {"http", "https"} or not host:
+        return "Mirror URL must start with https://"
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return "Mirror URL must not contain a user name or password"
+    if parsed.query or parsed.fragment or url.endswith(("?", "#")):
+        return "Mirror URL must not contain a query or fragment"
+    if parsed.scheme == "http" and host.lower() not in _LOOPBACK_HOSTS:
+        return "Mirror URL must use https://"
+    return None
+
+
 @router.get("/hf-mirror")
 def get_hf_mirror():
     return _hf_mirror_state()
@@ -1226,8 +1259,10 @@ def set_hf_mirror(body: _HFMirrorBody):
     # read as an explicit choice, so switching to Auto clears it (plus the
     # `hf_endpoint` pref fallback the download paths resolve).
     url = "" if mode == "auto" else (body.url or "").strip().rstrip("/")
-    if url and not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Mirror URL must start with http(s)://")
+    if url:
+        reason = _hf_mirror_url_problem(url)
+        if reason:
+            raise HTTPException(status_code=400, detail=reason)
     # Compare against the currently-persisted value (normalised the same way) so
     # a no-op save doesn't nag the user to restart. Only a real change to the
     # persisted endpoint can require a restart.
@@ -1240,6 +1275,9 @@ def set_hf_mirror(body: _HFMirrorBody):
         else:
             user_env.unset_user_env(_HF_ENDPOINT_ENV)
             os.environ.pop(_HF_ENDPOINT_ENV, None)
+        from services.hf_auth import apply_process_token_policy
+
+        apply_process_token_policy()
         from core import prefs
         if not url:
             # No endpoint anywhere: clearing to official (manual) or switching

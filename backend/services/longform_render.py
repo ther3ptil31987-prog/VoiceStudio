@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from services.ffmpeg_utils import local_inputs_only
+
 _BITRATE_RE = re.compile(r"^\d{2,3}k$")
 #: Default ceiling for the content-addressed chapter cache. Above this, the
 #: oldest cached chapter WAVs are evicted (LRU by mtime). Override via
@@ -625,11 +627,11 @@ def build_loudnorm_measure_cmd(ffmpeg: str, concat_list_path: str, filt: str) ->
     """Pure argv for the measure pass: decode the concat list, run the
     print_format=json loudnorm filter, discard audio to the portable null muxer.
     Input segment is byte-identical to build_render_cmd so measured == muxed."""
-    return [
+    return local_inputs_only([
         ffmpeg, "-y", "-hide_banner", "-loglevel", "info",
         "-f", "concat", "-safe", "0", "-i", str(concat_list_path),
         "-af", filt, "-f", "null", "-",
-    ]
+    ], tool="ffmpeg")
 
 
 # ── FFMETADATA ──────────────────────────────────────────────────────────────
@@ -759,7 +761,7 @@ def build_render_cmd(
         if embed_cover:
             cmd += ["-c:v", "copy"]
         cmd += ["-movflags", "+faststart", "-f", "mp4", str(out_path)]
-    return cmd
+    return local_inputs_only(cmd, tool="ffmpeg")
 
 
 # ── Render summary (what a finished render WAS) ─────────────────────────────

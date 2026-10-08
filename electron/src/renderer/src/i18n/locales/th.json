@@ -411,7 +411,8 @@
     "addHfToken": "เพิ่มโทเคน Hugging Face",
     "gatedAccessReady": "ยืนยันสิทธิ์เข้าถึงแล้ว สามารถติดตั้งโมเดลนี้ได้",
     "gatedAccessStillRequired": "ยังไม่มีสิทธิ์เข้าถึงหรือโทเคน โปรดทำตามขั้นตอนให้ครบแล้วตรวจสอบอีกครั้ง",
-    "checkAccess": "ตรวจสอบสิทธิ์เข้าถึง"
+    "checkAccess": "ตรวจสอบสิทธิ์เข้าถึง",
+    "mirrorGatedAccess": "โมเดลนี้จำกัดการเข้าถึง และมิเรอร์จะไม่ได้รับโทเค็น Hugging Face ของคุณ สลับไปที่ Hugging Face (official) ในการตั้งค่ามิเรอร์ แล้วลองอีกครั้ง"
   },
   "transcriptions": {
     "mode_label": "คุณภาพการถอดเสียง",

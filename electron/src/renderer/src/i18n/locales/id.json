@@ -411,7 +411,8 @@
     "addHfToken": "Tambahkan token Hugging Face",
     "gatedAccessReady": "Akses siap. Model ini sekarang dapat dipasang.",
     "gatedAccessStillRequired": "Akses atau token masih belum ada. Selesaikan langkahnya, lalu periksa lagi.",
-    "checkAccess": "Periksa akses"
+    "checkAccess": "Periksa akses",
+    "mirrorGatedAccess": "Model ini dibatasi aksesnya, dan mirror tidak pernah menerima token Hugging Face Anda. Beralih ke Hugging Face (official) di pengaturan mirror, lalu coba lagi."
   },
   "transcriptions": {
     "mode_label": "Kualitas transkripsi",

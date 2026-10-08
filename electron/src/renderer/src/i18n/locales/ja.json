@@ -411,7 +411,8 @@
     "addHfToken": "Hugging Faceトークンを追加",
     "gatedAccessReady": "アクセスが確認できました。モデルをインストールできます。",
     "gatedAccessStillRequired": "アクセス権またはトークンが不足しています。手順を完了して再確認してください。",
-    "checkAccess": "アクセスを確認"
+    "checkAccess": "アクセスを確認",
+    "mirrorGatedAccess": "このモデルはアクセス制限付きで、ミラーには Hugging Face トークンが送信されません。ミラー設定で Hugging Face (official) に切り替えてから再試行してください。"
   },
   "transcriptions": {
     "mode_label": "転写品質",

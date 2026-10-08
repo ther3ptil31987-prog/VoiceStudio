@@ -2271,6 +2271,9 @@ def _repair_model_cache(checkpoint: str, *, force: bool = False) -> bool:
         endpoint = os.environ.get("HF_ENDPOINT")
     if endpoint:
         dl_kwargs["endpoint"] = endpoint
+    from services.hf_auth import token_for_endpoint
+    if token_for_endpoint(endpoint, None) is False:
+        dl_kwargs["token"] = False  # a mirror never receives the HF token
     if force:
         # Replace present-but-corrupt blobs that resume would trust by size.
         dl_kwargs["force_download"] = True
@@ -2334,6 +2337,10 @@ def _repair_model_cache(checkpoint: str, *, force: bool = False) -> bool:
                             dl_kwargs["endpoint"] = new_ep
                         else:
                             dl_kwargs.pop("endpoint", None)
+                        if token_for_endpoint(new_ep, None) is False:
+                            dl_kwargs["token"] = False
+                        else:
+                            dl_kwargs.pop("token", None)
                         logger.info(
                             "Auto-repair of %s: endpoint failover — retrying on %s",
                             checkpoint, new_ep or "https://huggingface.co",
@@ -4446,7 +4453,8 @@ def get_diarization_pipeline(return_error: bool = False):
     resolved = token_resolver.resolve()
     # Access is checked during explicit installation. An already-installed
     # local bundle remains usable after a token expires or is removed.
-    hf_token = resolved.token if resolved else False
+    from services.hf_auth import token_for_endpoint
+    hf_token = token_for_endpoint(None, resolved.token) if resolved else False
     try:
         torch = _lazy_torch()
         _ensure_pyannote_hf_token_compat()  # #167: use_auth_token -> token

@@ -49,6 +49,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from services.model_manager import _gpu_pool, run_on_gpu_pool_guarded
 from core.http_headers import content_disposition
+from core.path_security import contained_join, upload_suffix
 from services.audio_io import OPUS_CODEC_ARGS, OPUS_SAMPLE_RATE
 
 logger = logging.getLogger("omnivoice.openai_compat")
@@ -701,9 +702,9 @@ async def create_speech(req: SpeechRequest):
         if row:
             from core.config import VOICES_DIR
             if row["is_locked"] and row["locked_audio_path"]:
-                kw["ref_audio"] = os.path.join(VOICES_DIR, row["locked_audio_path"])
+                kw["ref_audio"] = contained_join(VOICES_DIR, row["locked_audio_path"])
             elif row["ref_audio_path"]:
-                kw["ref_audio"] = os.path.join(VOICES_DIR, row["ref_audio_path"])
+                kw["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
             if row["ref_text"]:
                 kw["ref_text"] = row["ref_text"]
             if row["instruct"] and not instruct:
@@ -998,7 +999,8 @@ async def _transcribe_request(
         )
 
     # Write uploaded file to a temp location
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    # Content is probed by ffmpeg, so an unusable extension just gets ".wav".
+    suffix = upload_suffix(file.filename, ".wav") or ".wav"
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()

@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from core import voice_leases
 from core.db import db_conn
 from core.config import DUB_DIR, VOICES_DIR, dub_seg_path
+from core.path_security import contained_join
 from core.tasks import task_manager
 from schemas.requests import DubRequest
 from services.model_manager import _gpu_pool, run_on_gpu_pool_guarded
@@ -38,7 +39,7 @@ from services.fit_planner import FitParams, plan_fit
 from services.watermark import mark_synthetic
 from services.speaker_clone import auto_profile_id
 from services.segment_bundle import extract_segment_wavs
-from api.routers.dub_core import _get_job, _save_job
+from api.routers.dub_core import _get_job, _safe_lang_or_400, _save_job
 from services.dub_pipeline import (
     _dub_jobs_lock,
     publish_rendered_segments,
@@ -508,7 +509,7 @@ def _remote_voice(job: dict, profile_id: str | None, seg_id, voice_match: str,
         if row:
             seed = row["seed"]
             if row["is_locked"] and row["locked_audio_path"]:
-                ref_audio = os.path.join(VOICES_DIR, row["locked_audio_path"])
+                ref_audio = contained_join(VOICES_DIR, row["locked_audio_path"])
                 ref_text = row["ref_text"]
             elif row["instruct"] and not row["is_locked"]:
                 try:
@@ -517,7 +518,7 @@ def _remote_voice(job: dict, profile_id: str | None, seg_id, voice_match: str,
                     vd_states = None
                 instruct = heal_design_instruct(row["instruct"], vd_states)
             else:
-                ref_audio = os.path.join(VOICES_DIR, row["ref_audio_path"])
+                ref_audio = contained_join(VOICES_DIR, row["ref_audio_path"])
                 ref_text = row["ref_text"]
     return ref_audio, ref_text, single_use, instruct, seed
 
@@ -564,6 +565,10 @@ def _render_staging(job_id: str):
 @router.post("/dub/generate/{job_id}")
 async def dub_generate(job_id: str, req: DubRequest):
     """Adds a dub generation job to the async batch task pool."""
+    # The track language names files under the job dir (dubbed_{lang}.wav,
+    # seg_{lang}_{id}.wav), so reject anything that is not a plain code
+    # before the job is touched.
+    lang_code = _safe_lang_or_400(req.language_code or "und")
     job = _get_job(job_id)
     if not job:
         raise HTTPException(
@@ -631,10 +636,10 @@ async def dub_generate(job_id: str, req: DubRequest):
         all_segment_wavs = []
         sync_scores = []
 
-        # Track language for this run. Everything per-track — the per-segment
-        # WAV cache, fingerprints, seg_wav_kind — is keyed by it (P1.3) so a
+        # Track language for this run (`lang_code`, validated at the route
+        # entry). Everything per-track — the per-segment WAV cache,
+        # fingerprints, seg_wav_kind — is keyed by it (P1.3) so a
         # multi-language job's tracks can't cross-contaminate.
-        lang_code = req.language_code or "und"
 
         def _seg_lang_path(seg_key) -> str:
             # Per-language per-segment WAV: seg_{lang}_{id}.wav. Built through
@@ -1278,13 +1283,13 @@ async def dub_generate(job_id: str, req: DubRequest):
                     row = _profile_row_cache[profile_id]
                     if row:
                         if row["is_locked"] and row["locked_audio_path"]:
-                            ref_audio = os.path.join(VOICES_DIR, row["locked_audio_path"])
+                            ref_audio = contained_join(VOICES_DIR, row["locked_audio_path"])
                             ref_text = row["ref_text"]
                             used_seed = row["seed"]
                         elif row["instruct"] and not row["is_locked"]:
                             used_seed = row["seed"] 
                         else:
-                            ref_audio = os.path.join(VOICES_DIR, row["ref_audio_path"])
+                            ref_audio = contained_join(VOICES_DIR, row["ref_audio_path"])
                             ref_text = row["ref_text"]
                             used_seed = row["seed"]
                             
@@ -2253,10 +2258,10 @@ async def preview_segment(job_id: str, req: SegmentPreviewRequest):
                 ).fetchone()
             if row:
                 if row["is_locked"] and row["locked_audio_path"]:
-                    ref_audio = os.path.join(VOICES_DIR, row["locked_audio_path"])
+                    ref_audio = contained_join(VOICES_DIR, row["locked_audio_path"])
                     ref_text = row["ref_text"]
                 elif row["ref_audio_path"]:
-                    ref_audio = os.path.join(VOICES_DIR, row["ref_audio_path"])
+                    ref_audio = contained_join(VOICES_DIR, row["ref_audio_path"])
                     ref_text = row["ref_text"]
                 if not instruct_str and row["instruct"]:
                     instruct_str = row["instruct"]

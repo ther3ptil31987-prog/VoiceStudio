@@ -365,7 +365,12 @@ def recording_path(call_id: str) -> str | None:
 
     with db_conn() as conn:
         row = conn.execute("SELECT recording_path FROM call_sessions WHERE id=?", (call_id,)).fetchone()
-    path = row["recording_path"] if row else ""
+    from core.config import DATA_DIR
+    from core.path_security import contained_join
+
+    # Recordings are only ever written to DATA_DIR/calls (_write_recording);
+    # anything else in the row is not served or deleted.
+    path = contained_join(os.path.join(DATA_DIR, "calls"), row["recording_path"] if row else "")
     return path if path and os.path.isfile(path) else None
 
 

@@ -50,6 +50,7 @@ from services.ffmpeg_utils import (
     _spawn_with_retry,
     find_ffmpeg,
     find_ffprobe,
+    local_inputs_only,
     raise_for_audio_extract_failure,
     require_audio_stream,
     validate_media_source,
@@ -240,6 +241,14 @@ def discard_reference_run(run_dir: Optional[str], job: Optional[dict] = None) ->
     from core import voice_leases
 
     with _dub_jobs_lock:
+        # Never follow a link out of the job folder: neither the run folder
+        # nor its refs/ parent may be a symlink, and the run must resolve to a
+        # direct child of the real refs/ folder.
+        refs_dir = os.path.dirname(os.path.normpath(run_dir))
+        if os.path.islink(run_dir) or os.path.islink(refs_dir):
+            return
+        if os.path.dirname(os.path.realpath(run_dir)) != os.path.realpath(refs_dir):
+            return
         root = os.path.normcase(os.path.realpath(run_dir)) + os.sep
         if job is not None and any(p.startswith(root) for p in _job_reference_paths(job)):
             return
@@ -842,14 +851,14 @@ def _probe_codecs(path: str) -> tuple[str, str]:
         return ("", "")
     try:
         out = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            local_inputs_only([ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path], tool="ffprobe"),
             capture_output=True, text=True, timeout=10,
         )
         vcodec = (out.stdout or "").strip().lower()
         out = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            local_inputs_only([ffprobe, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path], tool="ffprobe"),
             capture_output=True, text=True, timeout=10,
         )
         acodec = (out.stdout or "").strip().lower()
@@ -892,9 +901,9 @@ def _ensure_browser_playable_mp4(video_path: str) -> str:
         pass
     else:
         rc = subprocess.run(
-            [ffmpeg_bin, "-y", "-i", video_path,
+            local_inputs_only([ffmpeg_bin, "-y", "-i", video_path,
              "-c:v", "copy", "-c:a", "copy",
-             "-movflags", "+faststart", target],
+             "-movflags", "+faststart", target], tool="ffmpeg"),
             capture_output=True,
         ).returncode
         if rc != 0 or not os.path.exists(target):
@@ -902,11 +911,11 @@ def _ensure_browser_playable_mp4(video_path: str) -> str:
     if rc != 0:
         # Full transcode — h264 baseline-ish + aac is the safe combo.
         rc = subprocess.run(
-            [ffmpeg_bin, "-y", "-i", video_path,
+            local_inputs_only([ffmpeg_bin, "-y", "-i", video_path,
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
              "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "192k",
-             "-movflags", "+faststart", target],
+             "-movflags", "+faststart", target], tool="ffmpeg"),
             capture_output=True,
         ).returncode
     if rc == 0 and os.path.exists(target) and target != video_path:
@@ -1147,6 +1156,16 @@ def yt_download_sync(
     """
     import glob
     import yt_dlp
+    from core.url_safety import (
+        check_public_url,
+        guard_outbound_connections,
+        harden_ytdlp_options,
+        ytdlp_url_guard_postprocessor,
+    )
+
+    # Every URL-import entry point validates first; re-check here so no caller
+    # can reach yt-dlp with an option-like or private-network "URL".
+    url = check_public_url(url)
     outtmpl = os.path.join(job_dir, "original.%(ext)s")
     # #1225: yt-dlp surfaces an OS write rejection as a bare
     # "Unable to download video: [Errno 22] Invalid argument" — no path, no
@@ -1235,7 +1254,10 @@ def yt_download_sync(
     client_idx = 0
     while True:
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Native downloaders only and no live streams: everything must
+            # connect through the guard above, never through ffmpeg.
+            with guard_outbound_connections(), yt_dlp.YoutubeDL(harden_ytdlp_options(ydl_opts)) as ydl:
+                ydl.add_post_processor(ytdlp_url_guard_postprocessor(), when="before_dl")
                 info = ydl.extract_info(url, download=True)
                 path = ydl.prepare_filename(info)
             break
@@ -1308,7 +1330,9 @@ def yt_download_sync(
                 "sleep_interval_subtitles": 1,
             }
             try:
-                with yt_dlp.YoutubeDL(sub_opts) as ydl_sub:
+                with guard_outbound_connections(), yt_dlp.YoutubeDL(
+                    harden_ytdlp_options(sub_opts, media=False)
+                ) as ydl_sub:
                     ydl_sub.extract_info(url, download=True)
             except Exception as e:
                 logger.warning(

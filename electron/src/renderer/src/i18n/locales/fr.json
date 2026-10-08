@@ -413,7 +413,8 @@
     "addHfToken": "Ajouter un jeton Hugging Face",
     "gatedAccessReady": "L'accès est prêt. Ce modèle peut maintenant être installé.",
     "gatedAccessStillRequired": "Il manque toujours un accès ou un jeton. Suivez les étapes, puis vérifiez à nouveau.",
-    "checkAccess": "Vérifier l'accès"
+    "checkAccess": "Vérifier l'accès",
+    "mirrorGatedAccess": "Ce modèle est à accès restreint et les miroirs ne reçoivent jamais votre jeton Hugging Face. Passez à Hugging Face (official) dans les paramètres du miroir, puis réessayez."
   },
   "transcriptions": {
     "mode_label": "Qualité des transcriptions",

@@ -413,7 +413,8 @@
     "addHfToken": "Agregar token Hugging Face",
     "gatedAccessReady": "El acceso está listo. Este modelo ya se puede instalar.",
     "gatedAccessStillRequired": "Aún falta el acceso o un token. Complete los pasos y luego verifique nuevamente.",
-    "checkAccess": "Comprobar acceso"
+    "checkAccess": "Comprobar acceso",
+    "mirrorGatedAccess": "Este modelo tiene acceso restringido y los mirrors nunca reciben tu token de Hugging Face. Cambia a Hugging Face (official) en la configuración del mirror y vuelve a intentarlo."
   },
   "transcriptions": {
     "mode_label": "Calidad de transcripción",

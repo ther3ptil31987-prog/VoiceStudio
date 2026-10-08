@@ -411,7 +411,8 @@
     "addHfToken": "Hugging Face-token toevoegen",
     "gatedAccessReady": "Toegang is klaar. Dit model kan nu worden geïnstalleerd.",
     "gatedAccessStillRequired": "Toegang of een token ontbreekt nog. Voltooi de stappen en controleer opnieuw.",
-    "checkAccess": "Toegang controleren"
+    "checkAccess": "Toegang controleren",
+    "mirrorGatedAccess": "Dit model is afgeschermd en mirrors ontvangen je Hugging Face-token nooit. Schakel in de mirror-instellingen over naar Hugging Face (official) en probeer het opnieuw."
   },
   "transcriptions": {
     "mode_label": "Transcriptiekwaliteit",

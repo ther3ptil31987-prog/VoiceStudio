@@ -26,8 +26,8 @@ from typing import Callable, Optional
 
 import httpx
 
-# Hosts the HF token may be sent to. Anything else (CDN) gets no auth header.
-_HF_AUTH_HOSTS = ("huggingface.co", "hf.co")
+from services.hf_auth import host_gets_auth as _host_gets_auth
+
 _DEFAULT_CONNECTIONS = 8
 _MIN_SEGMENT_BYTES = 4 * 1024 * 1024   # don't split below this — overhead > gain
 # Cap on a single segment. Progress is committed to the manifest only when a
@@ -43,11 +43,6 @@ _READ_CHUNK = 1024 * 1024
 
 class DownloadCancelled(Exception):
     """Raised when ``cancel_check()`` returns True mid-download."""
-
-
-def _host_gets_auth(url: str) -> bool:
-    host = (httpx.URL(url).host or "").lower()
-    return host in _HF_AUTH_HOSTS or host.endswith(".huggingface.co")
 
 
 def _auth_headers(url: str, token: Optional[str]) -> dict:

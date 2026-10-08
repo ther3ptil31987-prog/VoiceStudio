@@ -411,7 +411,8 @@
     "addHfToken": "Hugging Face टोकन जोड़ें",
     "gatedAccessReady": "पहुँच की पुष्टि हो गई है। अब यह मॉडल स्थापित किया जा सकता है।",
     "gatedAccessStillRequired": "पहुँच की अनुमति या टोकन अभी भी नहीं है। चरण पूरे करके फिर जाँचें।",
-    "checkAccess": "पहुँच जाँचें"
+    "checkAccess": "पहुँच जाँचें",
+    "mirrorGatedAccess": "यह मॉडल प्रतिबंधित है, और मिरर को आपका Hugging Face टोकन कभी नहीं मिलता। मिरर सेटिंग्स में Hugging Face (official) पर स्विच करें, फिर दोबारा प्रयास करें।"
   },
   "transcriptions": {
     "mode_label": "प्रतिलेखन गुणवत्ता",

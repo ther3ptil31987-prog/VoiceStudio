@@ -419,7 +419,8 @@
     "addHfToken": "إضافة رمز Hugging Face",
     "gatedAccessReady": "تم تأكيد الوصول. يمكنك الآن تثبيت هذا النموذج.",
     "gatedAccessStillRequired": "لا تزال صلاحية الوصول أو الرمز مفقودة. أكمل الخطوات ثم تحقق مجددًا.",
-    "checkAccess": "التحقق من الوصول"
+    "checkAccess": "التحقق من الوصول",
+    "mirrorGatedAccess": "هذا النموذج مقيّد الوصول، ولا تتلقى المرايا رمز Hugging Face الخاص بك أبدًا. انتقل إلى Hugging Face (official) في إعدادات المرآة، ثم أعد المحاولة."
   },
   "transcriptions": {
     "mode_label": "جودة النسخ",

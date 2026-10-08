@@ -82,6 +82,9 @@ def mm(monkeypatch):
     _mm._offload_timer.cancel()
 
 
+_GIB = 1024 ** 3
+
+
 @pytest.fixture
 def host(mm, monkeypatch):
     def _install(device: str, *, dedicated: bool = True, **kw) -> _FakeTTS:
@@ -89,6 +92,14 @@ def host(mm, monkeypatch):
         monkeypatch.setattr(mm, "model", fake, raising=False)
         monkeypatch.setattr(mm, "_has_dedicated_vram", lambda: dedicated)
         monkeypatch.setattr(mm, "get_best_device", lambda: device.split(":")[0])
+        # The fake host, not the machine running the tests, decides what CUDA
+        # reports: offload_tts_for_asr() skips the move when the real GPU has
+        # more than 8 GB free, so a roomy CUDA box would otherwise fail these
+        # tests. A fake CUDA host has tight VRAM (1 of 8 GB free).
+        torch = mm._lazy_torch()
+        on_cuda = device.startswith("cuda")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: on_cuda)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_a, **_k: (1 * _GIB, 8 * _GIB))
         return fake
 
     return _install

@@ -424,7 +424,8 @@
     "addHfToken": "添加Hugging Face代币",
     "gatedAccessReady": "访问权限已就绪，现在可以安装此模型。",
     "gatedAccessStillRequired": "仍缺少访问权限或令牌。请完成步骤后重新检查。",
-    "checkAccess": "检查访问权限"
+    "checkAccess": "检查访问权限",
+    "mirrorGatedAccess": "此模型需要授权访问，而镜像永远不会收到你的 Hugging Face 令牌。请在镜像设置中切换到 Hugging Face (official)，然后重试。"
   },
   "transcriptions": {
     "mode_label": "转录质量",

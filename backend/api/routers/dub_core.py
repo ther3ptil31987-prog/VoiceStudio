@@ -1,4 +1,5 @@
 import os
+import re
 import errno
 import uuid
 import asyncio
@@ -10,7 +11,7 @@ from urllib.parse import urlsplit
 import soundfile as sf
 import torch
 from typing import Optional
-from fastapi import Request
+from fastapi import Request, Depends
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 
@@ -18,6 +19,9 @@ from core.db import db_conn
 from core.config import PREVIEW_DIR
 from core.tasks import task_manager
 from core.logging_utils import log_safe
+from core.media_types import AUDIO_EXTS, MEDIA_EXTS, media_extension, media_upload_suffix, unsupported_media_detail
+from core.url_safety import UnsafeURLError, check_public_url, is_manifest_head, is_manifest_file
+from core.failure import InvalidMediaFileError
 from core import event_bus
 from schemas.requests import CleanupSegmentsRequest, DubIngestUrlRequest, ParseSubtitleTextRequest
 from services.srt_parser import CUE_SOURCE_FIELDS, CUE_SOURCE_ID
@@ -29,7 +33,7 @@ from services.asr_backend import (
     run_transcribe_guarded,
 )
 from services.audio_io import _safe_soundfile_write
-from services.ffmpeg_utils import find_ffmpeg
+from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
 from services.segmentation import (
     segment_transcript,
     assign_speakers_from_diarization,
@@ -42,6 +46,7 @@ from services.segmentation import (
 )
 from services.onset_align import snap_segment_starts
 from services import dub_pipeline
+from core.browser_guard import reject_cross_site_get
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
@@ -129,6 +134,17 @@ _get_job           = dub_pipeline.get_job
 _save_job          = dub_pipeline.save_job
 replace_source_segments = dub_pipeline.replace_source_segments
 segments_revision = dub_pipeline.segments_revision
+
+# Language codes name per-track files (``dubbed_{lang}.wav``,
+# ``seg_{lang}_{id}.wav``) and export filenames, so every route that accepts
+# one must pass it through this check before it reaches a path.
+_SAFE_LANG = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _safe_lang_or_400(lang: str | None) -> str | None:
+    if lang is not None and not _SAFE_LANG.fullmatch(lang):
+        raise HTTPException(status_code=400, detail="Invalid language code")
+    return lang
 
 # Pasted subtitle text is a transcript, not a media file: a feature-length
 # film's .srt is ~150 KB. 2 MB of characters is ~13x the worst realistic case
@@ -618,11 +634,19 @@ def delete_single_dub_history(history_id: str):
 
 @router.post("/preview/upload")
 async def preview_upload(video: UploadFile = File(...)):
-    ext = os.path.splitext(video.filename or "video.mp4")[1].lower()
+    ext = media_upload_suffix(video.filename, ".mp4")
+    if ext is None:
+        raise HTTPException(
+            status_code=415,
+            detail=unsupported_media_detail("video", MEDIA_EXTS, os.path.splitext(video.filename or "")[1]),
+        )
     safe_name = f"{uuid.uuid4().hex[:12]}"
     vid_path = os.path.join(PREVIEW_DIR, f"{safe_name}{ext}")
     wav_path = os.path.join(PREVIEW_DIR, f"{safe_name}.wav")
     payload = await video.read()
+    if is_manifest_head(payload[:512]):
+        # A playlist/manifest named like a video: ffmpeg would follow its URLs.
+        raise InvalidMediaFileError()
 
     def _write_and_extract() -> bool:
         with open(vid_path, "wb") as f:
@@ -630,11 +654,11 @@ async def preview_upload(video: UploadFile = File(...)):
         if ext in {".wav", ".mp3", ".m4a", ".aac"}:
             return False
         try:
-            ffmpeg_cmd = [
+            ffmpeg_cmd = local_inputs_only([
                 find_ffmpeg(), "-y", "-i", vid_path,
                 "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
                 wav_path
-            ]
+            ])
             subprocess.run(
                 ffmpeg_cmd, check=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -686,7 +710,7 @@ _ingest_gen       = dub_pipeline.ingest_pipeline
 #: Recognised audio extensions for audio-only dubbing (#119). When the client
 #: declares input_type=audio we refuse anything that isn't a known audio
 #: container so a mislabelled video can't slip past the video-skipping branch.
-_AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+_AUDIO_EXTS = AUDIO_EXTS
 
 def _dub_upload_disk_error() -> HTTPException:
     return HTTPException(
@@ -785,7 +809,13 @@ async def dub_upload(
             detail="Invalid job_id. Must be alphanumeric + hyphens/underscores only, ≤64 chars. Generate a fresh job_id or omit it to auto-create one.",
         )
     ext = os.path.splitext(video.filename or "video.mp4")[1]
-    if input_type == "audio" and ext.lower() not in _AUDIO_EXTS:
+    if input_type == "video" and media_extension(video.filename, MEDIA_EXTS, ".mp4") is None:
+        raise HTTPException(
+            status_code=415,
+            detail=unsupported_media_detail("video", MEDIA_EXTS, ext),
+        )
+    ext = ext.lower()
+    if input_type == "audio" and ext not in _AUDIO_EXTS:
         raise HTTPException(
             status_code=400,
             detail=f"Audio-only dubbing needs an audio file ({', '.join(sorted(_AUDIO_EXTS))}); got '{ext or 'no extension'}'.",
@@ -869,6 +899,15 @@ async def dub_upload(
     finally:
         await video.close()
 
+    # Refuse a playlist/manifest named like media before any ffmpeg sees it.
+    try:
+        manifest = await asyncio.to_thread(is_manifest_file, video_path)
+    except OSError:
+        manifest = False  # The prep task reports the unreadable file.
+    if manifest:
+        _discard_upload()
+        raise InvalidMediaFileError()
+
     filename = video.filename or f"video{ext}"
     task_id = f"prep_{job_id}"
     await task_manager.add_task(
@@ -896,12 +935,10 @@ async def dub_ingest_url(req: DubIngestUrlRequest, request: Request):
     audio extract, Demucs, scene detect, thumbnail) happens in the background
     task and progress is streamed via /tasks/stream/{task_id}.
     """
-    url = (req.url or "").strip()
-    if not url or not (url.startswith("http://") or url.startswith("https://")):
-        raise HTTPException(
-            status_code=400,
-            detail="URL must start with http:// or https://. Paste a full video link (e.g. https://youtube.com/watch?v=…) or drop a local file instead.",
-        )
+    try:
+        url = await asyncio.to_thread(check_public_url, req.url or "")
+    except UnsafeURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     source_lang_override = _source_lang_override(req.source_lang)
 
     try:
@@ -1179,7 +1216,7 @@ def _recover_from_phrase_embeddings(
         return None
 
 
-@router.get("/dub/transcribe-stream/{job_id}")
+@router.get("/dub/transcribe-stream/{job_id}", dependencies=[Depends(reject_cross_site_get)])
 async def dub_transcribe_stream(
     job_id: str,
     num_speakers: Optional[int] = None,

@@ -18,7 +18,9 @@ not activate a schedule, install n8n, expose your backend, or include credential
 The exported address is correct for a native n8n process on the same computer.
 Inside Docker, `127.0.0.1` refers to the container, not your desktop. Replace the
 node URL with the address your n8n process can actually reach; Docker Desktop
-commonly provides `host.docker.internal`. Linux container networking may require
+commonly provides `host.docker.internal` (Podman: `host.containers.internal`).
+VoiceStudio accepts requests addressed to those names out of the box, so no
+`OMNIVOICE_ALLOWED_HOSTS` entry is needed for them. Linux container networking may require
 an explicit host-gateway mapping. A cloud n8n instance cannot reach a private
 loopback address. Configure remote access deliberately using the
 [API authentication guide](../api-auth.md), rather than exposing a desktop port

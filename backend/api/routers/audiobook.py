@@ -267,6 +267,7 @@ def _resolve_voice(profile_id: str | None) -> dict:
         return out
     from core.config import VOICES_DIR
     from core.db import db_conn
+    from core.path_security import contained_join
 
     with db_conn() as conn:
         row = conn.execute("SELECT * FROM voice_profiles WHERE id=?", (profile_id,)).fetchone()
@@ -277,15 +278,15 @@ def _resolve_voice(profile_id: str | None) -> dict:
     except (KeyError, IndexError):
         kind = "clone"
     if row["is_locked"] and row["locked_audio_path"]:
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["locked_audio_path"])
+        out["ref_audio"] = contained_join(VOICES_DIR, row["locked_audio_path"])
         out["ref_text"] = row["ref_text"]
         out["instruct"] = row["instruct"]
     elif kind == "design":
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
+        out["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
         out["ref_text"] = row["ref_text"] if out["ref_audio"] else None
         out["instruct"] = row["instruct"]
     else:
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
+        out["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
         out["ref_text"] = row["ref_text"]
         out["instruct"] = row["instruct"]
     try:

@@ -411,7 +411,8 @@
     "addHfToken": "Thêm mã thông báo Hugging Face",
     "gatedAccessReady": "Truy cập đã sẵn sàng. Mô hình này bây giờ có thể được cài đặt.",
     "gatedAccessStillRequired": "Quyền truy cập hoặc mã thông báo vẫn bị thiếu. Hoàn tất các bước rồi kiểm tra lại.",
-    "checkAccess": "Kiểm tra quyền truy cập"
+    "checkAccess": "Kiểm tra quyền truy cập",
+    "mirrorGatedAccess": "Mô hình này bị giới hạn truy cập và các mirror không bao giờ nhận token Hugging Face của bạn. Chuyển sang Hugging Face (official) trong cài đặt mirror rồi thử lại."
   },
   "transcriptions": {
     "mode_label": "Chất lượng phiên âm",

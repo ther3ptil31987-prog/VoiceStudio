@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import io
+import os
 import struct
 import wave
 from pathlib import Path
@@ -273,7 +274,8 @@ def test_transcription_tests_neutralize_the_asr_model_preflight():
     from the cause."""
     import re
 
-    calls = re.compile(r"dub_transcribe(_stream)?\(|[\"']/dub/transcribe")
+    # A direct router call, or an HTTP request to the route (not a bare path in a route list).
+    calls = re.compile(r"dub_transcribe(_stream)?\(|\.(get|post|stream)\(\s*f?[\"']/dub/transcribe")
     offenders = []
     for root in (Path(__file__).parent, BACKEND / "tests"):
         for path in sorted(root.rglob("test_*.py")):
@@ -389,3 +391,33 @@ def test_reference_cleanup_keeps_a_folder_the_job_still_points_into(tmp_path):
     discard_reference_run(str(run_dir), job)
     assert not run_dir.exists()
     assert (tmp_path / REFERENCE_RUNS_DIRNAME).is_dir()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_reference_cleanup_never_follows_a_linked_run_folder(tmp_path):
+    from services.dub_pipeline import REFERENCE_RUNS_DIRNAME, discard_reference_run
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.wav"
+    keep.write_bytes(b"not ours")
+    refs = tmp_path / "job" / REFERENCE_RUNS_DIRNAME
+    refs.mkdir(parents=True)
+    try:
+        os.symlink(outside, refs / "run", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    discard_reference_run(str(refs / "run"), {})
+    assert keep.read_bytes() == b"not ours"
+
+    linked_refs = tmp_path / "job2" / REFERENCE_RUNS_DIRNAME
+    linked_refs.parent.mkdir()
+    real_refs = tmp_path / "elsewhere"
+    (real_refs / "run").mkdir(parents=True)
+    victim = real_refs / "run" / "victim.wav"
+    victim.write_bytes(b"not ours")
+    os.symlink(real_refs, linked_refs, target_is_directory=True)
+
+    discard_reference_run(str(linked_refs / "run"), {})
+    assert victim.read_bytes() == b"not ours"

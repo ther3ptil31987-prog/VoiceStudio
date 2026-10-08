@@ -415,7 +415,8 @@
     "addHfToken": "Додати токен Hugging Face",
     "gatedAccessReady": "Доступ підтверджено. Тепер можна встановити модель.",
     "gatedAccessStillRequired": "Бракує доступу або токена. Виконайте потрібні кроки та перевірте знову.",
-    "checkAccess": "Перевірити доступ"
+    "checkAccess": "Перевірити доступ",
+    "mirrorGatedAccess": "Доступ до цієї моделі обмежено, а дзеркала ніколи не отримують ваш токен Hugging Face. Перейдіть на Hugging Face (official) у налаштуваннях дзеркала й повторіть спробу."
   },
   "transcriptions": {
     "mode_label": "Якість транскрипції",

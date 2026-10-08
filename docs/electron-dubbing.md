@@ -100,7 +100,14 @@ Malformed, overlapping, or duration-clamped cue counts remain visible in the sid
 Failed imports preserve the current edits. Generated track buttons clear on successful
 replacement to avoid presenting older audio as the new subtitles' output.
 URL import runs only after clicking Ingest; it uses the backend's existing yt-dlp
-pipeline. Explicit cookies.txt selection is available under URL sign-in options; optional caption downloads are available.
+pipeline. URL imports (here and in the voice gallery) accept only `http://` and
+`https://` links and refuse addresses on this computer or the local network,
+including redirects to them. Live streams and upcoming premieres can't be
+imported until the recording is available. Voice-gallery clips download the
+audio track and cut the clip on this computer. To import from a media server on your own network,
+set `OMNIVOICE_ALLOW_PRIVATE_URL_IMPORTS=1` for the backend (for example in
+`~/.config/omnivoice/env`) and restart. Uploads accept common audio and video
+file types only; a playlist or manifest renamed as a video is refused. Explicit cookies.txt selection is available under URL sign-in options; optional caption downloads are available.
 
 Translation quality uses the existing backend Fast, Autofit and Cinematic modes.
 The choice persists in the working draft and saved project (`translateQuality`),
