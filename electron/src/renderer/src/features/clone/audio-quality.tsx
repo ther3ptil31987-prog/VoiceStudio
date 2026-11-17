@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { apiJson } from '@/lib/api/client';
 import { requestPlaybackSeek } from '@/lib/audio/playback-clock';
-import { formatClock } from '@/components/waveform-player';
+import { formatClock } from '@/components/media-clock';
 
 interface QualityReport {
   truncated: boolean;
@@ -29,16 +29,17 @@ export function AudioQuality({ audioPath }: { audioPath: string }) {
   });
   if (!id) return null;
   return (
-    <div className="text-xs text-muted-foreground">
+    <div className="contents text-xs text-muted-foreground">
       <Button
         variant="ghost"
-        size="sm"
+        size="xs"
+        className="ml-auto"
         onClick={() => setRequested(!requested)}
       >
         {t(requested ? 'common.close' : 'audioQuality.check')}
       </Button>
       {requested ? (
-        <div aria-live="polite" className="space-y-1">
+        <div aria-live="polite" className="order-last w-full basis-full space-y-1">
           {report.isFetching ? <p>{t('common.loading')}</p> : null}
           {report.isError ? <p>{t('audioQuality.failed')}</p> : null}
           {report.data ? (

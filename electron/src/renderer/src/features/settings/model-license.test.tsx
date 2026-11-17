@@ -103,11 +103,11 @@ const button = (name: string) =>
 async function click(element: HTMLElement) {
   await act(async () => element.click());
 }
-async function render(licenseInfo = info, target = 'local') {
+async function render(licenseInfo = info, dependencies?: any[]) {
   await act(async () =>
     root.render(
       <QueryClientProvider client={queryClient}>
-        <ModelLicense repoId="test/model" label="Test model" info={licenseInfo} target={target} />
+        <ModelLicense repoId="test/model" label="Test model" info={licenseInfo} dependencies={dependencies} />
       </QueryClientProvider>,
     ),
   );
@@ -132,26 +132,57 @@ afterEach(async () => {
 
 describe('versioned model notices', () => {
   it.each([
-    ['commercial', 'unreviewed', en.modelLicense.categoryCommercial, en.modelLicense.notReviewed],
-    ['conditions', 'unreviewed', en.modelLicense.categoryConditions, en.modelLicense.notReviewed],
+    [
+      'commercial',
+      'unreviewed',
+      en.modelLicense.categoryCommercial,
+      en.modelLicense.notReviewed,
+      en.modelLicense.shortCommercial,
+    ],
+    [
+      'conditions',
+      'unreviewed',
+      en.modelLicense.categoryConditions,
+      en.modelLicense.notReviewed,
+      en.modelLicense.shortConditions,
+    ],
     [
       'noncommercial',
       'noncommercial',
       en.modelLicense.categoryNoncommercial,
       en.modelLicense.notReviewed,
+      en.modelLicense.shortNoncommercial,
     ],
-    ['commercial', 'cleared', en.modelLicense.categoryCommercial, en.modelLicense.reviewed],
-    [undefined, 'unreviewed', en.modelLicense.categoryUnknown, en.modelLicense.notReviewed],
-    ['permitted', 'unreviewed', en.modelLicense.categoryUnknown, en.modelLicense.notReviewed],
+    [
+      'commercial',
+      'cleared',
+      en.modelLicense.categoryCommercial,
+      en.modelLicense.reviewed,
+      en.modelLicense.shortCommercial,
+    ],
+    [
+      undefined,
+      'unreviewed',
+      en.modelLicense.categoryUnknown,
+      en.modelLicense.notReviewed,
+      en.modelLicense.shortUnknown,
+    ],
+    [
+      'permitted',
+      'unreviewed',
+      en.modelLicense.categoryUnknown,
+      en.modelLicense.notReviewed,
+      en.modelLicense.shortUnknown,
+    ],
   ])(
-    'shows a Licence: icon %s/%s trigger named by licence, category and review state',
-    async (category, review, categoryLabel, reviewLabel) => {
+    'shows an icon-and-text %s/%s trigger named by licence, category and review state',
+    async (category, review, categoryLabel, reviewLabel, shortLabel) => {
       await render({ ...info, license_category: category, review_status: review });
       const summary = `${info.license} · ${categoryLabel} · ${reviewLabel}`;
       const trigger = within(host).getByRole('button', {
         name: `${en.modelLicense.label}: ${summary}; Test model`,
       });
-      expect(trigger.textContent).toBe(`${en.modelLicense.label}:`);
+      expect(trigger.textContent).toBe(shortLabel);
       expect(trigger.getAttribute('title')).toBe(summary);
       const svg = trigger.querySelector('svg')!;
       expect(svg.getAttribute('aria-hidden')).toBe('true');
@@ -214,6 +245,21 @@ describe('versioned model notices', () => {
     history,
   });
 
+  it('keeps a dependency unacceptable until its terms have loaded', async () => {
+    const dep = { repo_id: 'dep/model', license: 'x', category: 'noncommercial', required: true, accepted: false, fingerprint };
+    mock.details.mockImplementation((path: string) =>
+      path.includes('dep/model')
+        ? Promise.reject(new Error('down'))
+        : Promise.resolve(details({ accepted: true, state: 'accepted' })),
+    );
+    await render(info, [dep]);
+    await open();
+    await vi.waitFor(() => expect(text()).toContain(en.modelLicense.detailsFailed));
+    const box = document.querySelector('[role="dialog"] input[type="checkbox"]') as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    expect(button(en.modelLicense.accept).disabled).toBe(true);
+  });
+
   it('records acceptance through one checkbox and shows the stored time and hash', async () => {
     const acceptedAt = '2026-10-10T09:00:00+00:00';
     mock.details.mockResolvedValue(details({ accepted: false, state: 'not_accepted' }));
@@ -223,13 +269,20 @@ describe('versioned model notices', () => {
     await vi.waitFor(() => expect(text()).toContain(en.modelLicense.stateNotAccepted));
     const accept = button(en.modelLicense.accept);
     expect(accept.disabled).toBe(true);
-    const box = document.querySelector('[role="dialog"] input[type="checkbox"]') as HTMLInputElement;
+    const box = document.querySelector(
+      '[role="dialog"] input[type="checkbox"]',
+    ) as HTMLInputElement;
     expect(box.closest('label')?.textContent).toBe(
       en.modelLicense.acceptCheckbox.replace('{{model}}', 'Test model'),
     );
     mock.details.mockResolvedValue(
       details(
-        { accepted: true, state: 'accepted', accepted_at: acceptedAt, last_action: { action: 'accepted', at: acceptedAt, fingerprint } },
+        {
+          accepted: true,
+          state: 'accepted',
+          accepted_at: acceptedAt,
+          last_action: { action: 'accepted', at: acceptedAt, fingerprint },
+        },
         [{ action: 'accepted', at: acceptedAt, fingerprint, app_version: '0.5.7' }],
       ),
     );
@@ -246,10 +299,23 @@ describe('versioned model notices', () => {
   });
 
   it.each([
-    ['withdrawn', { accepted: false, state: 'withdrawn', last_action: { action: 'withdrawn', at: '2026-10-11T08:00:00+00:00', fingerprint } }, 'Acceptance withdrawn Oct 11, 2026'],
+    [
+      'withdrawn',
+      {
+        accepted: false,
+        state: 'withdrawn',
+        last_action: { action: 'withdrawn', at: '2026-10-11T08:00:00+00:00', fingerprint },
+      },
+      'Acceptance withdrawn Oct 11, 2026',
+    ],
     [
       'terms_updated',
-      { accepted: false, state: 'terms_updated', accepted_at: '2026-10-10T09:00:00+00:00', changed_fields: ['notes', 'documents'] },
+      {
+        accepted: false,
+        state: 'terms_updated',
+        accepted_at: '2026-10-10T09:00:00+00:00',
+        changed_fields: ['notes', 'documents'],
+      },
       'The licence terms changed after you accepted them on Oct 10, 2026',
     ],
   ])('explains the %s state and asks again', async (_state, acceptance, message) => {
@@ -302,7 +368,7 @@ describe('versioned model notices', () => {
     expect(text()).not.toContain('Synthetic notice only.');
   });
 
-  it('clears a prepared plan when registry or selected target changes', async () => {
+  it('clears a prepared plan when the registry changes', async () => {
     mock.api.mockResolvedValue(syntheticPlan());
     await render();
     await open();
@@ -310,9 +376,6 @@ describe('versioned model notices', () => {
     await click(document.querySelector('input')!);
     await render({ ...info, registry_digest: 'f'.repeat(64) });
     expect(document.querySelector('input[type="checkbox"]')).toBeNull();
-    await render(info, 'worker:test');
-    expect(button(en.modelLicense.prepare).disabled).toBe(true);
-    expect(text()).toContain('worker:test');
   });
 
   it('requires an explicit checkbox and commits the exact document set once', async () => {
@@ -341,7 +404,6 @@ describe('versioned model notices', () => {
       plan_digest: 'c'.repeat(64),
       acknowledged_document_ids: ['test-terms'],
       acknowledged: true,
-      target: 'local',
     });
     expect(button(en.common.close).disabled).toBe(true);
     await act(async () => resolve({ status: 'verified' }));
@@ -398,7 +460,7 @@ describe('conservative model notice contract', () => {
   });
   it('rejects changed identities, upstream-assent documents and absent evidence', () => {
     const plan = syntheticPlan();
-    expect(canAcknowledgeModelPlan(plan, 'test/model', 'local', info.registry_digest)).toBe(true);
+    expect(canAcknowledgeModelPlan(plan, 'test/model', info.registry_digest)).toBe(true);
     for (const changed of [
       { ...plan, repo_id: 'different/model' },
       { ...plan, registry_digest: 'changed' },
@@ -406,12 +468,7 @@ describe('conservative model notice contract', () => {
       { ...plan, blockers: ['terms_unverified'] },
       { ...plan, documents: [{ ...plan.documents[0], agreement_required: true }] },
     ])
-      expect(canAcknowledgeModelPlan(changed, 'test/model', 'local', info.registry_digest)).toBe(
-        false,
-      );
-    expect(canAcknowledgeModelPlan(plan, 'test/model', 'worker:test', info.registry_digest)).toBe(
-      false,
-    );
+      expect(canAcknowledgeModelPlan(changed, 'test/model', info.registry_digest)).toBe(false);
   });
   it('allows only HTTPS source URLs without embedded credentials', () => {
     for (const value of [

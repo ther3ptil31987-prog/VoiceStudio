@@ -1,0 +1,264 @@
+"""An install must not bypass a rejected digest through its plain fallback."""
+import asyncio
+import hashlib
+import importlib
+import re
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from test_download_blob_integrity import CONTENT, GIT_BLOB_OID
+
+
+@pytest.fixture
+def install_origin(monkeypatch, tmp_path):
+    import huggingface_hub
+    from huggingface_hub import constants, file_download
+    from services import performance_profiles, segmented_download as sd
+    from services import token_resolver
+    from utils import hf_progress
+
+    download = importlib.import_module("api.routers.setup.download")
+    repo = "integrity/fixture"
+    revision = "c" * 40
+    cache = tmp_path / "hub"
+    repo_dir = cache / "models--integrity--fixture"
+    snapshot = repo_dir / "snapshots" / revision
+    state = SimpleNamespace(
+        download=download, repo=repo, revision=revision, repo_dir=repo_dir,
+        snapshot=snapshot, good=False, unsupported=False, etag="", gets=[],
+        fallback_calls=[], events=[], redirect_to=None, accepts_ranges=True,
+        requested=[], range_errors={}, raised_ranges=[], connections=1, get_handler=None,
+    )
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr(download, "KNOWN_MODELS", [{
+        "repo_id": repo, "config_only": True, "config_required_files": ["config.json"],
+    }])
+    monkeypatch.setattr(download, "revision_for", lambda _repo: revision)
+    monkeypatch.setattr(download, "_download_endpoint", lambda **_kw: None)
+    monkeypatch.setattr(download, "_segmented_enabled", lambda: True)
+    monkeypatch.setattr(download, "_xet_active", lambda: False)
+    monkeypatch.setattr(download, "disk_space_error", lambda _size: None)
+    monkeypatch.setattr(download, "invalidate_cache", lambda: None)
+    monkeypatch.setattr(download, "_active_installs", set())
+    monkeypatch.setattr(download, "_install_cooldowns", {})
+    monkeypatch.setattr(download, "_install_failures", {})
+    monkeypatch.setattr(download, "_cancelled", set())
+    monkeypatch.setattr(download, "_install_tasks", set())
+    monkeypatch.setattr(download, "_install_tasks_by_repo", {})
+    monkeypatch.setattr(performance_profiles, "reconcile_active_profile", lambda: {})
+    monkeypatch.setattr(token_resolver, "resolve", lambda: None)
+
+    class Hub:
+        def __init__(self, **_kwargs):
+            pass
+
+        def repo_info(self, *_args, **_kwargs):
+            return SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename="config.json")])
+
+    def metadata(*_args, **_kwargs):
+        return SimpleNamespace(etag=state.etag, size=len(CONTENT),
+                               location="https://download.example/config.json")
+
+    def plain_snapshot(**kwargs):
+        if kwargs.get("dry_run"):
+            return []
+        state.fallback_calls.append(kwargs)
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "config.json").write_bytes(CONTENT if state.good else b"!" + CONTENT[1:])
+        return str(snapshot)
+
+    async def response(request):
+        state.requested.append(str(request.url))
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={
+                "Content-Length": str(len(CONTENT)),
+                "Accept-Ranges": "bytes" if state.accepts_ranges else "none",
+            })
+        if state.get_handler is not None:
+            return await state.get_handler(request)
+        if state.redirect_to:
+            return httpx.Response(302, headers={"Location": state.redirect_to})
+        if not state.accepts_ranges:
+            state.gets.append(None)
+            return httpx.Response(200, content=CONTENT)
+        bounds = tuple(map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", request.headers["Range"]).groups()))
+        state.gets.append(bounds)
+        if bounds[0] in state.range_errors:
+            state.raised_ranges.append(bounds[0])
+            raise state.range_errors[bounds[0]]
+        if state.unsupported:
+            return httpx.Response(200, content=CONTENT)  # ignores the range
+        body = CONTENT if state.good else b"!" + CONTENT[1:]
+        lo, hi = bounds
+        return httpx.Response(206, headers={
+            "Content-Range": f"bytes {lo}-{hi}/{len(body)}",
+        }, content=body[lo:hi + 1])
+
+    transfer = sd.segmented_download
+
+    async def download_with_transport(*args, **kwargs):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response), trust_env=False) as client:
+            return await transfer(*args, **kwargs, client=client, num_connections=state.connections)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", plain_snapshot)
+    monkeypatch.setattr(file_download, "get_hf_file_metadata", metadata)
+    monkeypatch.setattr(sd, "segmented_download", download_with_transport)
+    monkeypatch.setattr(sd, "_MIN_SEGMENT_BYTES", 16)
+    monkeypatch.setattr(sd, "_MAX_SEGMENT_BYTES", 16)
+    listener = hf_progress.register_listener(state.events.append)
+    try:
+        yield state
+    finally:
+        hf_progress.unregister_listener(listener)
+
+
+def _install(state):
+    async def run():
+        result = await state.download.install_model(
+            state.download.InstallModelRequest(repo_id=state.repo),
+        )
+        assert result["status"] == "install_started"
+        await state.download._install_tasks_by_repo[state.repo]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["git-blob", "sha256"])
+def test_install_rejects_corrupt_digest_without_plain_fallback_and_retry_heals(
+    install_origin, monkeypatch, kind,
+):
+    state = install_origin
+    state.etag = GIT_BLOB_OID if kind == "git-blob" else hashlib.sha256(CONTENT).hexdigest()
+    _install(state)
+    assert state.gets  # real segmentation, byte assembly and hashing were used
+    assert state.fallback_calls == []
+    assert not (state.repo_dir / "voicestudio-revision").exists()
+    assert not (state.repo_dir / "refs" / "main").exists()
+    assert not (state.snapshot / "config.json").exists()
+    phases = [event["phase"] for event in state.events]
+    assert "install_error" in phases and "install_done" not in phases
+    failure = state.download._install_failures[state.repo]
+    assert "mismatch" in failure["error"] and "corrupt" in failure["error"]
+    failed_job, = state.download.model_install_status()["jobs"]
+    assert failed_job["state"] == "failed" and failed_job["error"] == failure["error"]
+
+    # Elapse the existing retry cooldown without a real one-minute sleep.
+    monkeypatch.setattr(state.download, "_COOLDOWN_SECS", 0)
+    state.good = True
+    state.gets.clear()
+    state.events.clear()
+    _install(state)
+    assert sorted(state.gets) == [(0, 15), (16, 31), (32, 47), (48, 49)]
+    assert state.fallback_calls == []
+    assert (state.snapshot / "config.json").read_bytes() == CONTENT
+    assert (state.repo_dir / "voicestudio-revision").read_text(encoding="utf-8").strip() == state.revision
+    assert state.repo not in state.download._install_failures
+    assert "install_done" in [event["phase"] for event in state.events]
+
+
+def test_install_keeps_plain_fallback_for_unsupported_ranges(install_origin):
+    state = install_origin
+    state.etag = hashlib.sha256(CONTENT).hexdigest()
+    state.good = True
+    state.unsupported = True
+    _install(state)
+    assert len(state.fallback_calls) == 1
+    assert (state.snapshot / "config.json").read_bytes() == CONTENT
+    assert (state.repo_dir / "voicestudio-revision").read_text(encoding="utf-8").strip() == state.revision
+    assert "install_done" in [event["phase"] for event in state.events]
+
+
+def test_install_never_bypasses_a_destination_refusal_through_plain_fallback(install_origin, monkeypatch):
+    from core.url_safety import UnsafeURLError
+    state = install_origin
+    state.good = True
+    def refused(*_args, **_kwargs):
+        raise UnsafeURLError('private destination refused')
+    monkeypatch.setattr(state.download, '_segmented_snapshot', refused)
+    _install(state)
+    assert state.fallback_calls == []
+    assert state.download._is_retryable_download_error(UnsafeURLError('private destination refused')) is False
+    assert 'install_error' in [event['phase'] for event in state.events]
+    assert 'install_done' not in [event['phase'] for event in state.events]
+
+
+@pytest.mark.parametrize('accepts_ranges', [False, True], ids=['single-stream', 'range'])
+def test_get_only_private_redirect_never_reaches_legacy_install_fallback(install_origin, accepts_ranges):
+    """Run the real installer and downloader: HEAD succeeds, only GET redirects."""
+    state = install_origin
+    state.good = True
+    state.etag = hashlib.sha256(CONTENT).hexdigest()
+    state.accepts_ranges = accepts_ranges
+    state.redirect_to = 'http://169.254.169.254/latest/meta-data/'
+    _install(state)
+    assert state.fallback_calls == [], 'GET policy refusal reached the legacy Hub downloader'
+    assert all(httpx.URL(url).host != '169.254.169.254' for url in state.requested)
+    assert not (state.snapshot / 'config.json').exists()
+    phases = [event['phase'] for event in state.events]
+    assert 'install_error' in phases and 'install_done' not in phases
+
+
+@pytest.mark.parametrize('unsafe_first', [False, True], ids=['ordinary-first', 'unsafe-first'])
+def test_concurrent_range_refusal_cannot_be_masked_into_legacy_fallback(install_origin, unsafe_first):
+    from core.url_safety import UnsafeURLError
+    state = install_origin
+    state.good = True
+    state.etag = hashlib.sha256(CONTENT).hexdigest()
+    state.connections = 2
+    refusal = UnsafeURLError('private destination refused')
+    ordinary = ValueError('invalid range response')
+    state.range_errors = {
+        0: refusal if unsafe_first else ordinary,
+        16: ordinary if unsafe_first else refusal,
+    }
+    _install(state)
+    assert {0, 16}.issubset(state.raised_ranges), 'Both real range tasks must reach their errors'
+    assert state.fallback_calls == [], 'A known concurrent refusal reached the legacy Hub downloader'
+    assert not (state.snapshot / 'config.json').exists()
+    phases = [event['phase'] for event in state.events]
+    assert 'install_error' in phases and 'install_done' not in phases
+
+
+@pytest.mark.parametrize('policy_first',[False,True],ids=['ordinary-first-range','policy-first-range'])
+def test_pending_range_policy_refusal_cannot_be_cancelled_into_legacy_fallback(install_origin,monkeypatch,policy_first):
+    import threading
+    from core.url_safety import UnsafeURLError
+    from services import segmented_download as sd
+    state=install_origin
+    state.good=True;state.connections=2
+    state.etag=hashlib.sha256(CONTENT).hexdigest()
+    entered=threading.Event();release=threading.Event();awaiter_done=threading.Event();refused=threading.Event()
+    failures=[]
+    def policy(url):
+        assert url=='https://pending-policy.example/config.json'
+        entered.set()
+        assert release.wait(3)
+        refused.set()
+        raise UnsafeURLError('controlled eventual destination refusal')
+    monkeypatch.setattr(sd,'check_public_url',policy)
+    async def get(request):
+        start=int(re.fullmatch(r'bytes=(\d+)-(\d+)',request.headers['Range'])[1])
+        if start==(0 if policy_first else 16):
+            asyncio.current_task().add_done_callback(lambda _:awaiter_done.set())
+            return httpx.Response(302,headers={'Location':'https://pending-policy.example/config.json'})
+        assert await asyncio.to_thread(entered.wait,2)
+        return httpx.Response(200,content=CONTENT)  # Unsupported range => ordinary fallback class.
+    state.get_handler=get
+    def finish_policy_after_awaiter_is_cancelled():
+        try:
+            if not awaiter_done.wait(2):failures.append('policy awaiter did not finish promptly')
+        finally:release.set()
+    worker=threading.Thread(target=finish_policy_after_awaiter_is_cancelled)
+    worker.start()
+    try:_install(state)
+    finally:
+        release.set();worker.join(3)
+    assert not worker.is_alive() and failures==[]
+    assert entered.is_set() and refused.wait(1)
+    assert state.fallback_calls==[], 'Interrupted destination validation reached the legacy downloader'
+    assert not (state.snapshot/'config.json').exists()
+    assert 'install_error' in [event['phase'] for event in state.events]
+    assert 'install_done' not in [event['phase'] for event in state.events]

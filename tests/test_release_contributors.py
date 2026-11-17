@@ -1,0 +1,255 @@
+"""Release notes get a Contributors block from the tag comparison, automatically.
+
+v0.5.7-beta.1 shipped with notes copied from [Unreleased], which name only the
+people whose entries were credited by hand, so the maintainers and most community
+authors appeared nowhere. prepare_electron_release.py now adds the list itself.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def release(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location(
+        "prepare_release_contributors_test", ROOT / "scripts/prepare_electron_release.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeGh:
+    """Answers the two `gh api` calls the helper makes and records them."""
+
+    def __init__(self, base="v0.5.6", authors=(), pr_authors=(), releases=(), since_beta=None):
+        self.base, self.authors, self.pr_authors, self.calls = base, list(authors), list(pr_authors), []
+        # `releases`: "tag date" lines; `since_beta`: (base, authors) answered for that range.
+        self.releases, self.since_beta = list(releases), since_beta
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        if args[0] == "pr":
+            return "\n".join(self.pr_authors) + "\n"
+        path = args[1]
+        if path.endswith("/releases/latest"):
+            return self.base + " 2026-09-23T08:53:32Z\n"
+        if path.endswith("/releases"):
+            return "\n".join(self.releases) + "\n"
+        if self.since_beta and f"/compare/{self.since_beta[0]}..." in path:
+            return "\n".join(self.since_beta[1]) + "\n"
+        if "/compare/" in path:
+            return "\n".join(self.authors) + "\n"
+        raise AssertionError(f"unexpected gh call: {args}")
+
+
+def test_authors_are_ranked_by_commits_and_include_maintainers(release):
+    gh = FakeGh(authors=["debpalash"] * 5 + ["velixio"] * 3 + ["rudycelekli"] * 3 + ["zed"])
+    block = release.contributors_section("o/r", "v0.5.7", gh)
+    assert block.startswith("### Contributors\n")
+    # most commits first; a tie (velixio and rudycelekli, 3 each) is alphabetical
+    assert "@debpalash, @rudycelekli, @velixio, @zed" in block
+
+
+def test_bots_agents_and_unlinked_placeholders_are_never_credited(release):
+    """Real v0.5.7-beta.1 data contained @claude and @invalid-email-address."""
+    noise = ["dependabot[bot]", "github-actions[bot]", "claude", "Claude", "copilot",
+             "invalid-email-address", "app/dependabot", "coderabbitai"]
+    gh = FakeGh(authors=noise + ["velixio"], pr_authors=noise)
+    assert release.contributors_section("o/r", "v0.5.7", gh).endswith("@velixio\n")
+    assert release.contributors_section("o/r", "v0.5.7", FakeGh(authors=noise, pr_authors=noise)) == ""
+
+
+def test_pr_authors_with_unlinked_commits_are_still_credited_after_the_committers(release):
+    gh = FakeGh(authors=["debpalash", "velixio", "velixio"], pr_authors=["JoshuaWIls", "velixio", "alice"])
+    block = release.contributors_section("o/r", "v0.5.7", gh)
+    assert block.endswith("@velixio, @debpalash, @alice, @JoshuaWIls\n")
+
+
+def test_the_range_starts_at_the_latest_stable_release_for_betas_and_stables(release):
+    for tag in ("v0.5.7-beta.3", "v0.5.7"):
+        gh = FakeGh(base="v0.5.6", authors=["velixio"])
+        release.contributors_section("o/r", tag, gh)
+        assert gh.calls[1][1] == f"repos/o/r/compare/v0.5.6...{tag}"
+        assert "--paginate" in gh.calls[1]
+        pr_call = gh.calls[2]
+        assert pr_call[0] == "pr" and "merged:>=2026-09-23" in pr_call
+
+
+def test_a_later_beta_names_who_is_new_since_the_previous_beta_first(release):
+    """v0.5.8-beta.4 repeated beta.3's full list, so new contributors were invisible."""
+    releases = ["v0.5.8-beta.3 2026-11-09T11:41:42Z", "v0.5.8-beta.2 2026-11-05T00:00:00Z",
+                "v0.5.8-beta.5 2026-12-01T00:00:00Z", "v0.5.7 2026-10-26T00:00:00Z",
+                "v0.5.7-beta.9 2026-10-20T00:00:00Z"]
+    gh = FakeGh(base="v0.5.7", authors=["debpalash", "debpalash", "velixio", "kellerkind84"],
+                releases=releases, since_beta=("v0.5.8-beta.3", ["kellerkind84", "debpalash", "kellerkind84"]))
+    block = release.contributors_section("o/r", "v0.5.8-beta.4", gh)
+    assert "New since v0.5.8-beta.3: @kellerkind84, @debpalash\n" in block
+    assert block.endswith("Everyone who contributed since v0.5.7: @debpalash, @kellerkind84, @velixio\n")
+    new_pr_call = [c for c in gh.calls if c[0] == "pr"][-1]
+    assert "merged:>=2026-11-09" in new_pr_call
+
+
+def test_a_first_beta_and_a_stable_keep_the_single_list(release):
+    for tag in ("v0.5.8-beta.1", "v0.5.8"):
+        gh = FakeGh(base="v0.5.7", authors=["velixio"], releases=["v0.5.8-beta.1 2026-11-01T00:00:00Z"])
+        block = release.contributors_section("o/r", tag, gh)
+        assert block == "### Contributors\n\nThanks to everyone who contributed to this release: @velixio\n"
+
+
+def _prepare(release, monkeypatch, tmp_path, changelog, **kwargs):
+    monkeypatch.setattr(release, "verify_release", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    Path("package.json").write_text(json.dumps({"version": "1.2.3-beta.1"}))
+    Path("CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    assets = tmp_path / "assets"
+    assets.mkdir(exist_ok=True)
+    for suffix in ("mac-arm64.dmg", "mac-x64.dmg", "linux-x64.deb"):
+        (assets / f"VoiceStudio-1.2.3-beta.1-{suffix}").write_bytes(b"x")
+    release.prepare(assets, "v1.2.3-beta.1", **kwargs)
+    return (assets / "RELEASE_NOTES.md").read_text(encoding="utf-8")
+
+
+CHANGELOG = "## [Unreleased]\n\n## [1.2.3-beta.1] — 2026-10-24\n\n- A fix (#1)\n\n## [1.2.2] — 2026-10-01\n\n- Old\n"
+
+
+def test_release_notes_get_the_contributors_block_appended(release, monkeypatch, tmp_path):
+    notes = _prepare(release, monkeypatch, tmp_path, CHANGELOG, repo="o/r",
+                     gh=FakeGh(authors=["velixio", "debpalash", "debpalash"]))
+    assert notes.startswith("- A fix (#1)\n\n### Contributors\n")
+    assert notes.endswith("@debpalash, @velixio\n")
+
+
+def test_a_hand_written_contributors_section_is_never_duplicated(release, monkeypatch, tmp_path):
+    changelog = CHANGELOG.replace("- A fix (#1)\n", "- A fix (#1)\n\n### Contributors\n\n- @velixio — release tooling\n")
+    gh = FakeGh(authors=["someone"])
+    notes = _prepare(release, monkeypatch, tmp_path, changelog, repo="o/r", gh=gh)
+    assert notes.count("Contributors") == 1 and "@someone" not in notes
+    assert gh.calls == []
+
+
+def test_without_a_repo_the_notes_are_the_changelog_section_exactly(release, monkeypatch, tmp_path):
+    gh = FakeGh(authors=["velixio"])
+    assert _prepare(release, monkeypatch, tmp_path, CHANGELOG, gh=gh) == "- A fix (#1)\n"
+    assert gh.calls == []
+
+
+def test_a_failing_lookup_never_blocks_the_release(release, monkeypatch, tmp_path, capsys):
+    def broken(*args):
+        raise subprocess.CalledProcessError(1, args)
+
+    notes = _prepare(release, monkeypatch, tmp_path, CHANGELOG, repo="o/r", gh=broken)
+    assert notes == "- A fix (#1)\n"
+    assert "Contributors section skipped" in capsys.readouterr().err
+
+
+def test_the_release_workflow_passes_the_repository_to_both_prepare_calls():
+    workflow = (ROOT / ".github/workflows/electron-release.yml").read_text(encoding="utf-8")
+    calls = [l for l in workflow.splitlines() if "prepare_electron_release.py --assets" in l]
+    assert len(calls) == 4  # tag and rehearsal variants of both calls
+    assert all('--repo "$GITHUB_REPOSITORY"' in l for l in calls)
+
+
+@pytest.mark.parametrize("answer", ["", "\n", "v0.5.6\n", "v0.5.6 \n"])
+def test_an_answer_without_a_previous_release_skips_credits_instead_of_crashing(
+    release, answer, capsys
+):
+    """Credits must never block a release, whatever `gh api --jq` answers.
+
+    The helper split the answer and indexed `latest[1]`, so an empty result (no
+    published release yet) or a null `published_at` raised IndexError. That is
+    outside the caller's `(CalledProcessError, OSError)` guard, so the release
+    preparation aborted even though the intent is documented in the caller.
+    """
+
+    class Gh(FakeGh):
+        def __call__(self, *args):
+            if str(args[1]).endswith("/releases/latest"):
+                return answer
+            return super().__call__(*args)
+
+    assert release.contributors_section("debpalash/VoiceStudio", "v0.5.9", Gh()) == ""
+    assert "Contributors section skipped" in capsys.readouterr().err
+
+
+NOTES = "## [1.2.3] — 2099-01-01\n\n### Fixed\n\n- A fix (#1)\n"
+
+
+def test_any_credits_failure_warns_instead_of_blocking_the_notes(release, monkeypatch, capsys):
+    """The guard covers every failure, not only the ones the GitHub CLI raises.
+
+    Assembling the block can also fail on an unexpected answer shape or a parsing
+    bug, and a release whose notes are ready must still be prepared: the omission
+    is reported as a warning instead.
+    """
+
+    def boom(*args, **kwargs):
+        raise ValueError("unexpected gh answer")
+
+    monkeypatch.setattr(release, "contributors_section", boom)
+
+    assert release.notes_with_contributors(NOTES, "owner/repo", "v1.2.3") == NOTES
+    assert "Contributors section skipped" in capsys.readouterr().err
+
+
+def test_a_hand_written_contributors_block_wins(release, monkeypatch, capsys):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("the automatic block must not be assembled")
+
+    monkeypatch.setattr(release, "contributors_section", unexpected)
+    written = NOTES + "\n### Contributors\n\nThanks @someone for the report.\n"
+
+    assert release.notes_with_contributors(written, "owner/repo", "v1.2.3") == written
+    assert capsys.readouterr().err == ""
+
+
+def test_a_successful_block_is_appended_after_the_notes(release, monkeypatch):
+    monkeypatch.setattr(release, "contributors_section", lambda *a, **k: "### Contributors\n\nThanks @dev.\n")
+
+    assert release.notes_with_contributors(NOTES, "owner/repo", "v1.2.3") == (
+        NOTES + "\n### Contributors\n\nThanks @dev.\n"
+    )
+
+
+def test_prepare_writes_its_outputs_when_credits_fail(release, monkeypatch, tmp_path, capsys):
+    """End to end: a credits failure leaves the notes and the sums intact.
+
+    `prepare` is the entry point the release workflow calls, so the guard has to
+    hold there and not only in the helper: the notes keep the changelog text, the
+    checksum file is still written, and the omission is reported as a warning.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "package.json").write_text('{"version": "0.5.9"}', encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [0.5.9] — 2026-11-15\n\n### Fixed\n\n- A fix (#1)\n", encoding="utf-8"
+    )
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    installer = assets / "VoiceStudio-0.5.9-mac-arm64.dmg"
+    installer.write_bytes(b"installer")
+
+    monkeypatch.setattr(release, "verify_release", lambda *args, **kwargs: None)
+
+    def boom(*args, **kwargs):
+        raise ValueError("unexpected gh answer")
+
+    monkeypatch.setattr(release, "contributors_section", boom)
+
+    missing: list[str] = []
+    release.prepare(assets, "v0.5.9", repo="owner/repo", missing=missing)
+
+    notes = (assets / "RELEASE_NOTES.md").read_text(encoding="utf-8")
+    assert "A fix (#1)" in notes
+    assert "Contributors" not in notes
+    sums = (assets / "SHA256SUMS.txt").read_text(encoding="utf-8")
+    assert "VoiceStudio-0.5.9-mac-arm64.dmg" in sums
+    assert "Contributors section skipped" in capsys.readouterr().err
+    assert "installer mac-x64.dmg" in missing

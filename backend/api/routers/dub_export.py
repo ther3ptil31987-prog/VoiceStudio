@@ -1,15 +1,20 @@
 import asyncio
-import io
 import json
 import logging
 import ntpath
 import os
 import re
+import shutil
+import stat
+import tempfile
 import time
 import uuid
 import weakref
+import zipfile
+from functools import partial
 from pathlib import Path, PureWindowsPath
-from typing import Optional
+from tempfile import TemporaryFile
+from typing import Annotated, Any, BinaryIO, Optional
 
 from core.config import DUB_DIR
 from core.http_headers import content_disposition
@@ -17,7 +22,10 @@ from core.logging_utils import log_safe
 from core.path_security import UnsafePath, portable_filename, resolve_within
 from core.tasks import task_manager
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, Depends
-from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette.types import Receive, Scope, Send
 from services.ffmpeg_utils import (
     bed_mix_filter,
     explain_ffmpeg_failure,
@@ -25,10 +33,12 @@ from services.ffmpeg_utils import (
     local_inputs_only,
     run_ffmpeg,
 )
+from services import video_encoder
 from services.karaoke_ass import build_ass, scale_words
 from services.prosody_mirror import AnalysisBudgetExceeded, SegmentSpan, mirror_file
 from services.video_retime import (
     DRIFT_TOLERANCE_S,
+    H264_SIZE_FILTER,
     RetimeError,
     build_chunk_filter_graph,
     expand_retime_chunks,
@@ -38,6 +48,7 @@ from services.video_retime import (
 from api.routers.dub_core import _get_job, _safe_lang_or_400
 from schemas.requests import ProsodyMirrorRequest
 from core.browser_guard import reject_cross_site_get
+from core.scrub import scrub_text
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
@@ -71,16 +82,39 @@ async def _preserved_background(job: dict, job_id: str, lang: str, *, prepare: b
         raise HTTPException(status_code=409, detail={"code": "dub_background_unavailable", "message": str(exc)}) from exc
 
 
+# #2964: level of the separated background bed in exported mixes. 1.0 keeps
+# the bed at its original level (the only behaviour before this option); the
+# limiter in ``bed_mix_filter`` keeps a raised bed from clipping.
+DEFAULT_BED_LEVEL = 1.0
+MAX_BED_LEVEL = 4.0
+BedLevel = Annotated[float, Query(
+    ge=0.0, le=MAX_BED_LEVEL,
+    description="Background level when preserve_bg=1: 1.0 keeps the original level, 0 mutes it, up to 4.0.",
+)]
+
+
+def _bed_level_tag(bed_level: float) -> str:
+    """Cache-name suffix for a non-default bed level ("" at the default, so
+    caches written before #2964 keep their names).
+
+    Uses the exact level (``repr`` round-trips a float), so two accepted
+    levels never share a cached preview mixed at the other one.
+    """
+    if bed_level == DEFAULT_BED_LEVEL:
+        return ""
+    return "_bed" + repr(float(bed_level)).replace(".", "p").replace("+", "")
+
+
 def _unique_stamp() -> str:
     """Return a short unique suffix like '20260415T142301-ab12cd34' for export files."""
     return f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
-#: Seconds of silence on a `/tasks/stream` before a keepalive comment goes out.
-#: A task that is busy but quiet — ffmpeg on a long video, a slow TTS segment,
-#: a job queued behind another — leaves the stream byte-silent, and byte-silent
-#: SSE gets severed by the desktop webview, Chrome's ~5 min cap or a proxy's
-#: idle timeout (#1196, #2108). Comments are invisible to every consumer.
+#: Longest quiet spell, in seconds, before `/tasks/stream` writes a keepalive
+#: comment. A task can be busy yet silent (a long ffmpeg run, one slow TTS
+#: segment, a job waiting behind another); with nothing on the wire, desktop
+#: webviews, Chrome (~5 min cap) and proxy idle timeouts close the stream.
+#: Read at call time so tests can patch it.
 TASK_STREAM_KEEPALIVE_S = 15.0
 
 
@@ -226,9 +260,17 @@ def _native_save(source: str, destination: str, display_name: str, media_type: s
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         shutil.copy2(source, dest)
     except PermissionError as e:
-        raise HTTPException(status_code=403, detail=f"Permission denied: {e}")
+        # Fixed text on purpose: an OS error names the path, and Windows escapes
+        # its separators, which is the one shape scrub_text cannot match.
+        raise HTTPException(
+            status_code=403,
+            detail="Permission denied writing to the export folder. Choose one you can write to.",
+        ) from e
     except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="The file could not be copied. Check the destination folder and free space.",
+        ) from e
     if not os.path.exists(dest) or os.path.getsize(dest) == 0:
         raise HTTPException(status_code=500, detail="Copy produced empty file at destination")
     logger.info("Native save completed (%d bytes)", os.path.getsize(dest))
@@ -283,6 +325,7 @@ async def stream_task(task_id: str, after_seq: int = 0):
                 try:
                     evt = await asyncio.wait_for(q.get(), timeout=TASK_STREAM_KEEPALIVE_S)
                 except asyncio.TimeoutError:
+                    # SSE comment line: ignored by every client, but keeps bytes flowing.
                     yield ": keepalive\n\n"
                     continue
                 if evt is None:
@@ -322,23 +365,38 @@ async def get_job(job_id: str):
     return row
 
 
+class PersistedJobEvent(BaseModel):
+    seq: int
+    created_at: float
+    payload: str
+
+
+class JobEventWatermark(BaseModel):
+    seq: int
+    created_at: Optional[float]
+
+
+class PersistedJobEvents(BaseModel):
+    job: dict[str, Any]
+    events: list[PersistedJobEvent]
+    event_watermark: JobEventWatermark
+
+
 @router.get("/jobs/{job_id}/events")
-async def list_job_events(job_id: str, after_seq: int = 0, limit: int = 500):
-    """Persisted SSE tail. Strict ascending seq so the client can stitch
-    it onto a live feed (which starts above the last returned seq).
+async def list_job_events(job_id: str, after_seq: int = 0, limit: int = 500) -> PersistedJobEvents:
+    """A bounded ascending SSE page and true retained-tail watermark.
+
+    Job, page and watermark share one read snapshot. The watermark is not
+    limited by the page, so it can fence older history before a live feed.
     """
     from core import job_store
-    row = job_store.get(job_id)
-    if not row:
+    page = await run_in_threadpool(job_store.event_page, job_id, after_seq, limit)
+    if page is None:
         raise HTTPException(
             status_code=404,
             detail="No job with that id. It may have expired, been deleted, or the server restarted before it was persisted — check the dub history in the sidebar.",
         )
-    limit = max(1, min(2000, int(limit)))
-    return {
-        "job": row,
-        "events": job_store.events_since(job_id, after_seq=after_seq, limit=limit),
-    }
+    return PersistedJobEvents(**page)
 
 
 @router.post("/tasks/cancel/{task_id}")
@@ -534,9 +592,17 @@ def _build_video_stretch_filter_graph(
 
 def _video_stretch_plan_for(job: dict, lang_code: str) -> dict | None:
     """Return the persisted stretch plan + total durations for `lang_code`,
-    or None if this job didn't use stretch_video mode (or no plan exists).
+    or None if this track wasn't generated in stretch_video mode (or no plan
+    exists).
+
+    The track records its own strategy; ``job["timing_strategy"]`` is only
+    the most recent generate's, so a later language rendered another way
+    must not drop this track's retime. Tracks from before the per-track
+    record fall back to the job-level value.
     """
-    if (job.get("timing_strategy") or "").lower() != "stretch_video":
+    track = (job.get("dubbed_tracks") or {}).get(lang_code) or {}
+    strategy = track.get("timing_strategy") or job.get("timing_strategy")
+    if (strategy or "").lower() != "stretch_video":
         return None
     plans = job.get("video_stretch_plans") or {}
     entry = plans.get(lang_code)
@@ -645,6 +711,7 @@ def _build_audio_export_cmd(
     bg_path: Optional[str],
     out_path: str,
     fmt: str,
+    bed_level: float = DEFAULT_BED_LEVEL,
 ) -> list[str]:
     """Build the ffmpeg command for an audio-only dub export (#119).
 
@@ -658,7 +725,7 @@ def _build_audio_export_cmd(
         # Mix the dubbed voice over the original background bed (same weights
         # as the video mux path) so ambience/music is preserved.
         cmd += ["-i", bg_path, "-filter_complex",
-                bed_mix_filter("1:a", "0:a", bed_gain=1.0),
+                bed_mix_filter("1:a", "0:a", bed_gain=bed_level),
                 "-map", "[aout]"]
     cmd += codec
     cmd.append(out_path)
@@ -670,6 +737,7 @@ def _build_audio_export_cmd(
 async def dub_download(
     job_id: str,
     preserve_bg: bool = Query(True, description="Mix background noise into dubbed tracks"),
+    bed_level: BedLevel = DEFAULT_BED_LEVEL,
     default_track: str = Query("", description="Default audio track; omitted selects the first dubbed track"),
     include_tracks: str = Query("", description="Comma-separated list of tracks to include (e.g. 'original,de,es'). Empty = include all."),
     save_authorization: str = Header("", alias="X-VoiceStudio-Path-Authorization"),
@@ -687,11 +755,14 @@ async def dub_download(
         raise HTTPException(status_code=404, detail="Job not found")
 
     tracks = job.get("dubbed_tracks", {})
-    if not tracks:
-        raise HTTPException(status_code=400, detail="No dubbed tracks generated yet")
-
     include_set = set(t.strip() for t in include_tracks.split(",") if t.strip()) if include_tracks else None
     include_original = include_set is None or "original" in include_set
+    is_audio_job = (job.get("input_type") or "video").lower() == "audio"
+    # A transcribed video can be exported before any dub exists: the original
+    # audio with its transcript as burned or soft subtitles (#3393). Audio
+    # jobs have nothing to add without a dub.
+    if not tracks and (is_audio_job or not include_original):
+        raise HTTPException(status_code=400, detail="No dubbed tracks generated yet")
 
     if include_set:
         filtered_tracks = {k: v for k, v in tracks.items() if k in include_set}
@@ -754,7 +825,7 @@ async def dub_download(
             output_name = f"dubbed_audio_{stamp}.m4a"
         out_path = os.path.join(exports_dir, output_name)
         bg = await _preserved_background(job, job_id, lang_code) if preserve_bg else None
-        cmd = _build_audio_export_cmd(ffmpeg, track_info["path"], bg, out_path, fmt)
+        cmd = _build_audio_export_cmd(ffmpeg, track_info["path"], bg, out_path, fmt, bed_level)
         try:
             rc, _, stderr = await run_ffmpeg(cmd, timeout=1800.0)
             if rc != 0:
@@ -947,7 +1018,7 @@ async def dub_download(
         else:
             sub_src = "[0:v]"
         _sub_filter = "ass" if sub_is_ass else "subtitles"
-        filter_parts.append(f"{sub_src}{_sub_filter}='{esc}'[vsub]")
+        filter_parts.append(f"{sub_src}{H264_SIZE_FILTER},{_sub_filter}='{esc}'[vsub]")
         video_map = "[vsub]"
     if stretch_entry:
         orig_dur = float(stretch_entry.get("orig_duration") or job.get("duration") or 0.0)
@@ -958,6 +1029,25 @@ async def dub_download(
         if graph:
             filter_parts.append(graph)
             video_map = vlabel
+
+    # Maximum output resolution (#3732): only ever downscales, so a source
+    # already inside the limit keeps the stream-copy path.
+    max_res = video_encoder.max_resolution()
+    if max_res != "original":
+        size_src = (
+            retime_decision.file_path
+            if retime_decision is not None and retime_decision.mode == "file"
+            else video_path
+        )
+        size = await video_encoder.probe_video_size(size_src)
+        if not size:
+            logger.warning(
+                "Could not probe video size; applying the %s resolution cap by filter", max_res)
+        if not size or video_encoder.needs_downscale(size[0], size[1], max_res):
+            scale_src = video_map if video_map.startswith("[") else f"[{video_map}]"
+            filter_parts.append(f"{scale_src}{video_encoder.scale_filter(max_res)}[vcap]")
+            video_map = "[vcap]"
+            video_reencode = True
 
     cmd += ["-map", video_map]
     if include_original:
@@ -979,7 +1069,7 @@ async def dub_download(
         for i, t in enumerate(tracks_to_process):
             tail = f",apad=whole_dur={apad_dur:.4f}" if apad_dur else ""
             filter_parts.append(bed_mix_filter(
-                f"{t['bg_idx']}:a", f"{t['idx']}:a", out=f"aout{i}", tail=tail, uniq=str(i), bed_gain=1.0,
+                f"{t['bg_idx']}:a", f"{t['idx']}:a", out=f"aout{i}", tail=tail, uniq=str(i), bed_gain=bed_level,
             ))
             t["out_label"] = f"[aout{i}]"
         for t in tracks_to_process:
@@ -1002,8 +1092,13 @@ async def dub_download(
     # re-encode; stream-copy is viable when nothing touches the video
     # filter chain — including the batched Smart Fit path, whose retimed
     # intermediate is already encoded with these exact settings.
+    enc_args: tuple[str, ...] = ()
     if sub_path or stretch_entry or video_reencode:
-        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
+        # Hardware encoding is opt-in (#3732); libx264 stays the default.
+        enc_args = video_encoder.encoder_args(
+            await asyncio.to_thread(video_encoder.select_encoder, ffmpeg)
+        )
+        cmd += list(enc_args)
     else:
         cmd += ["-c:v", "copy"]
     cmd += ["-c:a", "aac", "-b:a", "192k"]
@@ -1047,8 +1142,17 @@ async def dub_download(
         cmd += ["-shortest"]
     cmd += [output_path, "-y"]
 
+    if retime_decision is None:
+        # Smart Fit cleared it at export start; a plain export must too, or an
+        # old /dub/abort reads as a cancel and blocks the encoder fallback.
+        job.pop("aborted", None)
     try:
-        rc, _, stderr = await run_ffmpeg(cmd, timeout=1800.0, job_id=job_id)
+        rc, _, stderr = await video_encoder.run_with_encoder_fallback(
+            cmd, enc_args,
+            lambda c: run_ffmpeg(c, timeout=1800.0, job_id=job_id),
+            aborted=lambda: bool(job.get("aborted")),
+            ffmpeg=ffmpeg,
+        )
         if rc != 0:
             raise Exception(stderr.decode(errors="replace") if stderr else "ffmpeg mux non-zero")
     except asyncio.TimeoutError:
@@ -1075,7 +1179,7 @@ async def dub_download(
 
     base_name = os.path.splitext(job.get('filename', 'output'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'output'
-    dl_name = f"dubbed_{safe_name}_{stamp}.mp4"
+    dl_name = f"{'dubbed' if tracks_to_process else 'subtitled'}_{safe_name}_{stamp}.mp4"
 
     # Structured warning surface for the Smart Fit fallback ladder: header is
     # a fixed ASCII token (FileResponse headers must be latin-1 safe); the
@@ -1156,6 +1260,7 @@ async def dub_preview_video(
     job_id: str,
     lang: str = Query(..., description="Language code of the dubbed track to mux in"),
     preserve_bg: bool = Query(True),
+    bed_level: BedLevel = DEFAULT_BED_LEVEL,
 ):
     """Return an inline-playable MP4 with the chosen dubbed track as sole audio.
 
@@ -1192,7 +1297,10 @@ async def dub_preview_video(
     if not exports_dir.startswith(_base + os.sep):
         raise HTTPException(status_code=400, detail="Invalid job id")
     os.makedirs(exports_dir, exist_ok=True)
-    bg_suffix = "surgical_v2_" + Path(bg_audio).stem if (preserve_bg and has_bg) else "nobg"
+    bg_suffix = (
+        "surgical_v2_" + Path(bg_audio).stem + _bed_level_tag(bed_level)
+        if (preserve_bg and has_bg) else "nobg"
+    )
     preview_path = os.path.realpath(
         os.path.join(exports_dir, f"preview_v2_{lang}_{bg_suffix}.mp4")
     )
@@ -1331,7 +1439,7 @@ async def dub_preview_video(
         audio_map = f"{track_idx}:a:0"
         if bg_idx is not None:
             tail = f",apad=whole_dur={apad_dur:.4f}" if apad_dur else ""
-            filter_parts.append(bed_mix_filter(f"{bg_idx}:a", f"{track_idx}:a", tail=tail, bed_gain=1.0))
+            filter_parts.append(bed_mix_filter(f"{bg_idx}:a", f"{track_idx}:a", tail=tail, bed_gain=bed_level))
             audio_map = "[aout]"
         elif apad_dur:
             filter_parts.append(f"[{track_idx}:a]apad=whole_dur={apad_dur:.4f}[aout]")
@@ -1377,7 +1485,7 @@ async def dub_preview_video(
             _discard_tmp()
             raise HTTPException(
                 status_code=500,
-                detail=f"ffmpeg failed to build the preview stream: {str(e)[:300]}. This usually means the source video can't be re-encoded on the fly — try downloading the MP4 instead.",
+                detail=f"ffmpeg failed to build the preview stream: {scrub_text(str(e))[:300]}. This usually means the source video can't be re-encoded on the fly — try downloading the MP4 instead.",
             )
         finally:
             if retime_decision is not None and retime_decision.mode == "file":
@@ -1413,7 +1521,7 @@ def _compute_timeline_sync(src_path: str) -> tuple[list[float], list[float]]:
     onsets = detect_speech_onsets(audio, sr)
     mono = np.asarray(audio, dtype=np.float32)
     if mono.ndim > 1:
-        mono = mono.mean(axis=1)
+        mono = np.max(np.abs(mono), axis=1)
     mono = mono.reshape(-1)
     if mono.size == 0:
         return onsets, []
@@ -1466,6 +1574,7 @@ async def dub_get_onsets(job_id: str):
                 isinstance(cached, dict)
                 and isinstance(cached.get("onsets"), list)
                 and isinstance(cached.get("peaks"), list)
+                and cached.get("channel_analysis") == "max_abs_v1"
             ):
                 return cached
     except (OSError, ValueError):
@@ -1476,10 +1585,10 @@ async def dub_get_onsets(job_id: str):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Onset analysis failed: {str(e)[:200]}",
+            detail=f"Onset analysis failed: {scrub_text(str(e))[:200]}",
         )
 
-    payload = {"onsets": onsets, "peaks": peaks, "source": source}
+    payload = {"onsets": onsets, "peaks": peaks, "source": source, "channel_analysis": "max_abs_v1"}
     try:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         tmp_path = cache_path + ".tmp"
@@ -1493,43 +1602,45 @@ async def dub_get_onsets(job_id: str):
 
 @router.post("/dub/prosody-mirror/{job_id}")
 async def dub_prosody_mirror(job_id: str, req: ProsodyMirrorRequest):
-    """Suggest per-segment directions that mirror the source delivery.
+    """Suggest delivery directions from how the source actor spoke each line.
 
-    Measures each line on the Demucs vocals track (the mix when separation
-    did not run) against its speaker's baseline and returns taxonomy
-    directions the editor can apply to lines without one. Read-only: nothing
-    about the job changes.
+    Read-only: nothing on the job changes.
     """
     _job_dir_or_400(job_id)
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    mix = _optional_dub_artifact(job.get("audio_path"), job_id)
     vocals = _optional_dub_artifact(job.get("vocals_path"), job_id)
-    src_path = vocals or mix
-    if not src_path:
-        raise HTTPException(status_code=404, detail="No audio track available for prosody analysis")
+    mix = _optional_dub_artifact(job.get("audio_path"), job_id)
+    audio_path = vocals or mix
+    if not audio_path:
+        raise HTTPException(status_code=404, detail="No audio track available for delivery analysis")
     source = "vocals" if vocals and vocals != mix else "mix"
 
     spans = [
-        SegmentSpan(id=seg.id, start=seg.start, end=seg.end, speaker_id=seg.speaker_id or "")
-        for seg in req.segments
+        SegmentSpan(
+            id=segment.id,
+            start=segment.start,
+            end=segment.end,
+            speaker_id=segment.speaker_id or "",
+        )
+        for segment in req.segments
     ]
     try:
-        results = await asyncio.to_thread(mirror_file, src_path, spans)
-    except AnalysisBudgetExceeded as e:
+        results = await asyncio.to_thread(mirror_file, audio_path, spans)
+    except AnalysisBudgetExceeded as exc:
+        logger.warning("Prosody mirror refused: %s", log_safe(exc))
         raise HTTPException(
             status_code=413,
-            detail="These segments overlap far more than the source audio allows. "
-            "Remove duplicated or overlapping segments and try again.",
-        ) from e
-    except (OSError, RuntimeError, ValueError) as e:
-        logger.warning("prosody mirror failed for %s: %s", log_safe(job_id), log_safe(e))
+            detail="The segments cover far more audio than the source holds. Remove duplicated or overlapping segments and try again.",
+        ) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Prosody mirror could not read the source audio: %s", log_safe(exc))
         raise HTTPException(
             status_code=422,
-            detail="Prosody analysis could not read this job's audio. Re-import the source and try again.",
-        ) from e
+            detail="The source audio could not be analysed. Re-import the source and try again.",
+        ) from exc
     return {"source": source, "segments": [result.to_dict() for result in results]}
 
 
@@ -1650,6 +1761,19 @@ async def dub_qc_pass(job_id: str, lang: str = Query(None), drift_threshold: flo
     # holds whichever language was generated last, so QC of an earlier track
     # compared its speech with another language and flagged every line (#2574).
     scored_segments = _segments_for_lang(job, track_lang)
+    # Smart Fit and Stretch Video place each line at its fitted position, so
+    # the recognized speech is timed on that track. Score each line in the
+    # window it plays in (the cue timing the subtitle exports use); source
+    # times paired lines with their neighbours' speech once the video slowed.
+    fitted = _fitted_segments_for(job, track_lang)
+    if fitted:
+        scored_segments = _apply_fitted_times(scored_segments, fitted)
+    else:
+        cues = _fitted_cue_times(job, track_lang)
+        if cues:
+            scored_segments = [
+                dict(seg, start=s, end=e) for seg, (s, e) in zip(scored_segments, cues)
+            ]
 
     # TTS-only install: no ASR model on disk → typed 409 with a download CTA,
     # BEFORE any backend load could silently auto-download whisper weights.
@@ -1678,7 +1802,7 @@ async def dub_qc_pass(job_id: str, lang: str = Query(None), drift_threshold: flo
         )
         from services.model_manager import _get_gpu_pool
         recognized, engine_id = await run_transcribe_guarded(
-            _get_gpu_pool(), _recognize, what="QC",
+            _get_gpu_pool(), _recognize, what="QC", audio_path=wav_path,
         )
     except ASRTimeoutError as e:
         # Backend is alive; ASR just couldn't finish in time. 504, not 500/connection.
@@ -1696,7 +1820,7 @@ async def dub_qc_pass(job_id: str, lang: str = Query(None), drift_threshold: flo
         if isinstance(e, ModelLicenceNotAccepted):
             raise  # typed 403 via the app handler (#2689)
         logger.exception("dub QC ASR pass failed")
-        raise HTTPException(status_code=500, detail=f"QC transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=f"QC transcription failed: {scrub_text(str(e))}")
 
     seg_ids = job.get("seg_order") or [s.get("id", i) for i, s in enumerate(segments)]
     scored = dub_qc.score_dub(scored_segments, recognized, drift_threshold=drift_threshold, seg_ids=seg_ids)
@@ -1778,7 +1902,10 @@ class _LeasedMixResponse(FileResponse):
             _release_mix(self._lease)
 
 
-async def _mixed_dub_audio(exports_dir: str, lang: str, bg_audio: str, track_path: str) -> str:
+async def _mixed_dub_audio(
+    exports_dir: str, lang: str, bg_audio: str, track_path: str,
+    bed_level: float = DEFAULT_BED_LEVEL,
+) -> str:
     """One reusable background + dub WAV per (background, track) version.
 
     The audio preview streams this route with HTTP range requests, and every
@@ -1801,6 +1928,10 @@ async def _mixed_dub_audio(exports_dir: str, lang: str, bg_audio: str, track_pat
         (os.path.basename(path), info.st_size, info.st_mtime_ns)
         for path, info in ((bg_audio, os.stat(bg_audio)), (track_path, os.stat(track_path)))
     ]
+    if bed_level != DEFAULT_BED_LEVEL:
+        # Only a non-default level joins the identity, so default mixes keep
+        # the key they were cached under before #2964.
+        identity.append(("bed_level", bed_level))
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
     target = os.path.realpath(os.path.join(exports, f"mixed_{lang}_{key}.wav"))
     if not target.startswith(exports + os.sep):
@@ -1813,7 +1944,7 @@ async def _mixed_dub_audio(exports_dir: str, lang: str, bg_audio: str, track_pat
             partial = target + ".tmp.wav"
             cmd = [
                 find_ffmpeg(), "-i", bg_audio, "-i", track_path,
-                "-filter_complex", bed_mix_filter("0:a", "1:a", bed_gain=1.0),
+                "-filter_complex", bed_mix_filter("0:a", "1:a", bed_gain=bed_level),
                 "-map", "[aout]", "-c:a", "pcm_s16le", "-f", "wav", "-y", partial,
             ]
             try:
@@ -1855,6 +1986,7 @@ async def dub_download_audio(
     job_id: str,
     lang: str = Query(None),
     preserve_bg: bool = Query(True),
+    bed_level: BedLevel = DEFAULT_BED_LEVEL,
     save_authorization: str = Header("", alias="X-VoiceStudio-Path-Authorization"),
 ):
     job_dir = _existing_job_dir_or_404(job_id)
@@ -1864,6 +1996,8 @@ async def dub_download_audio(
         raise HTTPException(status_code=404, detail="Job not found")
 
     tracks = job.get("dubbed_tracks", {})
+    if lang and lang not in tracks:
+        raise HTTPException(status_code=404, detail="Requested dubbed track not found")
     if lang and lang in tracks:
         wav_path = _dub_artifact(tracks[lang].get("path"), job_id, missing_detail="Audio file not found")
     elif tracks:
@@ -1881,7 +2015,7 @@ async def dub_download_audio(
     leased = None
     if bg_audio:
         try:
-            wav_path = leased = await _mixed_dub_audio(exports_dir, lang_label, bg_audio, wav_path)
+            wav_path = leased = await _mixed_dub_audio(exports_dir, lang_label, bg_audio, wav_path, bed_level)
         except Exception as exc:
             logger.exception("Failed to mix audio")
             raise HTTPException(status_code=500, detail={"code": "dub_background_unavailable", "message": "Could not preserve background audio"}) from exc
@@ -1951,6 +2085,30 @@ def _fitted_cue_times(job: dict, lang: str | None) -> list | None:
         return None
     from services.fitted_subtitles import fitted_cues
     return fitted_cues(job.get("segments", []), entry["plan"])
+
+
+@router.get("/dub/txt/{job_id}", response_class=PlainTextResponse)
+def dub_export_txt(
+    job_id: str,
+    lang: str = Query(None, description="Track language code; uses the same stored transcript as SRT, without cue numbers or timestamps."),
+) -> PlainTextResponse:
+    _job_dir_or_400(job_id)
+    lang = _safe_lang_or_400(lang)
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Preserve the editor's stored text before generation and each generated
+    # language afterward, exactly as subtitle exports do. No ASR/TTS is run.
+    lines = [(segment.get("text") or "").strip() for segment in _segments_for_lang(job, lang)]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise HTTPException(status_code=400, detail="No transcript segments available")
+    base_name = os.path.splitext(job.get("filename", "video"))[0]
+    return PlainTextResponse(
+        content="\n".join(lines) + "\n",
+        media_type="text/plain",
+        headers={"Content-Disposition": content_disposition(portable_filename(f"transcript_{base_name}.txt", "transcript"))},
+    )
 
 
 @router.get("/dub/srt/{job_id}")
@@ -2104,9 +2262,140 @@ async def dub_export_ass(
     )
 
 
+_ZIP_SNAPSHOT_PREFIX = ".zip-snapshot-"
+
+
+def _zip_source_version(path: str) -> tuple[int, int, int] | None:
+    """Identify one on-disk version of a regular file; None for anything else."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None  # symlink or non-file
+    return info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def _snapshot_zip_entries(
+    job_id: str,
+    entries: list[tuple[str, str]],
+    *,
+    required: frozenset[str] = frozenset(),
+    missing_detail: str = "File not found",
+    empty_detail: str = "No segments available",
+) -> tuple[str, list[tuple[str, str]]]:
+    """Pin one version of each export source in a private dir. Blocking: run in a worker thread.
+
+    Generation publishes with ``os.replace`` under the jobs lock, so hard links
+    made under that lock never mix old and new files, and a later replace leaves
+    the linked inode intact. Where links are unavailable the files are copied
+    without the lock and the copy is retried if a publication landed meanwhile.
+    """
+    from services.dub_pipeline import _dub_jobs_lock
+
+    job_dir = _job_dir_or_400(job_id)
+    try:
+        with os.scandir(job_dir) as scan:
+            for entry in scan:
+                if (
+                    entry.name.startswith(_ZIP_SNAPSHOT_PREFIX)
+                    and entry.is_dir(follow_symlinks=False)
+                    and time.time() - entry.stat(follow_symlinks=False).st_mtime > 86400
+                ):
+                    shutil.rmtree(entry.path, ignore_errors=True)
+    except OSError as exc:
+        # A crash mid-download leaves its snapshot behind; the sweep is best effort.
+        logger.debug("Dub ZIP snapshot sweep skipped: %s", type(exc).__name__)
+    snap_dir = tempfile.mkdtemp(prefix=_ZIP_SNAPSHOT_PREFIX, dir=job_dir)
+    try:
+        for _attempt in range(3):
+            kept: list[tuple[str, str]] = []
+            copies: list[tuple[str, str, tuple[int, int, int]]] = []
+            with _dub_jobs_lock:
+                for index, (source, arc_name) in enumerate(entries, 1):
+                    target = os.path.join(snap_dir, f"{index:04d}")
+                    try:
+                        os.unlink(target)  # left by an attempt a publication interrupted
+                    except OSError:
+                        pass  # nothing to clear on the first attempt
+                    version = _zip_source_version(source)
+                    if version is None:
+                        continue
+                    try:
+                        # No follow_symlinks argument: Windows does not accept it,
+                        # and the source was just checked to be a regular file.
+                        os.link(source, target)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        logger.info("Dub ZIP snapshot copying: hard link unavailable (%s)", type(exc).__name__)
+                        copies.append((source, target, version))
+                    kept.append((target, arc_name))
+            if not copies:
+                break
+            # Full-file copies stay outside the jobs lock so other dubs keep moving.
+            stable = True
+            for source, target, _version in copies:
+                try:
+                    shutil.copyfile(source, target)
+                except OSError:
+                    stable = False
+                    break
+            if stable:
+                with _dub_jobs_lock:
+                    stable = all(_zip_source_version(source) == version for source, _t, version in copies)
+            if stable:
+                break
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "dub_export_busy", "message": "This dub is being regenerated. Try the download again."},
+            )
+        present = {name for _, name in kept}
+        if not required <= present:
+            raise HTTPException(status_code=404, detail=missing_detail)
+        if not kept:
+            raise HTTPException(status_code=400, detail=empty_detail)
+    except BaseException:
+        shutil.rmtree(snap_dir, ignore_errors=True)
+        raise
+    return snap_dir, kept
+
+
+class _DubZipResponse(StreamingResponse):
+    """Compress off the event loop and release the temporary archive on disconnect."""
+
+    def __init__(self, entries: list[tuple[str, str]], filename: str, snapshot_dir: str | None = None):
+        self._entries = entries
+        self._snapshot_dir = snapshot_dir
+        super().__init__((), media_type="application/zip", headers={
+            "Content-Disposition": content_disposition(filename),
+        })
+
+    def _write_archive(self, archive: BinaryIO) -> int:
+        """Finish the archive before sending headers so build errors stay HTTP errors."""
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path, name in self._entries:
+                zf.write(path, name)
+        size = archive.tell()
+        archive.seek(0)
+        return size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Own the archive across both compression and streaming."""
+        try:
+            with TemporaryFile() as archive:
+                size = await run_in_threadpool(self._write_archive, archive)
+                self.headers["Content-Length"] = str(size)
+                self.body_iterator = iterate_in_threadpool(iter(partial(archive.read, 64 * 1024), b""))
+                await super().__call__(scope, receive, send)
+        finally:
+            if self._snapshot_dir:
+                shutil.rmtree(self._snapshot_dir, ignore_errors=True)
+
+
 @router.get("/dub/export-segments/{job_id}", dependencies=[Depends(reject_cross_site_get)])
 async def dub_export_segments_zip(job_id: str, lang: str = Query(None)):
-    import zipfile
     _job_dir_or_400(job_id)
     lang = _safe_lang_or_400(lang)
     job = _get_job(job_id)
@@ -2117,30 +2406,25 @@ async def dub_export_segments_zip(job_id: str, lang: str = Query(None)):
     if not segments:
         raise HTTPException(status_code=400, detail="No segments available")
 
-    zip_buffer = io.BytesIO()
+    entries = []
     order = job.get("seg_order") or []
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, seg in enumerate(segments):
-            seg_id = order[i] if i < len(order) else i
-            # Discovery returns only a non-symlink entry from the validated job root.
-            seg_path = _existing_segment_artifact(
-                job_id, _seg_wav_candidates(job, lang, (seg_id, i))
-            )
-            if seg_path:
-                speaker = seg.get("speaker_id", "Speaker1").replace(" ", "")
-                start_str = f"{seg['start']:.2f}"
-                end_str = f"{seg['end']:.2f}"
-                arc_name = f"{i+1:03d}_{start_str}-{end_str}_{speaker}.wav"
-                zf.write(seg_path, arc_name)
+    for i, seg in enumerate(segments):
+        seg_id = order[i] if i < len(order) else i
+        # Discovery returns only a non-symlink entry from the validated job root.
+        seg_path = _existing_segment_artifact(
+            job_id, _seg_wav_candidates(job, lang, (seg_id, i))
+        )
+        if seg_path:
+            speaker = seg.get("speaker_id", "Speaker1").replace(" ", "")
+            start_str = f"{seg['start']:.2f}"
+            end_str = f"{seg['end']:.2f}"
+            arc_name = f"{i+1:03d}_{start_str}-{end_str}_{speaker}.wav"
+            entries.append((seg_path, arc_name))
 
-    zip_buffer.seek(0)
     base_name = os.path.splitext(job.get('filename', 'video'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'segments'
-    return Response(
-        content=zip_buffer.read(),
-        media_type="application/zip",
-        headers={"Content-Disposition": content_disposition(f"segments_{safe_name}.zip")},
-    )
+    snap_dir, entries = await run_in_threadpool(_snapshot_zip_entries, job_id, entries)
+    return _DubZipResponse(entries, f"segments_{safe_name}.zip", snap_dir)
 
 @router.get("/dub/download-mp3/{job_id}", dependencies=[Depends(reject_cross_site_get)])
 @router.get("/dub/download-mp3/{job_id}/{filename}", dependencies=[Depends(reject_cross_site_get)])
@@ -2148,6 +2432,7 @@ async def dub_download_mp3(
     job_id: str,
     lang: str = Query(None),
     preserve_bg: bool = Query(True),
+    bed_level: BedLevel = DEFAULT_BED_LEVEL,
     save_authorization: str = Header("", alias="X-VoiceStudio-Path-Authorization"),
     bitrate: str = Query("192k"),
 ):
@@ -2158,6 +2443,8 @@ async def dub_download_mp3(
         raise HTTPException(status_code=404, detail="Job not found")
 
     tracks = job.get("dubbed_tracks", {})
+    if lang and lang not in tracks:
+        raise HTTPException(status_code=404, detail="Requested dubbed track not found")
     if lang and lang in tracks:
         wav_path = _dub_artifact(tracks[lang].get("path"), job_id, missing_detail="Audio file not found")
     elif tracks:
@@ -2178,7 +2465,7 @@ async def dub_download_mp3(
         mixed_path = os.path.join(exports_dir, f"mixed_mp3_{stamp}.wav")
         cmd_mix = [
             ffmpeg, "-i", bg_audio, "-i", wav_path,
-            "-filter_complex", bed_mix_filter("0:a", "1:a", bed_gain=1.0),
+            "-filter_complex", bed_mix_filter("0:a", "1:a", bed_gain=bed_level),
             "-map", "[aout]", "-c:a", "pcm_s16le", "-y", mixed_path
         ]
         try:
@@ -2234,7 +2521,6 @@ async def dub_download_mp3(
 
 @router.get("/dub/export-stems/{job_id}", dependencies=[Depends(reject_cross_site_get)])
 async def dub_export_stems(job_id: str, lang: str = Query(None)):
-    import zipfile
     _job_dir_or_400(job_id)
     lang = _safe_lang_or_400(lang)
     job = _get_job(job_id)
@@ -2242,6 +2528,8 @@ async def dub_export_stems(job_id: str, lang: str = Query(None)):
         raise HTTPException(status_code=404, detail="Job not found")
 
     tracks = job.get("dubbed_tracks", {})
+    if lang and lang not in tracks:
+        raise HTTPException(status_code=404, detail="Requested dubbed track not found")
     if not tracks:
         raise HTTPException(status_code=400, detail="No dubbed tracks generated yet")
 
@@ -2257,18 +2545,27 @@ async def dub_export_stems(job_id: str, lang: str = Query(None)):
         raise HTTPException(status_code=400, detail="No dubbed audio track")
 
     bg_path = _optional_dub_artifact(job.get("no_vocals_path"), job_id)
+    # Job-level timing follows the last generated language. Resolve this
+    # export against the selected track without changing the stored job.
+    # Older tracks without their own strategy retain the legacy fallback.
+    selected_job = {
+        **job,
+        "timing_strategy": ((tracks.get(lang_label) or {}).get("timing_strategy")
+                            or job.get("timing_strategy")),
+    }
+    if bg_path and _video_retime_plan_for(selected_job, lang_label):
+        # Use the same selected-track view for admission and preparation.
+        bg_path = await _preserved_background(selected_job, job_id, lang_label)
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(vocals_path, f"vocals_dubbed_{lang_label}.wav")
-        if bg_path:
-            zf.write(bg_path, "background_original.wav")
+    entries = [(vocals_path, f"vocals_dubbed_{lang_label}.wav")]
+    if bg_path:
+        entries.append((bg_path, "background_original.wav"))
 
-    zip_buffer.seek(0)
     base_name = os.path.splitext(job.get('filename', 'video'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'stems'
-    return Response(
-        content=zip_buffer.read(),
-        media_type="application/zip",
-        headers={"Content-Disposition": content_disposition(f"stems_{safe_name}.zip")},
+    snap_dir, entries = await run_in_threadpool(
+        _snapshot_zip_entries, job_id, entries,
+        required=frozenset({f"vocals_dubbed_{lang_label}.wav"}),
+        missing_detail="Dubbed audio file not found",
     )
+    return _DubZipResponse(entries, f"stems_{safe_name}.zip", snap_dir)

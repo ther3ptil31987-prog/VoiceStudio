@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from services import director, speech_rate, incremental
 from services.ffmpeg_utils import find_ffprobe, spawn_subprocess
-from api.dependencies import require_native_access
+from api.dependencies import require_admin, require_native_access
 from core.path_security import UnsafePath, resolve_within
 
 logger = logging.getLogger("omnivoice.tools")
@@ -86,6 +86,9 @@ class IncrementalReq(BaseModel):
     # scoped to that language (pass that language's stored hashes alongside);
     # omitted → legacy language-agnostic hashing, kept for old callers.
     lang: Optional[str] = None
+    # Match DubRequest.language when speech language differs from the track
+    # code (for example Auto speech stored in an en track).
+    language: Optional[str] = None
     # Voice-identity mode the client will generate with (DubRequest.voice_match).
     # Only "consistent" changes the hash (per_line/omitted == legacy), so
     # flipping the Voice-match toggle marks every segment stale — the audio
@@ -95,8 +98,18 @@ class IncrementalReq(BaseModel):
 
 @router.post("/tools/incremental")
 def plan_incremental(req: IncrementalReq):
+    from services.pronunciation import speech_text_preparer
+
+    prepare_text = speech_text_preparer()
+    segments = [
+        {**seg, "text": prepare_text(
+            seg.get("text") or "", seg.get("target_lang") or req.language or req.lang,
+            profile_id=seg.get("profile_id"),
+        )}
+        for seg in req.segments
+    ]
     return incremental.plan_incremental(
-        req.segments,
+        segments,
         stored_hashes=req.stored_hashes or {},
         track_lang=req.lang,
         voice_match=req.voice_match,
@@ -110,7 +123,7 @@ class DirectionReq(BaseModel):
     text: str = Field(..., description="Natural-language direction, e.g. 'urgent and surprised'")
 
 
-@router.post("/tools/direction")
+@router.post("/tools/direction", dependencies=[Depends(require_admin)])
 def parse_direction(req: DirectionReq):
     d = director.parse(req.text)
     return {
@@ -134,7 +147,7 @@ class RateFitReq(BaseModel):
     source_text: Optional[str] = None
 
 
-@router.post("/tools/rate-fit")
+@router.post("/tools/rate-fit", dependencies=[Depends(require_admin)])
 def rate_fit(req: RateFitReq):
     return speech_rate.adjust_for_slot(
         req.text,
@@ -167,7 +180,7 @@ def list_tts_plugins():
 # ── Video context analysis ─────────────────────────────────────────────────
 
 
-@router.post("/tools/video-context/{job_id}")
+@router.post("/tools/video-context/{job_id}", dependencies=[Depends(require_admin)])
 async def analyse_video_context(job_id: str):
     """Analyse the source video's visual context for dubbing decisions.
 
@@ -236,7 +249,7 @@ def _encode_workflow_audio(audio, rate: int) -> bytes:
     return output.getvalue()
 
 
-@router.post("/tools/normalize-speech")
+@router.post("/tools/normalize-speech", dependencies=[Depends(require_admin)])
 async def normalize_workflow_speech(
     audio: UploadFile = File(...),
     target_dbfs: float = Form(-2.0, ge=-24.0, le=-1.0),

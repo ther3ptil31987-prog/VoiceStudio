@@ -82,7 +82,11 @@ def _recv(stream):
 def _measure_vram_mb() -> float:
     """This sidecar's own GPU memory in MB (MM2-08). 0 on CPU. Never raises."""
     try:
-        import torch
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
     except Exception:
@@ -96,6 +100,16 @@ def _measure_vram_mb() -> float:
 # Module-level singleton — (runtime,). Device is auto-selected inside the
 # dots.tts runtime (cuda-or-cpu, no MPS); we don't pass a device.
 _runtime = None
+
+
+def _rocm_rdna2(torch):
+    """RDNA 2 bf16 GEMM can crash rocBLAS even when Torch claims support (#2372)."""
+    if not getattr(getattr(torch, "version", None), "hip", None):
+        return False
+    try:
+        return str(torch.cuda.get_device_properties(0).gcnArchName).lower().startswith("gfx103")
+    except Exception:  # noqa: BLE001 - unknown ROCm architecture uses safe precision
+        return True
 
 
 def _load_runtime(stdout):
@@ -122,6 +136,8 @@ def _load_runtime(stdout):
     except Exception:
         default_precision = "float32"  # Probe failure must not force half precision.
     precision = os.environ.get("OMNIVOICE_DOTS_TTS_PRECISION", default_precision)
+    if _rocm_rdna2(torch) and precision.strip().lower() in ("bfloat16", "bf16"):
+        precision = "float32"
     optimize = os.environ.get("OMNIVOICE_DOTS_TTS_OPTIMIZE", "0") == "1"
 
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 50})

@@ -1,4 +1,4 @@
-import { ShieldCheckIcon } from 'lucide-react';
+import { HistoryIcon, ShieldCheckIcon } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -10,6 +10,7 @@ import { apiJson } from '@/lib/api/client';
 import { SettingsSection, SettingsRow } from './settings-layout';
 import { useSettingsAction } from './use-settings-action';
 import { translatorPrivacy } from '@shared/utils/translatorPrivacy';
+import { DiagnosticPrivacySetting } from '@/components/diagnostic-consent';
 export function PrivacySettings({ showAnalytics = true }: { showAnalytics?: boolean } = {}) {
   const { t } = useTranslation();
   const info = useQuery({
@@ -30,13 +31,14 @@ export function PrivacySettings({ showAnalytics = true }: { showAnalytics?: bool
           <Link
             to="/settings/models/$family"
             params={{ family: 'translation' }}
-            className={buttonVariants({ variant: 'ghost', size: 'sm' })}
+            className={buttonVariants({ variant: 'outline', size: 'sm' })}
           >
-            {t('settings.translation')}
+            {t('privacy.change_translator')}
           </Link>
         </SettingsRow>
         <PrivacyToggle kind="watermark" />
         {showAnalytics && <PrivacyToggle kind="analytics" />}
+        <DiagnosticPrivacySetting />
       </SettingsSection>
       <HistoryRetention />
     </>
@@ -117,6 +119,7 @@ export function HistoryRetention() {
   }, [query.data]);
   const cap = Number(value);
   const valid = value.trim() !== '' && Number.isInteger(cap) && cap >= 0 && cap <= 100000;
+  const changed = Boolean(query.data) && cap !== query.data?.cap;
   const save = () =>
     action.run(async () => {
       const state = await apiJson('/api/settings/history-retention', {
@@ -128,12 +131,12 @@ export function HistoryRetention() {
       dirty.current = false;
     });
   const submit = () => {
-    if (!valid || !query.data || action.busy) return;
+    if (!valid || !changed || !query.data || action.busy) return;
     if (cap > 0 && (query.data.cap === 0 || cap < query.data.cap)) setConfirm(true);
     else void save();
   };
   return (
-    <SettingsSection icon={ShieldCheckIcon} title={t('settings.history_retention')}>
+    <SettingsSection icon={HistoryIcon} title={t('settings.history_retention')}>
       <p className="p-4 text-sm text-muted-foreground">{t('settings.history_retention_help')}</p>
       <SettingsRow
         id="retention-cap"
@@ -163,7 +166,11 @@ export function HistoryRetention() {
               action.reset();
             }}
           />
-          <Button type="submit" size="sm" disabled={!query.data || action.busy || !valid}>
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!query.data || action.busy || !valid || !changed}
+          >
             {t('common.save')}
           </Button>
         </form>

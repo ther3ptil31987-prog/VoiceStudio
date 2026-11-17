@@ -12,7 +12,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import re
 import time
 import zipfile
 from dataclasses import dataclass
@@ -34,7 +33,6 @@ PREVIEW_SAMPLE_RATE = 24_000                  # preview rate; mono, 16-bit PCM (
 # only after the linear allowlist below.
 _AUDIO_MEMBER_PREFIXES = ("ref_audio", "locked_audio", "consent_audio", "preview")
 # Reused verbatim from profiles.py:306 — single linear quantifier, no ReDoS.
-_MEMBER_EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
 
 # Membership allowlist for SPDX validation — a fixed-string set + the
 # ``LicenseRef-`` prefix. NO regex over the (user-supplied) SPDX string, so this
@@ -60,11 +58,14 @@ class NoPreviewSource(Exception):
 
 
 def _safe_member_ext(member_name: str) -> str:
-    """The extension for a ZIP member, allowlisted to ``^\\.[A-Za-z0-9]{1,8}$``
-    (else ``.wav``). Used ONLY to choose the output extension — never the path
-    (B11). Linear regex, no ReDoS."""
-    ext = os.path.splitext(member_name)[1]
-    return ext if _MEMBER_EXT_RE.match(ext) else ".wav"
+    """The extension for a ZIP member: a known audio or video extension, else
+    ``.wav``. Used ONLY to choose the output extension — never the path (B11).
+    The file is served back from ``/voice_audio``, so a member named
+    ``ref_audio.html`` must never keep its extension (VC-CVD-01892-V)."""
+    from core.media_types import MEDIA_EXTS
+
+    ext = os.path.splitext(member_name)[1].lower()
+    return ext if ext in MEDIA_EXTS else ".wav"
 
 
 def normalize_spdx(spdx: Optional[str]) -> str:
@@ -110,6 +111,7 @@ def build_manifest(
             "seed": profile.get("seed"),                 # int or None (A16)
             "is_locked": bool(profile.get("is_locked")),
             "vd_states": profile.get("vd_states"),        # JSON string or None (A15) — never re-parsed
+            "design_recipe": profile.get("design_recipe"),  # original free-form Voice Design prompt
         },
         "engine": {"id": engine_id or "", "design_params": None},
         "license": {"spdx": normalize_spdx(license_spdx), "custom_text": custom_license_text or None},
@@ -163,6 +165,7 @@ def _legacy_metadata(profile: dict, omnivoice_version: str) -> dict:
         "seed": profile.get("seed"),
         "kind": profile.get("kind") or "clone",
         "vd_states": profile.get("vd_states"),
+        "design_recipe": profile.get("design_recipe"),
         "is_locked": bool(profile.get("is_locked")),
         "omnivoice_version": omnivoice_version or "",
     }
@@ -392,6 +395,7 @@ def parse_persona_bundle(content: bytes) -> ParsedPersona:
                 "seed": legacy.get("seed"),
                 "is_locked": bool(legacy.get("is_locked")),
                 "vd_states": legacy.get("vd_states"),
+                "design_recipe": legacy.get("design_recipe"),
             },
             "license": {"spdx": DEFAULT_LICENSE, "custom_text": None},
             "tags": [],

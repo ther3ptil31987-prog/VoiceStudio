@@ -1,3 +1,5 @@
+import importlib
+import importlib.util
 import os
 import sys
 import platform
@@ -7,11 +9,16 @@ import psutil
 import asyncio
 import logging
 from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Query, Request
-from core.prefs import set_ as prefs_set, delete as prefs_delete
+from core.prefs import delete as prefs_delete, set_ as prefs_set
 from services import network_share
 from services import tailscale as _tailscale
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse
-from api.dependencies import is_loopback, require_admin, require_admin_action
+from api.dependencies import (
+    is_loopback,
+    require_admin,
+    require_admin_action,
+    require_admin_diagnostics,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 import torch
 import shutil
@@ -19,7 +26,7 @@ import subprocess
 import shlex
 
 from core.config import OUTPUTS_DIR, DATA_DIR, CRASH_LOG_PATH, LOG_PATH, IDLE_TIMEOUT_SECONDS
-from core.version import APP_VERSION
+from core.version import APP_VERSION, build_commit
 from core.browser_guard import reject_cross_site_get
 from core.logging_utils import log_safe
 from core.poll_guard import PollGuard
@@ -40,13 +47,46 @@ from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 router = APIRouter(dependencies=[Depends(require_admin)])
 logger = logging.getLogger("omnivoice.api")
 
+def _probe_accelerators(torch_module, cpu_pinned: bool) -> tuple[bool, bool, bool, bool]:
+    """(mps, cuda, xpu, npu) availability. A host pinned to CPU probes none of
+    them: that choice is the recovery after a graphics driver crash (#4002),
+    and initialising the driver for a status page could crash it again."""
+    if cpu_pinned:
+        return False, False, False, False
+    is_mac = hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available()
+    is_cuda = torch_module.cuda.is_available()
+    try:
+        is_xpu = hasattr(torch_module, "xpu") and torch_module.xpu.is_available()
+    except Exception:
+        is_xpu = False
+    try:
+        # torch.npu exists only once the Ascend extension registers it; torch_npu
+        # releases before 2.5.1 do not autoload, so import it where installed.
+        if not hasattr(torch_module, "npu") and importlib.util.find_spec("torch_npu"):
+            importlib.import_module("torch_npu")
+        is_npu = hasattr(torch_module, "npu") and torch_module.npu.is_available()
+    except Exception:
+        is_npu = False
+    return is_mac, is_cuda, is_xpu, is_npu
+
+
+def _cpu_pinned() -> bool:
+    """The user's explicit CPU choice, read without detecting capabilities.
+
+    ``detect_host_caps()`` would cache its snapshot here, at import, before
+    ``_probe_accelerators`` imports ``torch_npu``; a host whose Ascend
+    extension does not autoload would then lose its NPU for the whole
+    process. The choice alone is enough to decide whether to probe."""
+    try:
+        from core.device_caps import requested_device_override
+
+        return requested_device_override() == "cpu"
+    except Exception:  # noqa: BLE001 - a status page must never stop startup
+        return False
+
+
 # Cache device checks at module load — they don't change at runtime
-_is_mac = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-_is_cuda = torch.cuda.is_available()
-try:
-    _is_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
-except Exception:
-    _is_xpu = False
+_is_mac, _is_cuda, _is_xpu, _is_npu = _probe_accelerators(torch, _cpu_pinned())
 # Prime psutil's internal CPU counter so the first non-blocking call returns useful data
 psutil.cpu_percent(interval=None)
 
@@ -71,7 +111,7 @@ def _detect_cpu_model() -> str:
         if sys.platform == "darwin":
             import subprocess
             return subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=5
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, errors="replace", timeout=5
             ).strip()
         return platform.processor() or ""
     except Exception:
@@ -104,11 +144,12 @@ def _detect_os_gpu_name() -> str:
                 ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=3,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            names = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
             return max(names, key=_gpu_name_priority, default="")
         if sys.platform.startswith("linux"):
             executable = shutil.which("lspci")
@@ -118,11 +159,12 @@ def _detect_os_gpu_name() -> str:
                 [executable, "-mm"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=2,
                 check=False,
             )
             names = []
-            for line in result.stdout.splitlines():
+            for line in (result.stdout or "").splitlines():
                 parts = shlex.split(line)
                 if len(parts) >= 4 and parts[1] in {"VGA compatible controller", "3D controller"}:
                     names.append(" ".join(parts[2:4]))
@@ -135,18 +177,39 @@ def _detect_os_gpu_name() -> str:
                 [executable, "SPDisplaysDataType"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=3,
                 check=False,
             )
             names = [
                 line.split(":", 1)[1].strip()
-                for line in result.stdout.splitlines()
+                for line in (result.stdout or "").splitlines()
                 if "Chipset Model:" in line
             ]
             return max(names, key=_gpu_name_priority, default="")
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - best-effort label; it runs at import time
+        # A probe failure must never stop the backend from starting (#3612).
         return ""
     return ""
+
+
+def _active_accelerator():
+    """(module, name) of the accelerator this host runs on, or (None, "").
+
+    One resolution shared by device detection, ``/sysinfo`` and the post-flush
+    snapshot, so a host's backend is decided in a single place. CUDA, Intel XPU
+    and Ascend NPU all expose ``get_device_name`` / ``get_device_properties`` /
+    ``memory_allocated`` / ``memory_reserved`` through the same shape, so the
+    same code covers them. MPS is unified-memory and keeps its own branch (it
+    reports no device-side total).
+    """
+    if _is_cuda:
+        return torch.cuda, "cuda"
+    if _is_xpu:
+        return torch.xpu, "xpu"
+    if _is_npu:
+        return torch.npu, "npu"
+    return None, ""
 
 
 def _detect_gpu() -> tuple[str, float]:
@@ -155,14 +218,12 @@ def _detect_gpu() -> tuple[str, float]:
     MPS has unified memory, so there's no separate VRAM figure to report;
     the name alone tells a bug-report reader what hardware this is.
     """
+    backend, _ = _active_accelerator()
     try:
-        if _is_cuda:
-            props = torch.cuda.get_device_properties(0)
-            return torch.cuda.get_device_name(0), round(props.total_memory / (1024 ** 3), 1)
-        if _is_xpu:
-            props = torch.xpu.get_device_properties(0)
+        if backend is not None:
+            props = backend.get_device_properties(0)
             total_memory = float(getattr(props, "total_memory", 0.0))
-            return torch.xpu.get_device_name(0), round(total_memory / (1024 ** 3), 1)
+            return backend.get_device_name(0), round(total_memory / (1024 ** 3), 1)
         if _is_mac:
             return "Apple Silicon (MPS)", 0.0
     except Exception:
@@ -202,13 +263,14 @@ def _nvidia_live_stats() -> tuple[float, float, float] | None:
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=1.5,
             check=False,
             creationflags=creationflags,
         )
         if result.returncode != 0:
             return None
-        values = [float(value.strip()) for value in result.stdout.splitlines()[0].split(",")]
+        values = [float(value.strip()) for value in (result.stdout or "").splitlines()[0].split(",")]
         if len(values) != 3:
             return None
         utilization, used_mib, total_mib = values
@@ -339,7 +401,7 @@ def system_info():
     and a 500 here blocks the entire UI from rendering system details.
     """
     try:
-        _ffmpeg = find_ffmpeg()
+        _ffmpeg_path = find_ffmpeg()
         from services import model_manager as _mm
         from services import asr_backend as _asr_backend
         from core import prefs as _prefs_mod
@@ -355,6 +417,7 @@ def system_info():
         )
         return {
             "app_version": APP_VERSION,
+            "build_commit": build_commit(),
             "generate_timeout_s": _mm.GPU_JOB_TIMEOUT_S,
             "cpu_generate_timeout_s": _mm.CPU_JOB_TIMEOUT_S,
             # #1787 review fix: a saved prefs.json value for either key can be
@@ -387,8 +450,8 @@ def system_info():
             "gpu_name": _GPU_NAME,
             "vram_total_gb": _VRAM_TOTAL_GB,
             "disk_free_gb": _disk_free_gb(),
-            "ffmpeg_ok": bool(_ffmpeg),
-            "ffmpeg_path": _ffmpeg or "",
+            "ffmpeg_ok": bool(_ffmpeg_path),
+            "ffmpeg_path": _ffmpeg_path or "",
             "proxy_url": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "",
             "share_enabled": network_share.get_state().enabled,
             "share_port": network_share.get_state().share_port,
@@ -402,6 +465,7 @@ def system_info():
         logger.exception("system_info failed — returning safe defaults")
         return {
             "app_version": APP_VERSION,
+            "build_commit": build_commit(),
             "generate_timeout_s": 300.0,
             "cpu_generate_timeout_s": 600.0,
             "generate_timeout_shadowed": False,
@@ -603,7 +667,7 @@ def _tauri_log_candidates():
     return _tauri_plugin_log_candidates() + _backend_redirect_log_candidates()
 
 
-@router.get("/system/logs")
+@router.get("/system/logs", dependencies=[Depends(require_admin_diagnostics)])
 async def system_logs(tail: int = 200):
     """Tail the rolling runtime log — everything Python logged since last rotation.
 
@@ -633,14 +697,14 @@ async def system_logs(tail: int = 200):
             # report can then say whether it crossed a rollover.
             "paths": paths,
         }
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not read log at {path}: {e}. Check file permissions or delete it manually.",
+            detail="Could not read the log file. Check its permissions or delete it manually.",
         )
 
 
-@router.get("/system/logs/tauri")
+@router.get("/system/logs/tauri", dependencies=[Depends(require_admin_diagnostics)])
 async def system_logs_tauri(tail: int = 200):
     """Tail the Tauri plugin log (or backend stdout redirect, whichever exists)."""
     try:
@@ -665,7 +729,7 @@ async def system_logs_tauri(tail: int = 200):
     return {"lines": [], "path": None, "exists": False, "candidates": candidates}
 
 
-@router.get("/system/logs/stream")
+@router.get("/system/logs/stream", dependencies=[Depends(require_admin_diagnostics)])
 async def stream_logs(
     source: str = Query("backend", description="'backend' or 'tauri'"),
     interval: float = Query(1.0, ge=0.3, le=10.0, description="Poll interval in seconds"),
@@ -759,10 +823,13 @@ async def clear_system_logs():
             try:
                 await asyncio.to_thread(_truncate_file, p)
                 cleared_any = True
-            except Exception as e:
+            except Exception:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Could not clear log at {p}: {e}. The file may be open in another process or read-only — close tailing tools and retry.",
+                    detail=(
+                        "Could not clear the log file. It may be open in another program or "
+                        "read-only; close anything tailing it and try again."
+                    ),
                 )
     if cleared_any:
         # The crash log just shrank to zero — drop any stored ack so a stale
@@ -820,6 +887,7 @@ def get_sys_info():
     total_vram = 0.0
     gpu_active = False
 
+    backend, _ = _active_accelerator()
     try:
         if _is_mac:
             alloc = getattr(torch.mps, "current_allocated_memory", None)
@@ -828,13 +896,10 @@ def get_sys_info():
                 vram = driver() / (1024**3)
             elif alloc:
                 vram = alloc() / (1024**3)
-        elif _is_cuda:
-            vram = torch.cuda.memory_allocated() / (1024**3)
-            total_vram = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024**3)
-        elif _is_xpu:
-            vram = torch.xpu.memory_allocated() / (1024**3)
+        elif backend is not None:
+            vram = backend.memory_allocated() / (1024**3)
             total_vram = float(
-                getattr(torch.xpu.get_device_properties(0), "total_memory", 0.0)
+                getattr(backend.get_device_properties(backend.current_device()), "total_memory", 0.0)
             ) / (1024**3)
     except Exception:
         pass
@@ -906,6 +971,7 @@ async def flush_memory(unload_model: bool = False):
     # CUDA context plus kernel workspaces, which no in-process call can return.
     vram_after = 0.0
     vram_reserved = 0.0
+    backend, _ = _active_accelerator()
     try:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             driver = getattr(torch.mps, "driver_allocated_memory", None)
@@ -913,9 +979,9 @@ async def flush_memory(unload_model: bool = False):
                 vram_after = driver() / (1024**3)
             current = getattr(torch.mps, "current_allocated_memory", None)
             vram_reserved = (current() / (1024**3)) if current else vram_after
-        elif torch.cuda.is_available():
-            vram_after = torch.cuda.memory_allocated() / (1024**3)
-            vram_reserved = torch.cuda.memory_reserved() / (1024**3)
+        elif backend is not None:
+            vram_after = backend.memory_allocated() / (1024**3)
+            vram_reserved = backend.memory_reserved() / (1024**3)
     except Exception:
         pass
 
@@ -940,6 +1006,11 @@ def _gpu_arch_warning_cached() -> "str | None":
     too heavy for the 30s notifications poll)."""
     if not _GPU_ARCH_WARNING:
         try:
+            from core.gpu_self_test import pending
+
+            # Not cached: an answer given now would hide a failure found later.
+            if pending():
+                return None
             from services.model_manager import check_device_compatibility
             compatible, warning = check_device_compatibility()
             _GPU_ARCH_WARNING.append(None if compatible else warning)
@@ -985,11 +1056,16 @@ def system_notifications():
     # the panel. Checked once per process: it lazy-imports torch.
     gpu_warn = _gpu_arch_warning_cached()
     if gpu_warn:
+        from core.device_caps import LEGACY_NVIDIA_MARKER
+
+        # A pre-Volta card is already routed to the CPU (nothing to be noisy),
+        # and no other build can cover it, so it is a warning with its own text.
+        legacy = LEGACY_NVIDIA_MARKER in gpu_warn
         notes.append({
             "id": "gpu-arch-unsupported",
-            "level": "error",
+            "level": "warn" if legacy else "error",
             "title": "GPU not supported by this PyTorch build",
-            "message": gpu_warn + " Until then, output will be noise/garbage.",
+            "message": gpu_warn if legacy else gpu_warn + " Until then, output will be noise/garbage.",
         })
 
     # 2. Missing ffmpeg
@@ -1137,7 +1213,7 @@ def _crashed_last_session() -> bool:
     return mtime < _PROCESS_START_TS
 
 
-@router.get("/system/last-run-crash")
+@router.get("/system/last-run-crash", dependencies=[Depends(require_admin_diagnostics)])
 async def get_last_run_crash():
     """Newest unclean-shutdown record from the previous backend run (#1164)
     — the deployment-agnostic twin of the desktop shell's crash marker
@@ -1261,18 +1337,14 @@ def _authorized_sidecar_dir(value, authorization) -> str:
 
 @router.post("/system/set-env")
 async def set_env_var(body: dict):
-    """Set an environment variable at runtime, persisted across restarts.
+    """Set an environment variable for the running backend.
 
-    Persistent keys (proxy, FFMPEG_PATH, translation provider keys, …) are
-    saved to ``prefs.json`` so they survive backend restarts (restored at
-    startup in ``main.py``). HF_TOKEN is persisted via
-    ``token_resolver.persist_hub_token()`` (and cleared with the shared token-file helper). Other keys
-    are set on ``os.environ`` for the running process.
+    Keys in ``PERSISTENT_KEYS`` are saved in prefs.json and restored during
+    startup in main.py. HF_TOKEN is saved by
+    ``token_resolver.persist_hub_token()`` and cleared through the shared
+    token-file helper. Other accepted keys affect only this process.
 
-    The loopback-origin gate that previously lived inline here is now applied
-    at the router level via `dependencies=[Depends(require_admin)]` on
-    `router` — see the top of this file. Every route on this router is
-    gated, including this one. The 403 body and behavior are unchanged.
+    The loopback-origin gate that previously lived inline here is now applied at the router level via `dependencies=[Depends(require_admin)]` on `router` — see the top of this file. Every route on this router is gated, including this one. The 403 body and behavior are unchanged.
     """
     ALLOWED_KEYS = PERSISTENT_KEYS | {"HF_TOKEN", "TRANSLATE_API_KEY"}
     key = body.get("key", "")
@@ -1352,11 +1424,9 @@ async def set_env_var(body: dict):
 
     # HF_TOKEN persistence is handled above via persist_hub_token()/
     # clear_hf_cli_tokens() — it never touches prefs.json. Everything else in
-    # PERSISTENT_KEYS (proxy, FFMPEG_PATH, translation provider keys, …) is
-    # saved to prefs.json so it survives backend restarts (restored at
-    # startup in main.py). Non-persistent keys stay process-local.
+    # the persistent set is stored after the process environment is updated.
     if key != "HF_TOKEN" and key in PERSISTENT_KEYS:
-        prefs_key = f"env.{key}"
+        prefs_key = "env." + key
         from services.translation_apis import SECRET_ENV_KEYS
         if key in SECRET_ENV_KEYS:
             from services import settings_store
@@ -1479,7 +1549,7 @@ def hf_token_state():
 # ── Error journal ─────────────────────────────────────────────────────────
 
 
-@router.get("/system/errors/recent")
+@router.get("/system/errors/recent", dependencies=[Depends(require_admin_diagnostics)])
 def recent_errors(limit: int = Query(20, ge=1, le=50)):
     """Recent unhandled backend errors, newest first — structured, deduped
     (count per fingerprint), classified (error_class), pre-scrubbed. The
@@ -1582,6 +1652,12 @@ async def network_enable(request: Request):
     }
 
 
+@router.get("/system/network/check")
+async def network_check(request: Request):
+    """Self-check for LAN sharing: bind address, port and per-address listener probe."""
+    return await network_share.self_check(request.app)
+
+
 @router.post("/system/network/disable")
 async def network_disable(request: Request):
     st = await network_share.disable(request.app)
@@ -1620,7 +1696,7 @@ async def tailscale_disable():
 # stores nothing new, and transmits nothing anywhere: the only consumer is the
 # user's own UI over loopback. Read-only, content-free (counts and totals,
 # never the text of a take). Product analytics for the PROJECT is a separate,
-# consent-gated path (core/analytics.py: opt-in PostHog behind the first-run
+# consent-gated path (core/analytics.py: opt-in Supermetry behind the first-run
 # prompt, allowlisted content-free metadata only) — this endpoint stays local
 # regardless of that consent.
 @router.get("/stats/usage")

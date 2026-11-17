@@ -6,15 +6,16 @@ import {
   segTimeRange,
   formatTranscriptExport,
   preferredTranscript,
+  canExportTranscriptSubtitles,
+  type TranscriptExportFormat,
 } from '@shared/utils/transcriptionFormat';
 import { RecordingInputs } from '@/components/recording-inputs';
-import { AgentFixButton } from '@/components/agent-fix-button';
+import { NotReadyNotice, SetUpLink } from '@/components/engine-notice';
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Link, useNavigate } from '@tanstack/react-router';
+import { useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
-  AlertCircleIcon,
   Clock3Icon,
   KeyboardIcon,
   LanguagesIcon,
@@ -34,14 +35,17 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { runRendererTask } from '@/lib/global-error-recovery';
-import { Button, buttonVariants } from '@/components/ui/button';
+import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { VirtualList } from '@/components/virtual-list';
+import { Switch } from '@/components/ui/switch';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { WaveformPlayer } from '@/components/waveform-player';
 import { useRecording } from '@/hooks/use-recording';
 import { useDictationSelection } from '@/hooks/use-dictation-selection';
 import { useEngines } from '@/hooks/use-engines';
 import { apiJson, describeError } from '@/lib/api/client';
+import { TranscriptionFailure } from './transcription-failure';
 import { setCloneSetting } from '@/lib/store/clone-settings';
 import { cn } from '@/lib/utils';
 import {
@@ -53,16 +57,30 @@ import {
   TRANSCRIPTION_EVENT,
   type TranscriptEntry,
 } from '@shared/utils/transcriptionsStore';
-import { beginAppActivity } from '@/lib/app-activity';
 import { formatRelative } from '@/features/clone/format';
 import { useModelCatalogue } from '@/features/settings/model-catalogue-query';
 import { useNativeShortcut } from '@/hooks/use-native-dictation';
-import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
+import {
+  cancelTranscription,
+  clearTranscriptionFailure,
+  setTranscriptionsViewing,
+  startTranscription,
+  useTranscriptionJob,
+  type TranscriptionMode,
+} from './transcription-job';
 import { saveLocalFile } from '@/lib/local-export';
 import { formatShortcut } from '@shared/utils/dictationShortcut';
 
-type TranscriptionMode = 'fast' | 'accurate';
 const TRANSCRIPTION_MODE_KEY = 'voicestudio.transcription.mode';
+const TRANSCRIPTION_DIARIZE_KEY = 'voicestudio.transcription.diarize';
+
+function initialDiarize(): boolean {
+  try {
+    return localStorage.getItem(TRANSCRIPTION_DIARIZE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function initialTranscriptionMode(): TranscriptionMode {
   try {
@@ -82,13 +100,12 @@ export function TranscriptionsPage() {
   const [entries, setEntries] = useState(loadTranscriptions);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [search, setSearch] = useState('');
-  const [file, setFile] = useState<File | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [mode, setMode] = useState<TranscriptionMode>(initialTranscriptionMode);
-  const [busy, setBusy] = useState(false);
-  const [failed, setFailed] = useState<string | null>(null);
+  const [diarize, setDiarize] = useState(initialDiarize);
+  const job = useTranscriptionJob();
+  const { running: busy, error: failed, file, savedId } = job;
   const [confirmClear, setConfirmClear] = useState(false);
-  const request = useRef<AbortController | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const engines = useEngines();
   const dictation = useDictationSelection();
@@ -115,74 +132,40 @@ export function TranscriptionsPage() {
   const chooseMode = (next: string | undefined) => {
     if (next !== 'fast' && next !== 'accurate') return;
     setMode(next);
-    setFailed(null);
+    clearTranscriptionFailure();
     try {
       localStorage.setItem(TRANSCRIPTION_MODE_KEY, next);
     } catch {
       // A denied storage write should not prevent the current selection.
     }
   };
-  const transcribe = async (audio: File) => {
-    if (request.current) return;
-    const reportMode = mode;
-    recordActionBreadcrumb(`transcribe:${reportMode}:start`);
-    const controller = new AbortController();
-    request.current = controller;
-    setBusy(true);
-    setFailed(null);
-    setFile(audio);
-    const finishActivity = beginAppActivity(mode === 'accurate' ? 'transcription' : 'dictation');
+  const chooseDiarize = (next: boolean) => {
+    setDiarize(next);
     try {
-      const ready = await apiJson<{ ready: boolean }>(
-        mode === 'accurate' ? '/dictation/readiness?purpose=transcribe' : '/dictation/readiness',
-        { signal: controller.signal },
-      );
-      if (!ready.ready) {
-        recordActionBreadcrumb(`transcribe:${reportMode}:error`);
-        void fileReadiness.refetch();
-        return;
-      }
-      const body = new FormData();
-      body.set('audio', audio);
-      body.set('mode', mode);
-      const refinement = await apiJson<{ auto: boolean }>('/api/settings/dictation-refinement', {
-        signal: controller.signal,
-      }).catch(() => ({ auto: false }));
-      if (controller.signal.aborted) return;
-      body.set('refine', String(refinement.auto));
-      const result = await apiJson<Partial<TranscriptEntry>>('/transcribe', {
-        method: 'POST',
-        body,
-        signal: controller.signal,
-      });
-      if (!controller.signal.aborted) {
-        const saved = addTranscription(result);
-        setSelectedId(saved.id);
-        recordActionBreadcrumb(`transcribe:${reportMode}:complete`);
-      }
-    } catch (error) {
-      recordActionBreadcrumb(
-        `transcribe:${reportMode}:${controller.signal.aborted ? 'cancel' : 'error'}`,
-      );
-      if (!controller.signal.aborted) setFailed(describeError(error));
-    } finally {
-      finishActivity();
-      if (request.current === controller) {
-        request.current = null;
-        setBusy(false);
-      }
+      localStorage.setItem(TRANSCRIPTION_DIARIZE_KEY, next ? '1' : '0');
+    } catch {
+      // A denied storage write should not prevent the current selection.
     }
+  };
+  const transcribe = async (audio: File) => {
+    const outcome = await startTranscription(audio, mode, { diarize });
+    if (outcome === 'not-ready') void fileReadiness.refetch();
   };
   const recording = useRecording((audio) => void transcribe(audio));
   const capturing =
     liveBusy || recording.isStarting || recording.isRecording || recording.isCleaning;
   useEffect(() => {
+    setTranscriptionsViewing(true);
     const unsubscribe = subscribeTranscriptions(setEntries);
     return () => {
+      setTranscriptionsViewing(false);
       unsubscribe();
-      request.current?.abort();
     };
   }, []);
+  useEffect(() => {
+    // A job that finished while this page was unmounted: show its result.
+    if (savedId !== null) setSelectedId(savedId);
+  }, [savedId]);
   useEffect(() => {
     if (!file) {
       setUrl(null);
@@ -192,6 +175,7 @@ export function TranscriptionsPage() {
     setUrl(next);
     return () => URL.revokeObjectURL(next);
   }, [file]);
+  const historyRef = useRef<HTMLDivElement>(null);
   const visible = useMemo(
     () =>
       entries.filter((entry) =>
@@ -202,6 +186,10 @@ export function TranscriptionsPage() {
     [entries, search],
   );
   const selected = visible.find((entry) => entry.id === selectedId);
+  const subtitlesAvailable = useMemo(
+    () => !!selected && canExportTranscriptSubtitles(selected),
+    [selected],
+  );
   useEffect(() => {
     const next = visible[0]?.id ?? null;
     if (!visible.some((entry) => entry.id === selectedId) && selectedId !== next) {
@@ -228,12 +216,20 @@ export function TranscriptionsPage() {
       toast.error(t('modelSettings.failed'));
     }
   };
-  const exportText = async (list: TranscriptEntry[]) => {
+  const exportText = async (
+    list: TranscriptEntry[],
+    format: TranscriptExportFormat = 'history',
+  ) => {
     try {
-      const text = formatTranscriptExport(list);
+      const text = formatTranscriptExport(list, { format });
       const result = await saveLocalFile(
-        new Blob([text], { type: 'text/plain;charset=utf-8' }),
-        `transcriptions_${new Date().toISOString().slice(0, 10)}.txt`,
+        new Blob([text], {
+          type:
+            format === 'srt' ? 'application/x-subrip;charset=utf-8' : 'text/plain;charset=utf-8',
+        }),
+        format === 'history'
+          ? `transcriptions_${new Date().toISOString().slice(0, 10)}.txt`
+          : `transcript.${format === 'srt' ? 'srt' : 'txt'}`,
       );
       if (!result.canceled) toast.success(t('transcriptions.exported'));
     } catch (cause) {
@@ -278,42 +274,50 @@ export function TranscriptionsPage() {
             />
           ) : null}
           {entries.length > 0 && (
-            <div className="mt-3 min-h-0 flex-1 space-y-1 overflow-y-auto">
-              {visible.map((entry) => (
-                <button
-                  key={entry.id}
-                  className={cn(
-                    'w-full rounded-xl border border-transparent px-3 py-2.5 text-left text-sm transition-[color,background-color,border-color,box-shadow] hover:border-border/55 hover:bg-accent/60',
-                    selectedId === entry.id &&
-                      'border-primary/20 bg-primary/[0.07] shadow-[inset_2px_0_0_var(--primary)]',
-                  )}
-                  aria-pressed={selectedId === entry.id}
-                  onClick={() => setSelectedId(entry.id)}
-                >
-                  <p className="line-clamp-2 text-[13px] leading-5 font-medium">
-                    {preferredTranscript(entry)}
-                  </p>
-                  <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                    <span className="inline-flex min-w-0 items-center gap-1">
-                      <Clock3Icon className="size-3 shrink-0" aria-hidden="true" />
-                      <span className="truncate">
-                        {formatRelative(entry.timestamp, i18n.language)}
-                      </span>
-                    </span>
-                    {entry.language && entry.language !== 'unknown' ? (
+            <div ref={historyRef} className="mt-3 min-h-0 flex-1 overflow-y-auto">
+              <VirtualList
+                items={visible}
+                scrollRef={historyRef}
+                getKey={(entry) => entry.id}
+                activeKey={selectedId}
+                estimateSize={72}
+                rowClassName="pb-1"
+                renderRow={(entry) => (
+                  <button
+                    key={entry.id}
+                    className={cn(
+                      'w-full rounded-xl border border-transparent px-3 py-2.5 text-left text-sm transition-[color,background-color,border-color,box-shadow] hover:border-border/55 hover:bg-accent/60',
+                      selectedId === entry.id &&
+                        'border-primary/20 bg-primary/[0.07] shadow-[inset_2px_0_0_var(--primary)]',
+                    )}
+                    aria-pressed={selectedId === entry.id}
+                    onClick={() => setSelectedId(entry.id)}
+                  >
+                    <p className="line-clamp-2 text-[13px] leading-5 font-medium" dir="auto">
+                      {preferredTranscript(entry)}
+                    </p>
+                    <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
                       <span className="inline-flex min-w-0 items-center gap-1">
-                        <LanguagesIcon className="size-3 shrink-0" aria-hidden="true" />
-                        <span className="truncate">{entry.language}</span>
+                        <Clock3Icon className="size-3 shrink-0" aria-hidden="true" />
+                        <span className="truncate">
+                          {formatRelative(entry.timestamp, i18n.language)}
+                        </span>
                       </span>
-                    ) : null}
-                    {Number(entry.duration_s) > 0 ? (
-                      <span className="shrink-0 tabular-nums">
-                        {Number(entry.duration_s).toFixed(1)}s
-                      </span>
-                    ) : null}
-                  </div>
-                </button>
-              ))}
+                      {entry.language && entry.language !== 'unknown' ? (
+                        <span className="inline-flex min-w-0 items-center gap-1">
+                          <LanguagesIcon className="size-3 shrink-0" aria-hidden="true" />
+                          <span className="truncate">{entry.language}</span>
+                        </span>
+                      ) : null}
+                      {Number(entry.duration_s) > 0 ? (
+                        <span className="shrink-0 tabular-nums">
+                          {Number(entry.duration_s).toFixed(1)}s
+                        </span>
+                      ) : null}
+                    </div>
+                  </button>
+                )}
+              />
             </div>
           )}
           {entries.length > 0 && (
@@ -381,22 +385,27 @@ export function TranscriptionsPage() {
                   {t('transcriptions.mode_accurate')}
                 </ToggleGroupItem>
               </ToggleGroup>
+              {mode === 'accurate' ? (
+                <label className="inline-flex items-center gap-2 px-1 text-xs text-muted-foreground">
+                  <Switch
+                    size="sm"
+                    checked={diarize}
+                    onCheckedChange={chooseDiarize}
+                    disabled={busy || capturing}
+                  />
+                  {t('transcriptions.identify_speakers')}
+                </label>
+              ) : null}
               {selectedModel ? (
                 <span
                   className="inline-flex min-w-0 max-w-72 items-center gap-1.5 px-1 text-xs text-muted-foreground"
-                  title={`${t(
-                    mode === 'accurate' ? 'engineSidebar.asr' : 'engineSidebar.dictation',
-                  )} · ${selectedModel}`}
+                  title={t('transcriptions.active_model', { model: selectedModel })}
                 >
                   {mode === 'accurate' ? (
                     <ScanTextIcon className="size-3.5 shrink-0" aria-hidden="true" />
                   ) : (
                     <KeyboardIcon className="size-3.5 shrink-0" aria-hidden="true" />
                   )}
-                  <span className="shrink-0">
-                    {t(mode === 'accurate' ? 'engineSidebar.asr' : 'engineSidebar.dictation')}
-                  </span>
-                  <span aria-hidden="true">·</span>
                   <span className="truncate">{selectedModel}</span>
                 </span>
               ) : null}
@@ -490,7 +499,7 @@ export function TranscriptionsPage() {
                       <Button
                         variant="ghost"
                         onClick={() => {
-                          request.current?.abort();
+                          cancelTranscription();
                         }}
                       >
                         {t('common.cancel')}
@@ -508,21 +517,12 @@ export function TranscriptionsPage() {
             !accurateReadiness.data?.ready &&
             !accurateReadiness.isPending && (
               <div className="border-b border-border/50 px-6 py-3">
-                <div className="mx-auto flex w-full max-w-4xl items-center gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-sm">
-                  <ScanTextIcon className="size-4 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1">{t('transcriptions.missing_model')}</span>
-                  <AgentFixButton request="Restore accurate file transcription. Install and activate the best compatible local ASR model through VoiceStudio, preserve the selected media and mode, then verify transcription is ready to start." />
-                  <Link
-                    to="/settings/models/$family"
-                    params={{ family: 'asr' }}
-                    className={buttonVariants({
-                      variant: 'outline',
-                      size: 'sm',
-                    })}
-                  >
-                    {t('engineSidebar.asr')}
-                  </Link>
-                </div>
+                <NotReadyNotice
+                  compact
+                  className="mx-auto w-full max-w-4xl"
+                  title={t('transcriptions.missing_model')}
+                  action={<SetUpLink family="asr" />}
+                />
               </div>
             )}
           <div className="border-b border-border/50 px-6 py-3">
@@ -569,18 +569,7 @@ export function TranscriptionsPage() {
                                 : 'common.loading',
                           )}
                 </span>
-                {liveState.issue === 'model' && (
-                  <>
-                    <AgentFixButton request="Restore live dictation readiness. Install and activate the best compatible dictation model through VoiceStudio, preserve this transcription workspace, and verify recording can start." />
-                    <Link
-                      to="/settings/models/$family"
-                      params={{ family: 'dictation' }}
-                      className={buttonVariants({ variant: 'ghost', size: 'sm' })}
-                    >
-                      {t('nav.settings')}
-                    </Link>
-                  </>
-                )}
+                {liveState.issue === 'model' && <SetUpLink family="dictation" />}
                 {liveState.stage === 'error' && liveState.text && (
                   <Button
                     variant="ghost"
@@ -618,40 +607,12 @@ export function TranscriptionsPage() {
             </div>
           )}
           {failed && (
-            <div className="mx-6 mt-4 rounded-xl border border-border/60 bg-muted/20 px-4 py-3 text-sm">
-              <div className="flex items-center gap-3">
-                <AlertCircleIcon className="size-4 shrink-0 text-destructive" />
-                <span role="alert" className="min-w-0 flex-1 font-medium">
-                  {t('transcriptions.failed')}
-                </span>
-                <Button
-                  variant="ghost"
-                  disabled={!file || busy}
-                  onClick={() => file && void transcribe(file)}
-                >
-                  {t('backend.retry')}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={t('common.dismiss')}
-                  onClick={() => setFailed(null)}
-                >
-                  <XIcon />
-                </Button>
-              </div>
-              <details className="mt-1 pl-7 text-xs text-muted-foreground">
-                <summary className="cursor-pointer rounded py-1 focus-visible:outline-ring">
-                  {t('profileIdentity.details')}
-                </summary>
-                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted/40 p-3 font-mono text-xs">
-                  {failed}
-                </pre>
-                <Link to="/settings/logs" className="mt-2 inline-block underline">
-                  {t('settings.logs')}
-                </Link>
-              </details>
-            </div>
+            <TranscriptionFailure
+              failure={failed}
+              retryDisabled={!file || busy}
+              onRetry={() => file && void transcribe(file)}
+              onDismiss={clearTranscriptionFailure}
+            />
           )}
           <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
             {selected ? (
@@ -669,7 +630,7 @@ export function TranscriptionsPage() {
                       </span>
                     ) : null}
                   </div>
-                  <div className="flex gap-1">
+                  <div className="flex flex-wrap gap-1">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -689,6 +650,27 @@ export function TranscriptionsPage() {
                     </Button>
                     <Button
                       variant="ghost"
+                      size="sm"
+                      onClick={() => void exportText([selected], 'text')}
+                    >
+                      <FileTextIcon />
+                      {t('transcriptions.export_plain')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!subtitlesAvailable}
+                      aria-describedby={
+                        !subtitlesAvailable ? 'transcript-subtitle-hint' : undefined
+                      }
+                      title={t('transcriptions.original_transcript')}
+                      onClick={() => void exportText([selected], 'srt')}
+                    >
+                      <DownloadIcon />
+                      {t('transcriptions.export_srt')}
+                    </Button>
+                    <Button
+                      variant="ghost"
                       size="icon-sm"
                       aria-label={t('transcriptions.delete')}
                       onClick={() => remove(selected.id)}
@@ -697,7 +679,12 @@ export function TranscriptionsPage() {
                     </Button>
                   </div>
                 </div>
-                <p className="whitespace-pre-wrap text-base leading-7">
+                {!subtitlesAvailable && (
+                  <p id="transcript-subtitle-hint" className="text-xs text-muted-foreground">
+                    {t('transcriptions.timestamps_unavailable')}
+                  </p>
+                )}
+                <p className="whitespace-pre-wrap text-base leading-7" dir="auto">
                   {preferredTranscript(selected)}
                 </p>
                 {selected.refined_text && selected.refined_text.trim() !== selected.text.trim() ? (
@@ -734,6 +721,11 @@ export function TranscriptionsPage() {
                           <span className="mr-3 font-mono text-xs text-muted-foreground">
                             {segTimeRange(segment)}
                           </span>
+                          {segment.speaker ? (
+                            <span className="mr-2 font-medium text-foreground">
+                              {segment.speaker}
+                            </span>
+                          ) : null}
                           {segment.text}
                         </p>
                       ))}

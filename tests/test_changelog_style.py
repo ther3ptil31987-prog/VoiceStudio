@@ -56,8 +56,6 @@ _REF_ALLOWLIST = (
     # owner-authored download hardening, no public issue
     "Model downloads keep every file inside the model cache",
     # owner-authored entries without a public reference
-    "Remote workers open only the files a task sends as inputs",
-    "Remote worker registration signs a fresh single-use challenge",
     "The desktop app attaches only to a local backend that identifies itself",
     "Dubbing and batch jobs accept only plain language codes",
     "Saved voice, gallery and call-recording files are read only from inside",
@@ -103,7 +101,9 @@ def lint_changelog(text):
         subsection = None  # current "### X" title, None = section preamble
         has_subsections = any(ln.startswith("### ") for _, ln in body)
         has_highlights = any(ln.strip() == "**Highlights**" for _, ln in body)
-        if has_subsections and not has_highlights:
+        # Highlights are curated when a release is cut (scripts/release.py runs
+        # this lint on the new section), so a growing Unreleased may lack them.
+        if has_subsections and not has_highlights and heading != "## [Unreleased]":
             violations.append(
                 f"{heading}: entry subsections exist but no `**Highlights**` "
                 f"block — quiet style opens with a short Highlights bullet "
@@ -256,7 +256,7 @@ def test_linter_accepts_quiet_sample_and_grandfathers_old_sections():
 
 
 def test_linter_flags_missing_highlights():
-    bad = "## [Unreleased]\n\n### Fixed\n\n- A bug (#1)\n"
+    bad = "## [9.9.9] — 2099-01-01\n\n### Fixed\n\n- A bug (#1)\n"
     v = lint_changelog(bad)
     assert len(v) == 1 and "**Highlights**" in v[0]
 
@@ -340,3 +340,30 @@ def test_highlight_cardinality_preserves_published_and_work_in_progress_notes():
     for heading in ("## [0.5.3] — 2026-09-17", "## [Unreleased]"):
         text = heading + "\n\n**Highlights**\n\n- One item\n\n### Fixed\n\n- Fix (#1)\n"
         assert lint_changelog(text) == []
+
+
+def test_unreleased_may_grow_without_highlights_until_the_release_is_cut():
+    """After a release, fragments land in an empty Unreleased with no Highlights."""
+    unreleased = "## [Unreleased]\n\n### Fixed\n\n- A fix (#1)\n"
+    assert lint_changelog(unreleased) == []
+    released = unreleased.replace("[Unreleased]", "[9.9.9] — 2099-01-01")
+    assert any("**Highlights**" in v for v in lint_changelog(released))
+
+
+def test_reference_allowlist_entries_still_exist() -> None:
+    """Every grandfathered entry must still be in `CHANGELOG.md`.
+
+    `_REF_ALLOWLIST` exempts owner-authored entries that never had a public issue.
+    Nothing pruned it, so an entry whose line is later reworded or deleted
+    keeps exempting future entries from needing a reference —
+    the exemption outlives the reason it was granted. Delete the entry when its
+    line goes; this test says which ones.
+    """
+    with open(_REPO_CHANGELOG, encoding="utf-8") as handle:
+        text = handle.read()
+    stale = [entry for entry in _REF_ALLOWLIST if entry not in text]
+    assert not stale, (
+        "these _REF_ALLOWLIST entries no longer match a CHANGELOG.md line — delete them "
+        "from tests/test_changelog_style.py:\n  " + "\n  ".join(stale)
+    )
+

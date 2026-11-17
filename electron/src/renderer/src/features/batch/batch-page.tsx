@@ -20,6 +20,7 @@ import { SecondarySidebar } from '@/components/workspace-sidebar';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { PipelineFailure } from '@/components/pipeline-failure';
 import { EngineNotice } from '@/components/engine-notice';
+import { DisabledReason, firstReason } from '@/components/disabled-reason';
 import { WatchFolder } from './watch-folder';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -30,18 +31,20 @@ import { EngineLanguagePicker } from '@/features/clone/engine-language-picker';
 import { Switch } from '@/components/ui/switch';
 import { useProfiles } from '@/hooks/use-profiles';
 import { useTtsReadiness } from '@/hooks/use-tts-readiness';
-import { getBridge } from '@/components/bridge';
 import { apiJson, apiPath, describeError } from '@/lib/api/client';
 import { saveExport } from '@/lib/export-history';
-import { LANG_CODES } from '@shared/utils/languages';
+import { TRANSLATION_TARGET_LABELS, translationTargetCode } from '@/lib/translation-targets';
 import { PRESETS } from '@shared/utils/constants';
 import { announceModelLicenceRequired } from '@/features/settings/model-license-contract';
 import type { BatchJob } from '@shared/api/batch-types';
-import { generationFailureMessage } from '@shared/utils/generationFailureMessage';
+import { BatchJobFailure } from './batch-job-failure';
 import { enqueueVideos } from './enqueue';
+import { usePendingKeys } from './use-pending-keys';
 import { cachedTtsLanguagesSupported } from '@/lib/language-options';
 import { useTranslationEngines } from '@/features/settings/translation-settings';
-const languageOptions = LANG_CODES.map((item) => item.label);
+const languageOptions = TRANSLATION_TARGET_LABELS;
+const exportKey = (job: BatchJob, lang: string) => `${job.id}:${lang}`;
+
 export function BatchPage() {
   const { t } = useTranslation();
   const client = useQueryClient();
@@ -62,6 +65,7 @@ export function BatchPage() {
   const [tab, setTab] = useState('active');
   const [deleting, setDeleting] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  const exports = usePendingKeys();
   const addFiles = (selected: File[]) =>
     setFiles((current) => [
       ...current,
@@ -88,7 +92,8 @@ export function BatchPage() {
   useEffect(() => {
     for (const job of jobs.data ?? []) {
       const setup = job.setup_required;
-      if (setup?.kind !== 'model_licence_required' || announcedLicence.current.has(job.id)) continue;
+      if (setup?.kind !== 'model_licence_required' || announcedLicence.current.has(job.id))
+        continue;
       announcedLicence.current.add(job.id);
       announceModelLicenceRequired(setup);
     }
@@ -106,7 +111,7 @@ export function BatchPage() {
     try {
       const failed = await enqueueVideos(
         files,
-        langs.map((label) => LANG_CODES.find((item) => item.label === label)!.code),
+        langs.map((label) => translationTargetCode(label)!),
         voice,
         preserve,
         (file, cause) => {
@@ -169,24 +174,18 @@ export function BatchPage() {
       setActing(null);
     }
   };
-  const download = async (job: BatchJob, lang: string) => {
-    setError(null);
-    const url = apiPath(
-      '/batch/download/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
-    );
-    try {
-      const bridge = getBridge();
-      if (bridge) await saveExport(url, job.filename.replace(/\.[^.]+$/, '') + '_' + lang + '.mp4');
-      else {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = '';
-        link.click();
+  const download = (job: BatchJob, lang: string) =>
+    exports.run(exportKey(job, lang), async () => {
+      setError(null);
+      const url = apiPath(
+        '/batch/download/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
+      );
+      try {
+        await saveExport(url, job.filename.replace(/\.[^.]+$/, '') + '_' + lang + '.mp4');
+      } catch (cause) {
+        setError(t('clone.download_failed', { message: describeError(cause) }));
       }
-    } catch (cause) {
-      setError(t('clone.download_failed', { message: describeError(cause) }));
-    }
-  };
+    });
   return (
     <div className="flex h-full min-h-0 flex-col">
       <WorkspaceHeader>
@@ -360,25 +359,44 @@ export function BatchPage() {
               />
             </div>
           </section>
-          <Button
+          <DisabledReason
             className="w-full"
-            disabled={
-              busy ||
-              ttsBlocker !== null ||
-              !files.length ||
-              !langs.length ||
-              Boolean(
-                translationEngines.data &&
-                !(translationEngine?.ready ?? translationEngine?.installed),
-              )
-            }
-            onClick={() => void submit()}
+            reason={firstReason([
+              [ttsBlocker !== null, t('engines.none_ready_title')],
+              [!files.length, t('disabledReason.files_required')],
+              [!langs.length, t('disabledReason.languages_required')],
+              [
+                Boolean(
+                  translationEngines.data &&
+                  !(translationEngine?.ready ?? translationEngine?.installed),
+                ),
+                t('disabledReason.translation_not_ready'),
+              ],
+            ])}
           >
-            {t(busy ? 'common.loading' : 'batch.add_to_queue')}
-          </Button>
+            {(describedBy) => (
+              <Button
+                className="w-full"
+                disabled={
+                  busy ||
+                  ttsBlocker !== null ||
+                  !files.length ||
+                  !langs.length ||
+                  Boolean(
+                    translationEngines.data &&
+                    !(translationEngine?.ready ?? translationEngine?.installed),
+                  )
+                }
+                aria-describedby={describedBy}
+                onClick={() => void submit()}
+              >
+                {t(busy ? 'common.loading' : 'batch.add_to_queue')}
+              </Button>
+            )}
+          </DisabledReason>
           <EngineNotice operation="batch" />
           <WatchFolder
-            langs={langs.map((label) => LANG_CODES.find((item) => item.label === label)!.code)}
+            langs={langs.map((label) => translationTargetCode(label)!)}
             voiceId={voice}
             preserveBg={preserve}
             disabled={ttsBlocker !== null}
@@ -444,7 +462,7 @@ export function BatchPage() {
               </h2>
               {tab === 'active' && (
                 <>
-                  <p className="mt-2 text-sm text-muted-foreground">{t('batch.drop_hint')}</p>
+                  <p className="mt-2 text-sm text-muted-foreground">{t('batch.empty_hint')}</p>
                   <Button className="mt-5" onClick={() => input.current?.click()}>
                     <UploadIcon />
                     {t('batch.add_videos')}
@@ -464,6 +482,7 @@ export function BatchPage() {
                 act={act}
                 recover={recover}
                 download={download}
+                exporting={exports.pending}
               />
             ))}
           </div>
@@ -489,6 +508,7 @@ function BatchJobCard({
   act,
   recover,
   download,
+  exporting,
 }: {
   job: BatchJob;
   acting: string | null;
@@ -497,6 +517,7 @@ function BatchJobCard({
   act(job: BatchJob, remove: boolean): Promise<void>;
   recover(job: BatchJob): Promise<void>;
   download(job: BatchJob, lang: string): Promise<void>;
+  exporting: ReadonlySet<string>;
 }) {
   const { t, i18n } = useTranslation();
   const appearance = statusAppearance[job.status];
@@ -569,21 +590,17 @@ function BatchJobCard({
           {t('batch.completed_in', { duration: formatDuration(duration) })}
         </p>
       )}
-      {job.error && generationFailureMessage(job, t) && (
-        <p role="alert" className="mt-3 text-xs text-destructive">
-          {generationFailureMessage(job, t)}
-        </p>
-      )}
-      {job.error && (
-        <details className="mt-3 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          <summary>{t('common.more_info')}</summary>
-          <p className="mt-2 break-words">{job.error}</p>
-        </details>
-      )}
+      <BatchJobFailure job={job} />
       <div className="mt-3 flex flex-wrap justify-end gap-2">
         {job.status === 'done' &&
           Object.keys(job.outputs || {}).map((lang) => (
-            <Button key={lang} variant="ghost" size="sm" onClick={() => void download(job, lang)}>
+            <Button
+              key={lang}
+              variant="ghost"
+              size="sm"
+              disabled={exporting.has(exportKey(job, lang))}
+              onClick={() => void download(job, lang)}
+            >
               <DownloadIcon />
               {t('dub.export')} {lang}
             </Button>

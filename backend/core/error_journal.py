@@ -48,11 +48,17 @@ _entries: "OrderedDict[str, dict]" = OrderedDict()
 
 # Ordered: first match wins, most specific patterns up top.
 _CLASS_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Mirrors `failure._GPU_OOM_SIGNATURES`; pinned equal by
+    # tests/test_xpu_device_oom.py.
     ("GPU_OOM", (
         "cuda out of memory",
+        "cuda error: out of memory",
+        "cuda_error_out_of_memory",
         "mps backend out of memory",
         "hip out of memory",
         "out of memory on device",
+        "xpu out of memory",
+        "out_of_device_memory",
     )),
     # #2462: the host ran out of system RAM. Mirrors
     # `failure._HOST_OOM_SIGNATURES` — kept as literals here so a journal
@@ -221,6 +227,13 @@ def record(exc: BaseException, route: str = "", trace: str = "") -> dict:
     Never raises — this runs inside the global exception handler, where a
     second failure would shadow the one being reported.
     """
+    try:
+        from core import diagnostic_reports
+        diagnostic_reports.capture_failure(diagnostic_reports.route_stage(route), error=exc)
+    except Exception:
+        # Optional reporting must neither replace the original fault nor
+        # prevent the independent local journal from recording it.
+        pass
     try:
         error_class = classify_exception(exc, trace)
         fp = _fingerprint(error_class, exc)

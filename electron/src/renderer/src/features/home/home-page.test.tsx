@@ -1,9 +1,13 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ReactNode } from 'react';
+const projects = vi.hoisted(() => ({ saved: [] as unknown[], navigate: vi.fn() }));
 const browser = vi.hoisted(() => ({ open: vi.fn(async () => {}) }));
 const files = vi.hoisted(() => ({ openExternal: vi.fn(async () => {}) }));
-vi.mock('@/components/bridge', () => ({ getBridge: () => ({ browser, files }) }));
+vi.mock('@/components/bridge', () => ({
+  getBridge: () => ({ browser, files, app: { version: '0.0.0-test', isDev: false } }),
+  appVersion: () => '0.0.0-test',
+}));
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ to, children, ...props }: { to: string; children: ReactNode }) => (
@@ -11,22 +15,86 @@ vi.mock('@tanstack/react-router', () => ({
       {children}
     </a>
   ),
-  useNavigate: () => vi.fn(),
+  useNavigate: () => projects.navigate,
 }));
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
-  useQuery: () => ({ data: [] }),
+  useQuery: (options: { queryKey?: readonly unknown[] }) => ({
+    data: options.queryKey?.[0] === 'longform-projects' ? projects.saved : [],
+  }),
 }));
 vi.mock('@/hooks/use-profiles', () => ({ useProfiles: () => ({ data: [] }) }));
 vi.mock('@/components/app-shell/workspace-header', () => ({
   WorkspaceHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
 }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
 import { HomePage } from './home-page';
 import { homeContributors } from './home-contributors-data';
+import { HOME_CONTRIBUTOR_SLOTS } from './home-contributors';
 import en from '@/i18n/locales/en.json';
+import { blankLongformDraft, longformSession } from '@/features/longform/longform-session';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  projects.saved = [];
+  projects.navigate.mockClear();
+  longformSession.setState((state) => ({ ...state, active: null }));
+  vi.useRealTimers();
+});
+
+it('links the running version to its release notes', () => {
+  render(<HomePage />);
+  const link = screen.getByRole('link', { name: /update\.whats_new/ });
+  expect(link).toHaveAttribute('href', 'https://github.com/debpalash/VoiceStudio/releases');
+  expect(link).toHaveTextContent('app.version');
+});
+
+it('offers to hide the hero after three different profiles, until the next version', () => {
+  const { unmount } = render(<HomePage />);
+  const others = homeContributors.filter(
+    ({ login }) => login !== 'debpalash' && login !== 'velixio',
+  );
+  const open = (login: string) =>
+    fireEvent.click(screen.getByRole('link', { name: `GitHub · @${login}` }));
+  open(others[0].login);
+  open(others[0].login);
+  open(others[1].login);
+  fireEvent.click(screen.getByRole('link', { name: 'homeUi.allContributors' }));
+  expect(screen.queryByRole('button', { name: /homeUi\.hideUntilUpdate/ })).toBeNull();
+  open(others[2].login);
+  fireEvent.click(screen.getByRole('button', { name: /homeUi\.hideUntilUpdate/ }));
+  expect(screen.queryByText('homeUi.subtitle')).toBeNull();
+  expect(screen.getByRole('heading', { name: 'homeUi.title' })).toHaveClass('sr-only');
+  unmount();
+
+  render(<HomePage />);
+  expect(screen.queryByText('homeUi.subtitle')).toBeNull();
+  cleanup();
+  localStorage.setItem('voicestudio.home.heroHiddenFor', '0.0.0-older');
+  render(<HomePage />);
+  expect(screen.getByText('homeUi.subtitle')).toBeVisible();
+  expect(screen.queryByRole('button', { name: /homeUi\.hideUntilUpdate/ })).toBeNull();
+});
+
+it('adds snow in winter and Santa only in Christmas week', () => {
+  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(2027, 0, 10));
+  const { unmount } = render(<HomePage />);
+  expect(screen.getByTestId('home-snow')).toBeInTheDocument();
+  expect(screen.queryByTestId('home-christmas')).toBeNull();
+  unmount();
+  vi.setSystemTime(new Date(2026, 11, 24));
+  render(<HomePage />);
+  expect(screen.getByTestId('home-christmas')).toHaveTextContent('homeUi.hoHoHo');
+  cleanup();
+  vi.setSystemTime(new Date(2026, 6, 1));
+  render(<HomePage />);
+  expect(screen.queryByTestId('home-snow')).toBeNull();
+});
 
 it('keeps the heading and description together beside the contributor artwork', () => {
   render(<HomePage />);
@@ -53,7 +121,6 @@ it('previews the official website only when the title is clicked', () => {
 it('names the feature Dubbing consistently while preserving the existing route', () => {
   expect(en.dubWorkspace.title).toBe('Dubbing');
   expect(en.nav.dub).toBe('Dubbing');
-  expect(en.keyboard.dub).toBe('Dubbing');
   render(<HomePage />);
   expect(screen.getByRole('link', { name: /dubWorkspace.title/ })).toHaveAttribute('href', '/dub');
 });
@@ -61,10 +128,17 @@ it('names the feature Dubbing consistently while preserving the existing route',
 it('credits qualifying contributors and opens their GitHub profiles externally', () => {
   render(<HomePage />);
   const credits = screen.getAllByRole('listitem');
-  expect(credits).toHaveLength(homeContributors.length + 1);
   expect(
-    [1, 2, 3].map((row) => credits.filter((credit) => credit.style.gridRow === String(row)).length),
-  ).toEqual([5, 3, 2]);
+    Array.from(document.querySelectorAll('[data-core-maintainer]'), (badge) =>
+      badge.getAttribute('data-core-maintainer'),
+    ),
+  ).toEqual(['debpalash', 'velixio']);
+  const shown = homeContributors.slice(0, 2 + HOME_CONTRIBUTOR_SLOTS - 1);
+  expect(credits).toHaveLength(shown.length + 1);
+  expect(Array.from(document.querySelectorAll('.home-contributors-core li img')).length).toBe(2);
+  expect(document.querySelectorAll('.home-contributors-rest li')).toHaveLength(
+    Math.min(homeContributors.length - 2, HOME_CONTRIBUTOR_SLOTS - 1) + 1,
+  );
   expect(homeContributors.every((person) => person.commits > 10)).toBe(true);
   const all = screen.getByRole('link', { name: 'homeUi.allContributors' });
   expect(all).toHaveAttribute(
@@ -75,8 +149,8 @@ it('credits qualifying contributors and opens their GitHub profiles externally',
   expect(files.openExternal).toHaveBeenCalledWith(
     'https://github.com/debpalash/VoiceStudio/graphs/contributors',
   );
-  for (const { login } of homeContributors) {
-    if (login === 'debpalash') continue;
+  for (const { login } of shown) {
+    if (login === 'debpalash' || login === 'velixio') continue;
     const profile = screen.getByRole('link', { name: `GitHub · @${login}` });
     expect(profile).toHaveAttribute('href', `https://github.com/${login}`);
     expect(profile.querySelector('img')?.src).not.toMatch(/^https?:\/\/(avatars|github)/);
@@ -90,12 +164,35 @@ it('opens both creator profiles from the accessible avatar card', async () => {
   fireEvent.click(screen.getByRole('button', { name: '@debpalash' }));
   const github = await screen.findByRole('link', { name: 'GitHub @debpalash' });
   const x = screen.getByRole('link', { name: 'X @idebpalash' });
+  expect(screen.getByRole('link', { name: 'homeUi.website palash.dev' })).toHaveAttribute(
+    'href',
+    'https://palash.dev',
+  );
+  expect(screen.getByText('homeUi.creatorCoreTeam')).toBeVisible();
+  expect(screen.getByText('homeUi.maintainerPalash')).toBeVisible();
+  expect(screen.getAllByText('homeUi.follow')).toHaveLength(2);
   expect(github).toHaveAttribute('href', 'https://github.com/debpalash');
   expect(x).toHaveAttribute('href', 'https://x.com/idebpalash');
   fireEvent.click(github);
   expect(files.openExternal).toHaveBeenCalledWith('https://github.com/debpalash');
   fireEvent.click(x);
   expect(files.openExternal).toHaveBeenCalledWith('https://x.com/idebpalash');
+});
+
+it('gives velixio the same hover card as the creator', async () => {
+  render(<HomePage />);
+  fireEvent.click(screen.getByRole('button', { name: '@velixio' }));
+  const github = await screen.findByRole('link', { name: 'GitHub @velixio' });
+  expect(github).toHaveAttribute('href', 'https://github.com/velixio');
+  expect(screen.getByText('homeUi.maintainerShimul')).toBeVisible();
+  expect(screen.getByRole('link', { name: 'homeUi.website shimul.me' })).toHaveAttribute(
+    'href',
+    'https://shimul.me',
+  );
+  expect(screen.getByRole('link', { name: 'X @shimuldn' })).toHaveAttribute(
+    'href',
+    'https://x.com/shimuldn',
+  );
 });
 
 it('separates three primary creation actions and describes all nine destinations', () => {
@@ -118,4 +215,47 @@ it('separates three primary creation actions and describes all nine destinations
   expect(screen.queryByText('dub.supported_formats')).not.toBeInTheDocument();
   expect(screen.queryByText('clone.history_title')).not.toBeInTheDocument();
   expect(screen.queryByText('0')).not.toBeInTheDocument();
+});
+
+it.each([true, false])(
+  'opens a saved Home project only when longform is idle: active=%s',
+  async (active) => {
+    const draft = {
+      ...blankLongformDraft(),
+      title: 'Saved synthetic book',
+      script: 'Preserved saved manuscript',
+    };
+    projects.saved = [
+      { id: 'saved', name: 'Saved synthetic book', mode: 'audiobook', updatedAt: 1, draft },
+    ];
+    longformSession.setState((state) => ({ ...state, active: active ? 'stories' : null }));
+    render(<HomePage />);
+    fireEvent.click(screen.getByRole('button', { name: /Saved synthetic book/ }));
+    if (active) {
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent('audiobook.blocked.busy'),
+      );
+      expect(projects.navigate).not.toHaveBeenCalled();
+      expect(longformSession.state.drafts.audiobook.script).not.toBe('Preserved saved manuscript');
+    } else {
+      // Opening replaces the working draft, so nothing changes until confirmed.
+      expect(await screen.findByText('projectActions.open')).toBeInTheDocument();
+      expect(longformSession.state.drafts.audiobook.script).not.toBe('Preserved saved manuscript');
+      fireEvent.click(screen.getByRole('button', { name: 'common.confirm' }));
+      await waitFor(() => expect(projects.navigate).toHaveBeenCalledWith({ to: '/audiobook' }));
+      expect(longformSession.state.drafts.audiobook.script).toBe('Preserved saved manuscript');
+    }
+  },
+);
+
+it('keeps the working draft and stays on Home when the project open is cancelled', async () => {
+  const draft = { ...blankLongformDraft(), script: 'Saved manuscript' };
+  projects.saved = [{ id: 'saved', name: 'Saved book', mode: 'audiobook', updatedAt: 1, draft }];
+  const before = longformSession.state.drafts.audiobook.script;
+  render(<HomePage />);
+  fireEvent.click(screen.getByRole('button', { name: /Saved book/ }));
+  fireEvent.click(await screen.findByRole('button', { name: 'common.cancel' }));
+  await waitFor(() => expect(screen.queryByText('projectActions.open')).toBeNull());
+  expect(projects.navigate).not.toHaveBeenCalled();
+  expect(longformSession.state.drafts.audiobook.script).toBe(before);
 });

@@ -1,10 +1,12 @@
 import json
 import os
+import re
 import time
 import asyncio
 import logging
 from typing import Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from api.dependencies import consumer_generation, require_consumer_reads_admin_writes
 from fastapi.responses import JSONResponse
 
 from schemas.requests import AgentFitRequest, TranslateRequest
@@ -20,7 +22,7 @@ from services.translator import (
 )
 from api.routers.dub_core import _get_job, _save_job
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_consumer_reads_admin_writes)])
 logger = logging.getLogger("omnivoice.api")
 
 _NLLB_REPO_ID = "facebook/nllb-200-distilled-600M"
@@ -38,13 +40,15 @@ TRANSLATE_CODES = {
     "en": "en", "es": "es", "fr": "fr", "de": "de", "it": "it", "pt": "pt",
     "ru": "ru", "ja": "ja", "ko": "ko", "zh": "zh-CN", "cmn-Hans": "zh-CN",
     "ar": "ar", "hi": "hi", "tr": "tr", "pl": "pl", "nl": "nl", "sv": "sv",
-    "th": "th", "vi": "vi", "id": "id", "uk": "uk", "ml": "ml",
+    "th": "th", "vi": "vi", "id": "id", "uk": "uk",
+    "ml": "ml",
 }
 
 FLORES_CODES = {
     "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
     "it": "ita_Latn", "pt": "por_Latn", "ru": "rus_Cyrl", "ja": "jpn_Jpan",
-    "ko": "kor_Hang", "zh": "zho_Hans", "zh-CN": "zho_Hans", "cmn-Hans": "zho_Hans", "ar": "arb_Arab",
+    "ko": "kor_Hang", "zh": "zho_Hans", "zh-CN": "zho_Hans",
+    "cmn-Hans": "zho_Hans", "ar": "arb_Arab",
     "hi": "hin_Deva", "tr": "tur_Latn", "pl": "pol_Latn", "nl": "nld_Latn",
     "sv": "swe_Latn", "th": "tha_Thai", "vi": "vie_Latn", "id": "ind_Latn",
     "uk": "ukr_Cyrl",
@@ -76,6 +80,11 @@ FLORES_CODES = {
     "tg": "tgk_Cyrl", "tk": "tuk_Latn", "tl": "tgl_Latn", "fil": "tgl_Latn",
     "tt": "tat_Cyrl", "uz": "uzn_Latn", "xh": "xho_Latn", "yi": "ydd_Hebr",
     "yo": "yor_Latn", "zu": "zul_Latn",
+    # Translation target only: Whisper cannot transcribe Kabyle, Uyghur or
+    # Cebuano, but NLLB-200 and OmniVoice handle all three.
+    "kab": "kab_Latn",
+    "ceb": "ceb_Latn",
+    "ug": "uig_Arab",
 }
 
 
@@ -104,10 +113,12 @@ def _nllb_language(code: str) -> str | None:
 LANG_NAMES = {
     "en": "English", "es": "Spanish", "fr": "French", "de": "German",
     "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
-    "ko": "Korean", "zh": "Chinese (Simplified)", "zh-CN": "Chinese (Simplified)", "cmn-Hans": "Chinese (Simplified)",
+    "ko": "Korean", "zh": "Chinese (Simplified)",
+    "zh-CN": "Chinese (Simplified)", "cmn-Hans": "Chinese (Simplified)",
     "ar": "Arabic", "hi": "Hindi", "tr": "Turkish", "pl": "Polish",
     "nl": "Dutch", "sv": "Swedish", "th": "Thai", "vi": "Vietnamese",
-    "id": "Indonesian", "uk": "Ukrainian",
+    "id": "Indonesian", "uk": "Ukrainian", "ug": "Uyghur", "kab": "Kabyle",
+    "ceb": "Cebuano",
 }
 
 # Regional dialect hints (#280 item 2). Maps a BCP-47 dialect code to the
@@ -283,48 +294,100 @@ def _nllb_hypothesis_budget() -> int:
     return 16
 
 
+# The single variant a machine-translation engine writes when a language has
+# no dialect split in its vocabulary (#3143). NLLB-200's ``por_Latn`` is
+# evaluated on FLORES-200, whose Portuguese is Brazilian; the plain ``pt`` of
+# Google and Argos is Brazilian too. A request for that variant is therefore
+# honoured as-is, and any other variant is reported as not applied together
+# with the variant the engine wrote instead.
+MT_NATIVE_DIALECTS = {"pt": "pt-BR"}
+
+
+def _resolve_target_dialect(req) -> None:
+    """Canonicalize ``target_lang``/``dialect`` before any provider runs.
+
+    * A regional target ("pt-PT") becomes the base code plus that dialect, so
+      API/MCP callers can name the variant directly.
+    * A plain Portuguese target with no dialect means Brazilian Portuguese,
+      the owner-set default, so LLM prompts ask for it explicitly.
+    """
+    from core.language_variants import canonical_dialect, default_dialect, split_target
+
+    # Internal callers may hand over a request-like object without the
+    # optional ``dialect`` field; treat it as unset rather than failing.
+    dialect = getattr(req, "dialect", None)
+    base, region = split_target(req.target_lang)
+    if region:
+        req.target_lang = base
+        dialect = dialect or region
+    if dialect:
+        req.dialect = canonical_dialect(dialect) or dialect
+    else:
+        req.dialect = default_dialect(req.target_lang)
+    # Per-segment overrides reach the same provider lookups, so a regional
+    # segment target ("pt-PT") must name its base code as well.
+    for seg in getattr(req, "segments", None) or ():
+        seg_target = getattr(seg, "target_lang", None)
+        if seg_target:
+            seg_base, seg_region = split_target(seg_target)
+            if seg_region:
+                seg.target_lang = seg_base
+
+
 def _dialect_flags(req, applied: bool) -> dict:
     """Response fields describing whether the requested dialect was honored.
 
     Empty dict when no dialect was requested, so existing response shapes
-    stay byte-identical for callers that never send one.
+    stay byte-identical for callers that never send one. When the engine
+    could not apply it, ``dialect_used`` names the variant it wrote instead
+    (when known), so the UI can say which one the user got.
     """
-    if not getattr(req, "dialect", None):
+    dialect = getattr(req, "dialect", None)
+    if not dialect:
         return {}
-    return {"dialect": req.dialect, "dialect_applied": bool(applied)}
+    target = str(getattr(req, "target_lang", "") or "").lower()
+    native = MT_NATIVE_DIALECTS.get(target)
+    if not applied and native and str(dialect).lower() == native.lower():
+        applied = True  # the engine's only variant is the one asked for
+    flags = {"dialect": dialect, "dialect_applied": bool(applied)}
+    if not applied and native:
+        flags["dialect_used"] = native
+    return flags
 
 
 def _guess_lang_from_text(segments) -> str | None:
-    """Best-effort source language from segment text, by script.
-
-    Used only as a last resort when neither the request nor the job carries a
-    detected language. Without this, the bare "en" fallback below forces
-    en -> en on non-English audio (e.g. Korean), which has no Argos package and
-    fails every segment even though ASR detected the language correctly.
-    """
-    text = " ".join((getattr(s, "text", "") or "") for s in (segments or [])[:8])
-    has = lambda lo, hi: any(lo <= ord(c) <= hi for c in text)
-    if has(0x3040, 0x30FF):
-        return "ja"  # Hiragana/Katakana — check before CJK (Japanese uses Kanji too)
-    if has(0xAC00, 0xD7A3) or has(0x1100, 0x11FF):
-        return "ko"  # Hangul
-    if has(0x4E00, 0x9FFF):
-        return "zh"  # CJK ideographs
-    if has(0x0400, 0x04FF):
-        return "ru"  # Cyrillic
-    if has(0x0600, 0x06FF):
-        return "ar"  # Arabic
+    """Infer a likely source language from scripts in the first few captions."""
+    text = " ".join(str(getattr(segment, "text", "") or "") for segment in (segments or ())[:8])
+    script_codes = (
+        (r"[\u3040-\u30ff]", "ja"),
+        (r"[\uac00-\ud7a3\u1100-\u11ff]", "ko"),
+        (r"[\u4e00-\u9fff]", "zh"),
+        (r"[\u0400-\u04ff]", "ru"),
+        (r"[\u0600-\u06ff]", "ar"),
+    )
+    for pattern, code in script_codes:
+        if re.search(pattern, text):
+            return code
     return None
 
 
-def _resolve_source_lang(req: TranslateRequest) -> str:
-    """Pick source language: explicit request > job.source_lang > text guess > 'en'."""
-    if getattr(req, "source_lang", None):
-        return req.source_lang
-    if getattr(req, "job_id", None):
-        job = _get_job(req.job_id)
-        if job and job.get("source_lang"):
-            return job["source_lang"]
+def _resolve_source_lang(req: TranslateRequest) -> str | None:
+    """Choose an explicit, job-derived, or text-inferred source language."""
+    requested = getattr(req, "source_lang", None)
+    if requested:
+        return requested
+
+    job_id = getattr(req, "job_id", None)
+    if job_id:
+        job = _get_job(job_id)
+        if job:
+            if job.get("source_lang_override"):
+                return job["source_lang_override"]
+            if job.get("source_lang"):
+                return job["source_lang"]
+            if job.get("source_lang_detection_missing"):
+                return None
+
     return _guess_lang_from_text(getattr(req, "segments", None)) or "en"
 
 
@@ -398,7 +461,18 @@ def _should_unload_nllb() -> bool:
 
 
 @router.post("/dub/translate")
+@consumer_generation
 async def dub_translate(req: TranslateRequest):
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
+
+    async def _await_unit(start):
+        # Translation and refinement are descendants of this request/job,
+        # including an inherited known-OFF owner. Only a new operation may
+        # observe a new grant after another unit has awaited.
+        with diagnostic_reports.grant_scope(diagnostic_epoch):
+            return await start()
+
     try:
         provider = (req.provider if req.provider else os.environ.get("TRANSLATE_PROVIDER", "google")).lower()
         from services import translation_engines
@@ -408,10 +482,16 @@ async def dub_translate(req: TranslateRequest):
                 status_code=400,
                 content={"error": "Choose a supported translation engine."},
             )
+        _resolve_target_dialect(req)
         lang_code = TRANSLATE_CODES.get(req.target_lang, req.target_lang)
         api_key = os.environ.get("TRANSLATE_API_KEY", "")
         loop = asyncio.get_running_loop()
         src_lang = _resolve_source_lang(req)
+        if src_lang is None:
+            return JSONResponse(status_code=400, content={
+                "error": "Source language is unknown. Select the source language before translating.",
+                "code": "source_language_required",
+            })
 
         # Offline NLLB Transformer Translation
         if provider == "nllb":
@@ -568,14 +648,14 @@ async def dub_translate(req: TranslateRequest):
 
                 return [results_by_index[index] for index in range(len(req.segments))]
 
-            translated = await loop.run_in_executor(_gpu_pool, _translate_nllb)
+            translated = await _await_unit(lambda: loop.run_in_executor(_gpu_pool, _translate_nllb))
             if _should_unload_nllb():
                 _unload_nllb()
             # Cinematic/Autofit refine + rate-ratio badges must run for NLLB too
             # (previously this returned before _maybe_cinematic, so a Cinematic
             # pick on NLLB silently produced plain Fast output). Unloading NLLB
             # first is fine — the refine LLM is a separate network provider.
-            return await _maybe_cinematic(translated, req, src_lang, loop)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop))
 
         # LLM translation — resolves through the LLM Skills registry: per-skill
         # "Dub translation" override → global active provider (Settings → LLM
@@ -649,10 +729,10 @@ async def dub_translate(req: TranslateRequest):
             # the manual glossary still rides along — that costs no extra call.
             auto_ctx = None
             if auto_glossary_on:
-                auto_ctx = await loop.run_in_executor(
+                auto_ctx = await _await_unit(lambda: loop.run_in_executor(
                     _cpu_pool, _resolve_translation_context,
                     req, client, model_name, llm_timeout, src_lang,
-                )
+                ))
             merged_terms = tq.merge_glossary(req.glossary, (auto_ctx or {}).get("terms"))
             context_extra = tq.context_clause((auto_ctx or {}).get("theme", ""), merged_terms)
 
@@ -787,55 +867,63 @@ async def dub_translate(req: TranslateRequest):
                 return {"id": seg.id, "text": seg.text,
                         "error": scrub_provider_error(last_err, api_key) or "llm-failed"}
 
-            tasks = [loop.run_in_executor(_cpu_pool, _translate_llm, seg) for seg in req.segments]
-            translated = await asyncio.gather(*tasks)
+            translated = await _await_unit(lambda: asyncio.gather(*[
+                loop.run_in_executor(_cpu_pool, _translate_llm, seg) for seg in req.segments
+            ]))
             translated.sort(key=lambda x: str(x["id"]))
             # provider="openai" is already an LLM translation — _maybe_cinematic
             # skips the reflect/adapt re-refine (already_llm) but still stamps
             # rate-ratio badges and runs the bounded Autofit fit pass. Before
             # this it returned here, so Cinematic/Autofit on the LLM engine did
             # nothing.
-            return await _maybe_cinematic(translated, req, src_lang, loop, already_llm=True)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop, already_llm=True))
 
         # Offline Argos Translate
         if provider == "argos" or provider == "libretranslate":
+            # Windows ROCm 10: CTranslate2 must not load beside Torch (no import).
+            from core.windows_rocm.isolation_policy import argos_error
+
+            blocked = argos_error()
+            if blocked:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": blocked, "detail": {"code": "argos_runtime_unavailable", "message": blocked}},
+                )
             try:
                 import argostranslate  # noqa: F401
             except ImportError:
-                # Single-source the install command from the engine registry so
-                # this 400 and the proactive Install button in the Engine
-                # selector can never drift (see translation_engines.install_command).
                 from services.translation_engines import install_command
                 cmd = install_command("argos") or "uv pip install argostranslate"
-                friendly = (
-                    f"The '{provider}' translation engine needs the optional "
-                    f"`argostranslate` Python package, which isn't installed in "
-                    f"this backend. Install it with `{cmd}` "
-                    f"and restart the server, or "
-                    f"switch the Engine dropdown to another provider."
+                message = (
+                    f"The selected '{provider}' engine requires the optional "
+                    f"`argostranslate` Python package, but this backend does not have it. "
+                    f"Run `{cmd}` and restart the server, or choose another provider "
+                    f"from the Engine dropdown."
                 )
-                return JSONResponse(status_code=400, content={"error": friendly})
-            # The package imports without its native dep; the *translator*
-            # needs CTranslate2, whose library is rejected outright by kernels
-            # that refuse an executable stack (#692). Repair it (a one-bit ELF
-            # patch), and if that is impossible say so in one actionable 400
-            # instead of the opaque 500 every segment used to produce.
+                return JSONResponse(status_code=400, content={"error": message})
+            # Importing argostranslate.translate loads CTranslate2's native
+            # library, which hardened kernels may reject (#692). Try an
+            # in-place repair, then verify the import so the user gets an
+            # actionable 400 instead of an opaque failure mid-translate.
             try:
                 from core.execstack import ensure_ctranslate2_loadable
 
                 ensure_ctranslate2_loadable()
-            except Exception as e:  # noqa: BLE001 — repair must not block translation
-                logger.debug("exec-stack repair unavailable (%s) — continuing", e)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("CTranslate2 repair before Argos failed: %s", exc)
             try:
                 import argostranslate.translate  # noqa: F401
-            except Exception as e:  # noqa: BLE001 — OSError here, not ImportError
+            except Exception:  # noqa: BLE001
                 friendly = (
-                    f"The '{provider}' engine's CTranslate2 runtime could not be "
-                    "loaded in this backend."
-                    + " Switch the Engine dropdown to NLLB (local) or an online "
-                    "provider, or reinstall the backend, then retry."
+                    f"Offline translation with '{provider}' is unavailable: its "
+                    f"CTranslate2 backend failed to start on this machine. Pick "
+                    f"NLLB (local) or an online provider in the Engine dropdown, "
+                    f"or reinstall the backend, and try again."
                 )
-                return JSONResponse(status_code=400, content={"error": friendly, "detail": {"code": "argos_runtime_unavailable", "message": friendly}})
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": friendly, "detail": {"code": "argos_runtime_unavailable", "message": friendly}},
+                )
 
             target_codes = list(dict.fromkeys(
                 seg.target_lang if seg.target_lang else req.target_lang
@@ -862,6 +950,9 @@ async def dub_translate(req: TranslateRequest):
                     },
                 )
 
+            import threading
+            argos_cancelled = threading.Event()
+
             def _translate_argos():
                 import argostranslate.translate
 
@@ -882,15 +973,23 @@ async def dub_translate(req: TranslateRequest):
                         )
                         results.append({"id": seg.id, "text": translated_text})
                     except Exception as e:
+                        if not argos_cancelled.is_set():
+                            from core import diagnostic_reports
+                            diagnostic_reports.capture_failure("translation", error=e)
                         results.append({"id": seg.id, "text": seg.text, "error": str(e)})
                 return results
 
-            translated = await loop.run_in_executor(_cpu_pool, _translate_argos)
+            try:
+                translated = await _await_unit(lambda: loop.run_in_executor(
+                    _cpu_pool, diagnostic_reports.bind_callable(_translate_argos)))
+            except asyncio.CancelledError:
+                argos_cancelled.set()
+                raise
             # Argos is the DEFAULT engine — routing it through _maybe_cinematic is
             # the headline fix: a user who picks Cinematic/Autofit on Argos now
             # gets the LLM refine + fit pass (and rate-ratio badges in Fast mode)
             # instead of silent plain-Fast output.
-            return await _maybe_cinematic(translated, req, src_lang, loop)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop))
 
         # Legacy / API Deep_Translator logic.
         # Preflight the optional `deep_translator` dep once so we fail with a
@@ -919,13 +1018,16 @@ async def dub_translate(req: TranslateRequest):
         if provider == "amazon":
             from services.translation_apis import AmazonConfigurationError, validate_amazon_configuration
             try:
-                await asyncio.to_thread(validate_amazon_configuration)
+                await _await_unit(lambda: asyncio.to_thread(validate_amazon_configuration))
             except AmazonConfigurationError as exc:
                 return JSONResponse(status_code=409, content={"error": exc.public_message})
 
         src_arg = TRANSLATE_CODES.get(src_lang, src_lang) or "auto"
 
-        _proxies = {"http": None, "https": None}
+        # The free deep_translator clients go out directly: a system proxy
+        # meant for other traffic should not route (or break) these calls.
+        direct_proxies = {"http": None, "https": None}
+        # Server-side keys take precedence over the one sent with the request.
         _deepl_key = os.environ.get("DEEPL_API_KEY") or api_key
         _msft_key = os.environ.get("MICROSOFT_API_KEY") or api_key
 
@@ -934,9 +1036,9 @@ async def dub_translate(req: TranslateRequest):
                 return ApiTranslator(provider, src, tgt, api_key=api_key)
             if provider == "mymemory":
                 from deep_translator import MyMemoryTranslator
-                return MyMemoryTranslator(source=src, target=tgt, proxies=_proxies)
+                return MyMemoryTranslator(source=src, target=tgt, proxies=direct_proxies)
             from deep_translator import GoogleTranslator
-            return GoogleTranslator(source=src, target=tgt, proxies=_proxies)
+            return GoogleTranslator(source=src, target=tgt, proxies=direct_proxies)
 
         def _translate_single(seg):
             seg_lc = (
@@ -968,16 +1070,19 @@ async def dub_translate(req: TranslateRequest):
             return {"id": seg.id, "text": seg.text,
                     "error": scrub_provider_error(last_err, _deepl_key or _msft_key or api_key) or "unknown"}
 
-        tasks = [loop.run_in_executor(_cpu_pool, _translate_single, seg) for seg in req.segments]
-        translated = await asyncio.gather(*tasks)
+        translated = await _await_unit(lambda: asyncio.gather(*[
+            loop.run_in_executor(_cpu_pool, _translate_single, seg) for seg in req.segments
+        ]))
         translated.sort(key=lambda x: str(x["id"]))
 
-        return await _maybe_cinematic(
+        return await _await_unit(lambda: _maybe_cinematic(
             translated, req, src_lang, loop,
-        )
+        ))
     except ModelLicenceNotAccepted:
         raise
     except Exception as e:
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("translation", error=e, expected_epoch=diagnostic_epoch)
         from core.public_errors import public_failure
 
         error = public_failure(
@@ -1338,6 +1443,7 @@ def translation_style_brief(req) -> str:
 
 
 @router.post("/dub/agent-fit")
+@consumer_generation
 async def dub_agent_fit(req: AgentFitRequest):
     """Rewrite rendered lines from real duration evidence.
 

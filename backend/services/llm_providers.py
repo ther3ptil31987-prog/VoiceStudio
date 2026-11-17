@@ -21,11 +21,14 @@ users.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("omnivoice.llm_providers")
 
@@ -34,6 +37,7 @@ logger = logging.getLogger("omnivoice.llm_providers")
 _ACTIVE_PROVIDER_KEY = "llm.active_provider"
 _BASE_URL_KEY = "llm.base_url."   # + provider id
 _MODEL_KEY = "llm.model."         # + provider id
+_PLAIN_HTTP_KEY = "llm.plain_http_lan."  # + provider id; "1" = key may cross a trusted LAN in clear
 SECRET_PREFIX = "llm_key."        # + provider id  → settings_store secret name
 
 
@@ -90,7 +94,19 @@ _PROVIDERS: tuple[Provider, ...] = (
              key_envs=("CHEAPER_INFERENCE_API_KEY",),
              base_url_env="CHEAPER_INFERENCE_BASE_URL",
              model_env="CHEAPER_INFERENCE_MODEL",
-             signup_url="https://cheaperinference.com/signup"),
+             signup_url="https://cheaperinference.com/signup",
+             notes="A single gateway that reaches models from several AI labs."),
+    # No base_url_env: Opper's own SDKs read OPPER_BASE_URL as the API root,
+    # not this OpenAI-compatible path. The URL can still be changed in Settings.
+    Provider("opper", "Opper", "https://api.opper.ai/v3/compat",
+             "claude-sonnet-4-6",
+             key_envs=("OPPER_API_KEY",), model_env="OPPER_MODEL",
+             signup_url="https://platform.opper.ai"),
+    Provider("api-route", "API Route", "https://global.api-route.com/v1",
+             "deepseek-v4.1-flash",
+             key_envs=("API_ROUTE_API_KEY",), base_url_env="API_ROUTE_BASE_URL",
+             model_env="API_ROUTE_MODEL",
+             signup_url="https://www.api-route.com"),
     Provider("groq", "Groq", "https://api.groq.com/openai/v1",
              "llama-3.3-70b-versatile",
              key_envs=("GROQ_API_KEY",), base_url_env="GROQ_BASE_URL",
@@ -321,130 +337,131 @@ def _cached_discovery(pid: str) -> tuple[bool, Optional[str]]:
     return True, value
 
 
-#: LM Studio's native endpoint, unlike the OpenAI-compatible ``/v1/models``,
-#: reports which checkpoints are actually resident in memory. On a laptop only
-#: one usually is, and asking for any other makes LM Studio evict and reload
-#: multi-GB weights mid-request (or fail outright when they don't fit), so the
-#: loaded one is the only sane discovery answer.
 _LMSTUDIO_PROBE_TIMEOUT_S = 3.0
 
 
-def _probe_lmstudio_loaded_model(base_url: str, api_key: str = "local") -> Optional[str]:
-    """Return the id of a model LM Studio currently holds in memory, if any.
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-    Best-effort and never raises: LM Studio not running, an older build without
-    ``/api/v0``, or any other host on that URL simply yields ``None`` and the
-    caller keeps its configured/default model without guessing from untyped IDs.
-    Only ever called through
-    :func:`discover_model`, which caches both outcomes — probing per request
-    would cost an HTTP round trip on every translated segment.
+
+def _probe_lmstudio_loaded_model(
+    base_url: str, api_key: str = "local"
+) -> Optional[str]:
+    """Return a typed, resident LM Studio chat model without following redirects.
+
+    Defence in depth for #4131: this is the one place a stored key becomes an
+    ``Authorization`` header, so the transport gate is re-checked here rather
+    than trusted to the caller — a future call site must not be able to leak it.
+    LM Studio is the only provider with a native probe, so its per-provider
+    plaintext-LAN opt-in is the one that applies; absent it, a non-loopback
+    plaintext URL fails closed. Costs no network work, and only runs when a real
+    key would actually be sent.
     """
-    import json
-    import urllib.request
-    from urllib.parse import urlsplit
-
     if not base_url:
+        return None
+    provider = get_provider("lmstudio")
+    allow_lan = provider is not None and plain_http_lan_allowed(provider)
+    if api_key and api_key != "local" and _plaintext_url_carries_credentials(
+        base_url, allow_private_lan=allow_lan
+    ):
+        logger.debug(
+            "LM Studio probe refused: a stored key would cross plaintext to a remote host"
+        )
         return None
     try:
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return None
-        clean_base = base_url.rstrip("/")
-        if clean_base.endswith("/v1"):
-            clean_base = clean_base[: -len("/v1")]
-        headers = {"User-Agent": "VoiceStudio"}
+        root = base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        headers = {"User-Agent": "VoiceStudio LM Studio model probe"}
         if api_key and api_key != "local":
             headers["Authorization"] = f"Bearer {api_key}"
-        req = urllib.request.Request(f"{clean_base}/api/v0/models", headers=headers)
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                return None
-
-        # A configured API credential belongs only to the configured origin.
-        opener = urllib.request.build_opener(NoRedirect())
-        with opener.open(req, timeout=_LMSTUDIO_PROBE_TIMEOUT_S) as resp:  # nosec B310 — HTTP(S) validated above
-            data = json.loads(resp.read().decode("utf-8"))
-        loaded = [
-            str(m.get("id"))
-            for m in (data.get("data") or [])
-            if isinstance(m, dict)
-            and m.get("state") == "loaded"
-            and m.get("type") in {"llm", "vlm"}
-            and m.get("id")
+        request = urllib.request.Request(
+            f"{root}/api/v0/models", headers=headers, method="GET"
+        )
+        opener = urllib.request.build_opener(_RejectRedirects())
+        # The configured URL is validated above and redirects are disabled.
+        with opener.open(request, timeout=_LMSTUDIO_PROBE_TIMEOUT_S) as response:  # nosec B310
+            payload = json.load(response)
+        entries = payload["data"]
+        if not isinstance(entries, list):
+            return None
+        loaded_ids = [
+            entry["id"]
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("state") == "loaded"
+            and entry.get("type") in {"llm", "vlm"}
+            and isinstance(entry.get("id"), str)
+            and entry["id"]
         ]
-    except Exception as e:  # noqa: BLE001 — discovery is best-effort by design
-        logger.debug("LM Studio loaded-model probe failed: %s", e)
+        return sorted(loaded_ids)[0] if loaded_ids else None
+    except Exception as exc:
+        logger.debug("LM Studio loaded-model probe failed: %s", exc)
         return None
-    # Sorted for the same reason discover_model sorts: two runs on one machine
-    # must pick the same model when several are resident.
-    return sorted(loaded)[0] if loaded else None
 
 
 def discover_model(p: Provider) -> Optional[str]:
-    """Ask an OpenAI-compatible server which model it is actually serving.
-
-    Only used when we would otherwise send a placeholder. Never raises: a
-    server that is down or does not implement ``/v1/models`` leaves the caller
-    with the placeholder, which is exactly where it was before.
-
-    Both outcomes are cached — success for :data:`DISCOVERY_TTL_S`, failure for
-    :data:`DISCOVERY_FAILURE_TTL_S` — because this runs once per translated
-    segment, so an uncached failure costs a 5s timeout per segment.
-    """
+    """Best-effort model discovery with positive and negative caching."""
     hit, cached = _cached_discovery(p.id)
     if hit:
         return cached
     base_url = resolve_base_url(p)
     if not base_url:
         return None
+    # The transport gate refuses a credential over remote plaintext (#4131);
+    # discovery must not be the way around it — the LM Studio probe attaches
+    # the stored key as a Bearer header. This is a configuration refusal, not a
+    # probe failure: like the missing-base_url return above it writes NO
+    # negative-cache entry, so fixing the URL or switching the plaintext-LAN
+    # opt-in on takes effect on the next call, not after DISCOVERY_FAILURE_TTL_S.
+    if credential_transport_error(p):
+        return None
 
     if p.id == "lmstudio":
-        loaded = _probe_lmstudio_loaded_model(base_url, resolve_api_key(p))
-        if loaded:
-            _DISCOVERED_MODEL[p.id] = (loaded, time.monotonic() + DISCOVERY_TTL_S)
-            return loaded
-        # /v1/models omits native types; opaque embedding IDs cannot be
-        # distinguished safely. Keep the user/default choice instead.
-        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
-        return None
+        loaded = _probe_lmstudio_loaded_model(base_url, resolve_api_key(p) or "local")
+        ttl = DISCOVERY_TTL_S if loaded else DISCOVERY_FAILURE_TTL_S
+        _DISCOVERED_MODEL[p.id] = (loaded, time.monotonic() + ttl)
+        return loaded
 
     try:
         from openai import OpenAI
 
-        # max_retries=0 + a short timeout: this runs in the request path, and a
-        # local server that is not running must fail fast rather than add the
-        # SDK's retry ladder to a translation the user is waiting on.
-        client = OpenAI(api_key=resolve_api_key(p) or "local",
-                        base_url=base_url, max_retries=0)
-        ids = [m.id for m in client.models.list(timeout=5)]
-    except Exception as e:  # noqa: BLE001 — discovery is best-effort by design
-        logger.debug("model discovery failed for %s: %s", p.id, e)
-        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
-        return None
-    if not ids:
+        client = OpenAI(
+            api_key=resolve_api_key(p) or "local",
+            base_url=base_url,
+            max_retries=0,
+        )
+        listed = client.models.list(timeout=5)
+        records = getattr(listed, "data", listed)
+        ids = [record.id for record in records if isinstance(getattr(record, "id", None), str)]
+    except Exception as exc:
+        logger.debug("Model discovery failed for %s: %s", p.id, exc)
         _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
         return None
 
-    # An embedding checkpoint cannot serve chat — picking one yields a 400 on
-    # every request — so never return them as a chat discovery result.
-    chat_ids = [mid for mid in ids if not any(k in mid.lower() for k in ("embed", "bert"))]
-    if not chat_ids:
+    candidates = [
+        model_id for model_id in ids
+        if "embed" not in model_id.lower() and "bert" not in model_id.lower()
+    ]
+    if not candidates:
         _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
         return None
-    candidate_ids = chat_ids
-
-    # Prefer a known instruct family over whatever else is loaded, then sort
-    # WITHIN the chosen bucket: deterministic rather than "whatever the server
-    # listed first", so two runs on the same machine pick the same model and a
-    # bug report is reproducible.
-    preferred = [mid for mid in candidate_ids if any(k in mid.lower() for k in ("qwen", "llama"))]
-    chosen = sorted(preferred or candidate_ids)[0]
-
+    preferred = [
+        model_id for model_id in candidates
+        if "qwen" in model_id.lower() or "llama" in model_id.lower()
+    ]
+    chosen = sorted(preferred or candidates)[0]
     if len(ids) > 1:
         logger.info(
             "%s has %d models loaded and no model is set in Settings; using %r. "
             "Pick one in Settings → LLM Providers to choose deliberately.",
-            p.display_name, len(ids), chosen,
+            p.display_name,
+            len(ids),
+            chosen,
         )
     _DISCOVERED_MODEL[p.id] = (chosen, time.monotonic() + DISCOVERY_TTL_S)
     return chosen
@@ -471,13 +488,11 @@ def resolve_model(p: Provider) -> str:
     Discovery sits between the user's choice and the built-in default so it can
     never override an explicit setting, and only runs for providers whose
     default is a placeholder — everyone else keeps a pure, offline resolution.
-    For LM Studio, "discovered" means the model actually loaded in memory
-    (:func:`_probe_lmstudio_loaded_model`) rather than the alphabetically first
-    one the server lists — but it stays BELOW the stored override like every
-    other discovery: picking a model in Settings → LLM Providers has to win, or
-    the "pick one deliberately" line this module logs would be a lie. Probing
-    from here would also re-open the per-segment cost the discovery cache
-    exists to prevent (a 200-segment dub × one HTTP round trip each).
+
+    For LM Studio, discovery reports the model currently resident in memory,
+    rather than choosing the first advertised id. It remains below a stored
+    Settings choice, and its cache prevents repeating a network probe for every
+    segment in a large dub.
     """
     explicit = configured_model(p)
     if explicit:
@@ -517,21 +532,49 @@ def _key_in_store(pid: str) -> bool:
     return (SECRET_PREFIX + pid) in settings_store.list_secret_names()
 
 
-def credential_transport_error(p: Provider) -> Optional[str]:
-    """Never send provider credentials over remote plaintext transport."""
+def plain_http_lan_allowed(p: Provider) -> bool:
+    """Per-provider, explicit opt-in (#3811) to send a key over plain HTTP.
+
+    Only OpenAI-compatible providers can use it; the SDK transport keeps its
+    HTTPS-only rule. Off unless the user switched it on for this provider.
+    """
+    from services import settings_store
+    return p.transport == "openai" and settings_store.get_text(_PLAIN_HTTP_KEY + p.id) == "1"
+
+
+def is_private_ip_literal(host: str) -> bool:
+    """True only for a private, loopback or link-local IP *literal*.
+
+    DNS names are never accepted: a name can resolve to a public address (or be
+    re-pointed after the check), so the opt-in requires the user to type the
+    LAN address itself. IPv4-mapped IPv6 is judged by its IPv4 address.
+    """
+    from ipaddress import IPv6Address, ip_address
+    try:
+        ip = ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(ip, IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_unspecified or ip.is_multicast:
+        return False
+    return ip.is_loopback or ip.is_link_local or ip.is_private
+
+
+def _plaintext_url_carries_credentials(base_url: str, *, allow_private_lan: bool) -> bool:
+    """True when ``base_url`` is unencrypted remote HTTP and would leak a key.
+
+    Split out of ``credential_transport_error`` (#4131) so the LM Studio probe
+    can apply the same URL rule to the exact URL it is about to call instead of
+    re-resolving a provider's own base_url.
+    """
     from ipaddress import ip_address
     from urllib.parse import urlsplit
 
-    base = resolve_base_url(p)
-    if not base or p.transport == "cli":
-        return None
-    key = resolve_api_key(p)
-    if p.transport != "sdk" and (not key or key == "local"):
-        return None
     try:
-        url = urlsplit(base)
+        url = urlsplit(base_url)
         if url.scheme == "https" and url.hostname:
-            return None
+            return False
         host = (url.hostname or "").lower()
         loopback = host == "localhost"
         if not loopback:
@@ -540,9 +583,26 @@ def credential_transport_error(p: Provider) -> Optional[str]:
             except ValueError:
                 pass
         if url.scheme == "http" and loopback:
-            return None
+            return False
+        if url.scheme == "http" and allow_private_lan and is_private_ip_literal(host):
+            return False
     except ValueError:
         pass
+    return True
+
+
+def credential_transport_error(p: Provider) -> Optional[str]:
+    """Never send provider credentials over remote plaintext transport."""
+    base = resolve_base_url(p)
+    if not base or p.transport == "cli":
+        return None
+    key = resolve_api_key(p)
+    if p.transport != "sdk" and (not key or key == "local"):
+        return None
+    if not _plaintext_url_carries_credentials(
+        base, allow_private_lan=plain_http_lan_allowed(p)
+    ):
+        return None
     return "Use HTTPS for a credentialed provider, or HTTP on localhost."
 
 
@@ -662,7 +722,8 @@ def save_key(pid: str, api_key: str) -> None:
 
 def save_overrides(pid: str, *, base_url: Optional[str] = None,
                    model: Optional[str] = None,
-                   account_id: Optional[str] = None) -> None:
+                   account_id: Optional[str] = None,
+                   allow_plain_http: Optional[bool] = None) -> None:
     from services import settings_store
     if pid not in _BY_ID:
         raise ValueError(f"unknown provider {pid!r}")
@@ -684,6 +745,8 @@ def save_overrides(pid: str, *, base_url: Optional[str] = None,
         forget_discovered_models(pid)
     if account_id is not None:
         settings_store.set_text(f"llm.account.{pid}", account_id.strip())
+    if allow_plain_http is not None and p.transport == "openai":
+        settings_store.set_text(_PLAIN_HTTP_KEY + pid, "1" if allow_plain_http else "")
 
 
 def _active_env_pin() -> Optional[str]:
@@ -724,6 +787,8 @@ def describe(p: Provider) -> dict:
             or os.environ.get("OMNIVOICE_LLM_BACKEND") not in (None, "", "openai-compat")
         ),
         "configured": is_configured(p),
+        "allow_plain_http": plain_http_lan_allowed(p),
+        "supports_plain_http": p.transport == "openai",
     }
     if p.needs_account:
         d["account_id"] = resolve_account_id(p)

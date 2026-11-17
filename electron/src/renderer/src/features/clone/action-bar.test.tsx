@@ -12,11 +12,14 @@ vi.mock('@tanstack/react-router', () => ({
   ),
 }));
 
-const failure = vi.hoisted(() => ({ error: null as string | null }));
+const failure = vi.hoisted(() => ({ error: null as string | null, topic: null as string | null }));
 const readiness = vi.hoisted(() => ({
-  blocker: null as null | 'reference' | 'text' | 'preparing',
+  blocker: null as null | 'reference' | 'text' | 'preparing' | 'engine',
 }));
 vi.mock('@/hooks/use-clone-readiness', () => ({ useCloneReadiness: () => readiness.blocker }));
+vi.mock('@/components/install-stt-button', () => ({
+  InstallSttButton: () => <button>install-stt</button>,
+}));
 vi.mock('@/hooks/use-clone-demo', () => ({ useCloneDemo: () => false }));
 vi.mock('@/hooks/use-tts-languages', () => ({
   useTtsLanguages: () => ({ names: ['English'], modelLabel: 'Test model', state: 'known' }),
@@ -32,6 +35,8 @@ const runtime = {
   stage: 'preparing',
   modelStage: null as string | null,
   modelProgress: null as number | null,
+  queue: [] as Array<{ id: string; label: string; voice: string | null; status: string }>,
+  queuedCount: 0,
 };
 
 const settings = {
@@ -78,7 +83,11 @@ vi.mock('@/hooks/use-generate', () => ({
     generate,
     cancel,
     error: failure.error,
+    errorTopic: failure.topic,
     cloneBlocker: readiness.blocker,
+    removeQueued: vi.fn(),
+    clearFinished: vi.fn(),
+    cancelAll: vi.fn(),
     ...runtime,
   }),
 }));
@@ -87,11 +96,14 @@ describe('ActionBar', () => {
   beforeEach(() => {
     readiness.blocker = null;
     failure.error = null;
+    failure.topic = null;
     generate.mockClear();
   });
   beforeEach(() => {
     Object.assign(runtime, {
       isGenerating: false,
+      queue: [],
+      queuedCount: 0,
       elapsedSeconds: 0,
       progress: null,
       stage: 'preparing',
@@ -118,6 +130,22 @@ describe('ActionBar', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('LibsndfileError');
     expect(screen.getByRole('alert').querySelector('details')).not.toBeInTheDocument();
     expect(view.container.querySelector('pre')).not.toBeInTheDocument();
+  });
+  it('offers the speech-model install only for the missing-transcriber failure', () => {
+    failure.error = 'No transcript';
+    const view = render(<ActionBar />);
+    expect(screen.queryByText('install-stt')).not.toBeInTheDocument();
+    failure.topic = 'REFERENCE_STT_MISSING';
+    view.rerender(<ActionBar />);
+    expect(screen.getByText('install-stt')).toBeInTheDocument();
+    // Typing the transcript is the other fix; the button opens and focuses it.
+    const focus = vi.fn();
+    window.addEventListener('voicestudio:focus-clone-transcript', focus);
+    fireEvent.click(
+      screen.getByRole('button', { name: /add transcript|failureAction.add_transcript/i }),
+    );
+    window.removeEventListener('voicestudio:focus-clone-transcript', focus);
+    expect(focus).toHaveBeenCalledOnce();
   });
   it('keeps synthesis available while the latest take is playing', () => {
     render(<ActionBar />);
@@ -179,6 +207,65 @@ describe('ActionBar', () => {
     expect(screen.getByText('62% · 3.4s')).toBeInTheDocument();
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '62');
   });
+
+  it('queues another take while one is rendering instead of blocking', () => {
+    Object.assign(runtime, {
+      isGenerating: true,
+      stage: 'generating',
+      queuedCount: 1,
+      queue: [
+        { id: 'a', label: 'First line', voice: 'Narrator', status: 'running' },
+        { id: 'b', label: 'Second line', voice: 'Narrator', status: 'queued' },
+      ],
+    });
+    render(<ActionBar />);
+
+    const add = screen.getByRole('button', { name: /Add to queue/ });
+    expect(add).toBeEnabled();
+    expect(add).toHaveTextContent('1');
+    fireEvent.click(add);
+    expect(generate).toHaveBeenCalledTimes(1);
+    const queue = screen.getByRole('region', { name: 'Generation queue' });
+    expect(queue).toHaveTextContent('Second line');
+    expect(queue).toHaveTextContent('#1 in line');
+  });
+
+  it('shows no queue controls while idle', () => {
+    render(<ActionBar />);
+    expect(screen.queryByRole('button', { name: /Add to queue/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Generation queue' })).not.toBeInTheDocument();
+  });
 });
 
 vi.mock('@/hooks/use-engines', () => ({ useEngines: () => ({ activeTts: null }) }));
+
+vi.mock('@/hooks/use-tts-readiness', () => ({
+  useTtsReadiness: () => (readiness.blocker === 'engine' ? 'engine' : null),
+}));
+vi.mock('@/hooks/use-model-install', () => ({
+  useModelInstall: () => ({ view: null, busy: false, start: vi.fn() }),
+}));
+vi.mock('@tanstack/react-query', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-query')>()),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+
+describe('ActionBar while text-to-speech is not ready', () => {
+  it('makes setup the primary action instead of a dead Synthesize button', () => {
+    readiness.blocker = 'engine';
+    runtime.isGenerating = false;
+    render(<ActionBar />);
+    expect(screen.queryByRole('button', { name: 'Synthesize audio' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Set up' })).toBeEnabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Text-to-speech is not ready');
+  });
+
+  it('drives the setup the page passes in, so a download outlives the notice', () => {
+    readiness.blocker = 'engine';
+    runtime.isGenerating = false;
+    const setup = { blocked: true, busy: false, install: null, fix: vi.fn() };
+    render(<ActionBar setup={setup} />);
+    screen.getByRole('button', { name: 'Set up' }).click();
+    expect(setup.fix).toHaveBeenCalled();
+  });
+});

@@ -1,8 +1,8 @@
 """Local model disclosures and an additive reviewed-install foundation.
 
 This is deliberately NOT a global download/first-use enforcement mechanism.
-Ordinary installers, SDK loads and remote workers remain unchanged. Production
-records currently have incomplete evidence, so no reviewed install is enabled.
+Ordinary installers and SDK loads remain unchanged. Production records
+currently have incomplete evidence, so no reviewed install is enabled.
 No network call, ML import, provider assent or commercial entitlement is implied.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ from core.path_security import UnsafePath, resolve_within
 REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "model_licenses.json"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_REPO = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+\Z")
+_REPO = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+(?::[\w.-]+)?\Z")
 PROMPT = {
     "prompt_id": "model-notices",
     "prompt_version": 1,
@@ -306,10 +306,11 @@ def _component(row: dict) -> tuple[dict, list[dict]]:
 def build_plan(registry: dict, catalog: list[dict], repo_id: str, target: str,
                source: str = "https://huggingface.co") -> dict:
     if target != "local":
-        raise ModelTermsError("review_required", ["remote_review_unsupported"])
+        raise ModelTermsError("review_required", ["local_target_required"])
     if source not in {"https://huggingface.co", "https://hf-mirror.com"}:
         raise ModelTermsError("review_required", ["source_unverified"])
-    specs = {m["repo_id"]: m for m in catalog}
+    # Catalogue identity: a package entry's own id, else its repo id.
+    specs = {str(m.get("id") or m["repo_id"]): m for m in catalog}
     if len(specs) != len(catalog):
         raise ModelTermsError("registry_invalid", ["duplicate_catalogue_identity"])
     if repo_id not in specs:

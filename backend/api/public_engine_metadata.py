@@ -41,7 +41,7 @@ def _public_routing_reason(status: object, diagnostic: object) -> str:
 # boundary intact and still names the kind of problem and the place to fix it.
 _UNAVAILABLE_NOT_INSTALLED = (
     "This engine's package isn't installed yet. Install it from "
-    "Model Catalogue."
+    "Settings → Models."
 )
 # An engine gated behind an in-app license review (Supertonic-3, PocketTTS).
 # The Model Catalogue shows its Accept button only when the reason matches
@@ -50,7 +50,7 @@ _UNAVAILABLE_NOT_INSTALLED = (
 # the only way to enable those engines.
 _UNAVAILABLE_LICENSE = (
     "License not accepted yet. Review and accept it in "
-    "Model Catalogue to enable this engine."
+    "Settings → Models to enable this engine."
 )
 # An engine that cannot run on this machine at all: Apple-Silicon-only MLX,
 # PyTorch with no Intel Mac build. "Isn't installed yet" or "check
@@ -66,13 +66,26 @@ _UNAVAILABLE_NO_MPS = (
     "can't use it. Updating macOS or reinstalling VoiceStudio usually "
     "restores it."
 )
+# A native executable the user builds themselves: not found, won't start, or
+# its device probe failed. Before the generic missing-file line, whose
+# "Reinstall it from Settings" advice cannot fix a runtime the app never ships.
+_UNAVAILABLE_NATIVE_RUNTIME = (
+    "This engine's native runtime isn't set up or won't start. Its guide "
+    "lists how to build it and check it from a terminal."
+)
 _UNAVAILABLE_NEEDS_CONFIG = (
     "This engine needs to be configured before it can run. Open "
-    "Model Catalogue to finish setting it up."
+    "Settings → Models to finish setting it up."
+)
+# An explicit model/frontend path override that points at nothing: reinstalling
+# cannot fix it, correcting the override can.
+_UNAVAILABLE_BAD_OVERRIDE = (
+    "A model path set for this engine points to a missing file. Correct or "
+    "remove it in Settings → Models, or its environment variable."
 )
 _UNAVAILABLE_FILE_MISSING = (
     "A file this engine needs is missing or unreadable. Reinstall it from "
-    "Model Catalogue."
+    "Settings → Models."
 )
 
 # The same two cases for an engine the app cannot install for you. "Install it
@@ -109,8 +122,10 @@ _UNAVAILABLE_SIGNATURES = (
         "no windows install", "not supported on windows",
     )),
     (_UNAVAILABLE_NO_MPS, ("torch mps unavailable",)),
+    (_UNAVAILABLE_NATIVE_RUNTIME, ("native runtime",)),
+    (_UNAVAILABLE_BAD_OVERRIDE, ("points to a missing model file", "is missing frontend files")),
     (_UNAVAILABLE_FILE_MISSING, (
-        "file is missing", "file is empty", "file is unreadable",
+        "model files were not found", "model files:", "file is missing", "file is empty", "file is unreadable",
         "script missing", "binary", "not found at",
     )),
     (_UNAVAILABLE_NEEDS_CONFIG, (

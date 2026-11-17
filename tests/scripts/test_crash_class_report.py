@@ -5,7 +5,7 @@ Pins two things:
 - title → sub-class mapping matches the auto-reporter's real title shapes
   (seeded from error messages, so titles are machine-stable), and
 - body → build bucket mapping matches the exact `**Build status:**` lines
-  the bug reporter stamps (electron/src/shared/utils/bugReport.js) — a drift in
+  the bug reporter stamps (electron/src/renderer/src/components/report-bug.tsx) — a drift in
   either side silently zeroes the metric.
 """
 
@@ -50,8 +50,9 @@ def test_title_bucketing(report, title, expected):
 
 
 def test_build_status_lines_match_the_reporter_stamps(report):
-    # These literals must stay in lockstep with electron/src/shared/utils/bugReport.js
-    # captureContext() — the stamps are the metric's only version signal.
+    # The OUTDATED literal must stay in lockstep with the live reporter
+    # (renderer components/report-bug.tsx); the "current" and Version forms are
+    # still recognised for reports filed by earlier builds.
     assert report.OUTDATED.search("**Build status:** OUTDATED — `v0.5.0` was already out when this was filed")
     assert report.CURRENT.search("**Build status:** current at filing time (latest `v0.5.0`)")
     assert not report.OUTDATED.search("**Build status:** current at filing time (latest `v0.5.0`)")
@@ -70,6 +71,14 @@ def test_build_status_lines_match_the_reporter_stamps(report):
         ("**Version:** `0.4.2`\n**Build status:** current at filing time (latest `v0.4.2`)", "0.5.0", "outdated"),
         ("**Version:** `0.5.0`\n**Build status:** current at filing time (latest `v0.5.0`)", "0.5.0", "current"),
         ("**Version:** `0.5.1-3`", "0.5.1", "current"),  # preview stamps match by base
+        ("**App:** VoiceStudio 0.5.8 (build abc1234)", "0.5.8", "current"),
+        ("**App:** VoiceStudio 0.5.7 (build abc1234)", "0.5.8", "outdated"),
+        ("**App:** VoiceStudio 0.5.9-beta.2 (build abc1234)", "0.5.9-beta.2", "current"),
+        ("**App:** VoiceStudio 0.5.9-beta.1 (build abc1234)", "0.5.9-beta.2", "outdated"),
+        ("**App:** VoiceStudio 0.5.9-beta.2 (build abc1234)", "0.5.9", "outdated"),
+        ("**Version:** `0.5.9-beta.2`", "0.5.9-beta.2", "current"),
+        ("**Version:** `0.5.9-beta.2`", "0.5.9", "outdated"),
+        ("**App:** VoiceStudio 0.5.8 (build abc1234)", None, "unknown"),
         ("no version line", "0.5.0", "unknown"),
     ],
 )
@@ -78,7 +87,29 @@ def test_classify_build(report, body, version, expected):
 
 
 def test_reporter_source_still_emits_the_stamps(report):
-    # Fail here (not in production silence) if bugReport.js rewords the marker.
-    src = (SCRIPT_PATH.parents[1] / "electron/src/shared/utils/bugReport.js").read_text(encoding="utf-8")
+    # Fail here (not in production silence) if the live reporter rewords the marker.
+    src = (SCRIPT_PATH.parents[1] / "electron/src/renderer/src/components/report-bug.tsx").read_text(encoding="utf-8")
     assert "**Build status:** OUTDATED" in src
-    assert "**Build status:** current at filing time" in src
+    assert "**App:** VoiceStudio ${__APP_VERSION__}" in src
+
+
+def test_cli_counts_current_reporter_versions_without_assuming_freshness(report, monkeypatch, capsys):
+    bodies = [
+        "**App:** VoiceStudio 0.5.9-beta.2 (build abc1234)",
+        "**App:** VoiceStudio 0.5.9-beta.1 (build def5678)",
+        "**Version:** `0.5.8`",
+        "no version or freshness evidence",
+    ]
+    monkeypatch.setattr(report, "fetch_issues", lambda since: [
+        {"number": index, "title": "[Crash] Backend died (exit code 1)", "body": body}
+        for index, body in enumerate(bodies, start=1)
+    ])
+    monkeypatch.setattr(sys, "argv", ["crash_class_report.py", "--since", "2026-11-01",
+                                      "--version", "0.5.9-beta.2"])
+    assert report.main() == 0
+    output = capsys.readouterr().out
+    assert "Recurrence metric (current-version crash-class reports): 1" in output
+    assert "#1      [backend-died/current]" in output
+    assert "#2      [backend-died/outdated]" in output
+    assert "#3      [backend-died/outdated]" in output
+    assert "#4      [backend-died/unknown]" in output

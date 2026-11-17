@@ -1,8 +1,4 @@
-import {
-  classifyError,
-  urlFor,
-  type ErrorClass,
-} from '@shared/utils/errorDocsMap';
+import { classifyError, urlFor, type ErrorClass } from '@shared/utils/errorDocsMap';
 import { ExternalLink } from './external-link';
 import { buildIssueSearchUrl } from '@shared/utils/bugReportDocument';
 import { Component, useEffect, type ReactNode, type ErrorInfo } from 'react';
@@ -13,18 +9,34 @@ import { ReportBug } from './report-bug';
 import { Button } from './ui/button';
 import { openRepairAgent } from '@/lib/repair-agent-events';
 import { captureException } from '@shared/utils/analytics';
+import { captureDiagnosticException } from '@/lib/diagnostic-reports';
 
 const MODULE_RETRY_PREFIX = 'voicestudio.moduleRetry:';
 const reloadRenderer = () => window.location.reload();
 
+function isModuleLoadError(message: string): boolean {
+  return /(?:failed to fetch dynamically imported module|error loading dynamically imported module|importing a module script failed)/i.test(
+    message,
+  );
+}
+
+// Try Again resets the boundary first, which keeps unsaved work. A failed
+// dynamic import that React.lazy or the module loader has cached (a lazy route,
+// the lazy setup wizard) replays the same rejection at once; only a full
+// renderer reload can request that chunk again, so a replay triggers one.
+const RESET_REPLAY_MS = 2000;
+let moduleErrorReset: { message: string; at: number } | null = null;
+
+function resetReplayedModuleError(message: string): boolean {
+  return (
+    isModuleLoadError(message) &&
+    moduleErrorReset?.message === message &&
+    Date.now() - moduleErrorReset.at < RESET_REPLAY_MS
+  );
+}
+
 function claimModuleRetry(message: string): string | null {
-  if (
-    !/(?:failed to fetch dynamically imported module|error loading dynamically imported module|importing a module script failed)/i.test(
-      message,
-    )
-  ) {
-    return null;
-  }
+  if (!isModuleLoadError(message)) return null;
   const key = MODULE_RETRY_PREFIX + message.slice(0, 240);
   try {
     if (sessionStorage.getItem(key) === 'attempted') return null;
@@ -47,6 +59,11 @@ export function ErrorRecovery({
   const { t } = useTranslation();
   const failure = error instanceof Error ? error : new Error(String(error));
   useEffect(() => {
+    if (resetReplayedModuleError(failure.message)) {
+      reload();
+      return;
+    }
+    moduleErrorReset = null; // the last reset ended in a different outcome
     const retryKey = claimModuleRetry(failure.message);
     if (retryKey) {
       // A failed dynamic-import promise is cached by the module loader. Resetting
@@ -79,7 +96,15 @@ export function ErrorRecovery({
           </pre>
         </details>
         <div className="flex flex-wrap items-start gap-2">
-          <Button size="sm" onClick={reset}>
+          <Button
+            size="sm"
+            onClick={() => {
+              moduleErrorReset = isModuleLoadError(failure.message)
+                ? { message: failure.message, at: Date.now() }
+                : null;
+              reset();
+            }}
+          >
             {t('errors.tryAgain')}
           </Button>
           <Button
@@ -118,6 +143,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { error: E
     return { error };
   }
   componentDidCatch(error: Error, info: ErrorInfo) {
+    captureDiagnosticException(error, 'renderer_crash', 'render');
     captureException(error, 'renderer:react-boundary');
     console.error('[VoiceStudio UI]', error, info.componentStack);
   }

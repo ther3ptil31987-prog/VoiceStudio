@@ -17,10 +17,14 @@ model needs one acceptance. Accepting confirms that you have the rights the
 model's licence requires for your use, for example non-commercial use only or a
 separate licence from the rights holder for commercial use.
 
-- Until accepted, the model card shows **Accept licence to use** and every
-  feature that would load the model (generation, transcription, dictation,
-  dubbing, translation, batch, workflows, API) stops with an acceptance dialog
-  instead of loading it. Nothing is reinstalled.
+- Until accepted, the model card shows **Accept licence to use**. Click it,
+  or focus it and press Enter or Space, to open the full terms and confirmation
+  dialog for the model and its required dependencies. Every feature that would
+  load the model (generation, transcription, dictation, dubbing, translation,
+  batch, workflows, API) also stops with an acceptance dialog instead of loading
+  it. Nothing is reinstalled. Licence acceptance does not install a missing
+  engine runtime; a downloaded Sortformer bundle still needs the separate
+  audio.cpp runtime shown in Settings → Models → Diarisation.
 - Acceptance is recorded locally and separately for each model: when you
   accepted or withdrew, the fingerprint of the exact terms you were shown, and
   the app version. The last 20 actions are kept as history, shown under
@@ -35,6 +39,8 @@ separate licence from the rights holder for commercial use.
 - When a feature needs several unaccepted models at once (OmniVoice and its
   tokenizer, for example), the dialog shows each model's full licence and asks
   for a separate confirmation for each one.
+- After all required licences are accepted, the synthesis or model-selection warning clears.
+  Retry synthesis or selection to continue; acceptance does not replay the action automatically.
 - An earlier Supertonic-3 licence acceptance carries over.
 - API and headless users get HTTP 403 with
   `{"code": "model_licence_required", "models": [...]}` listing each model's
@@ -142,6 +148,9 @@ installed revisions are not deleted, revoked or deemed accepted by this change.
   and `target: local`. It rechecks the current plan, stores the local receipt
   before transfer and verifies every downloaded file. It does not call the
   ordinary model installer or SDK fallback.
+  Both endpoints require an authenticated consumer, the same gate as
+  `POST /models/install`; on the desktop build that means the app's own
+  loopback process.
 - `GET /models/licenses/receipts/{plan_digest}` exports an existing local
   receipt with its archived evidence, without network access. Responses are
   `no-store` and subject to the app's browser-origin protections.

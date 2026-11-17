@@ -18,6 +18,17 @@ env var that exempts trusted callers:
 | **API key** | `OMNIVOICE_API_KEY` env var on the backend | direct clients and first-party session bootstrap | non-loopback **HTTP + WebSocket** |
 | **Trusted networks** | `OMNIVOICE_TRUSTED_NETWORKS` env var | *exempts* the two gates above | non-loopback **consumption** routes only |
 
+The route authorization census (`scripts/dump_route_auth.py`) records effective
+FastAPI dependencies, including nested dependencies. Its policy test requires
+every mutating HTTP route and every WebSocket to carry a recognized gate or an
+explicit, documented exception. Only the read-only `GET /` frontend fallback is
+excluded; mutations and WebSockets at `/` remain visible. Exceptions record the
+current policy, including known gaps; they do not add authorization themselves.
+All four WebSocket paths additionally await the shared inline `require_ws_access`
+guard before accepting a connection. The census lists this in-body authorization
+explicitly because it cannot infer it from FastAPI dependencies. The HTTP-only
+share PIN does not authorize a socket; the WebSocket policy is detailed below.
+
 Loopback traffic (`127.0.0.1`, `::1`, `localhost`) is **never** gated — local
 tools keep working unchanged whichever gate is set.
 
@@ -66,15 +77,17 @@ HTTP/1.1 401 Unauthorized
 
 Notes on the PIN gate (`NetworkAccessMiddleware`, `backend/main.py`):
 
-- It covers **HTTP only** — it does **not** gate WebSockets. The dictation
-  WebSocket has its own guard (see below), and the PIN does **not** authorize
-  it; use the API key or a trusted network for remote dictation.
+- It covers **HTTP only** — it does **not** gate WebSockets. All WebSocket
+  routes have their own shared guard (see below), and the PIN does **not**
+  authorize them; use an administrator credential or a trusted network.
 - The SPA shell (`/`, `/index.html`, `/favicon*`, `/assets/*`, `/health`) is
   always served un-PIN'd so the PIN-prompt UI can load.
 - It is a **consumption** credential: a valid PIN never unlocks the admin surface
   (it is 6 digits, brute-forceable). Admin needs loopback or the API key.
-- It is completely inert when no PIN is set (the default, and every Docker
-  deploy).
+- It is completely inert when no PIN is set (including Docker until in-app
+  network sharing is enabled). Docker's bridge can make the host's own browser
+  a non-loopback client; if the PIN is lost, follow the
+  [Docker recovery steps](install/docker.md#recovering-from-a-lost-share-pin).
 
 ---
 
@@ -146,8 +159,9 @@ HTTP/1.1 401 Unauthorized
 {"detail": "API key required"}
 ```
 
-On a **WebSocket**, a missing or wrong key rejects the handshake with close
-code **1008** (policy violation) instead of a JSON body.
+On a **WebSocket**, a missing or wrong key rejects the handshake before
+acceptance with HTTP **403**, without a JSON body or a WebSocket close frame.
+The guard's internal ASGI policy code is `1008`.
 
 Notes on the API-key gate (`BearerKeyMiddleware`, `backend/main.py`):
 
@@ -205,15 +219,27 @@ to the ambient-cookie CSRF check.
 
 ---
 
-## Dictation WebSocket
+## WebSocket access
 
-The live-dictation stream at **`ws://<host>:3900/ws/transcribe`** carries its
-own inline guard (`backend/api/routers/capture_ws.py`) *in addition to* the
-API-key middleware. A non-loopback client reaches it only if it is **either**:
+The live-dictation stream at **`ws://<host>:3900/ws/transcribe`**, its
+`/v1/audio/transcriptions/stream` alias, streaming TTS at `/ws/tts`, and sidebar
+events at `/ws/events` all await `require_ws_access` before accepting a socket,
+in addition to the API-key middleware. This guard also applies when no API key
+is configured. A non-loopback client reaches these routes only if it is either:
 
 - on a [trusted network](#trusted-networks) (`is_local_host` passes), **or**
 - presenting a direct-client **API key** in `Authorization`, or through a
-  legacy `ov_key`/`?api_key=` transport.
+  legacy `ov_key`/`?api_key=` transport, or a valid administrator session or
+  path-bound one-shot ticket as described below.
+
+A browser's supplied `Origin` is validated before any local/trusted-network or
+credential admission. It must match the backend's origin or an entry in
+`OMNIVOICE_ALLOWED_ORIGINS`; the default entries include `app://voicestudio`
+and the localhost/127.0.0.1 UI origins. An origin outside these allowed values
+is refused even on loopback or with a valid key. Native clients without an
+`Origin` keep their credential and trusted network paths, except WebSocket
+tickets, which require an allowed origin; browser session cookies also require
+an allowed origin.
 
 ```
 ws://gpu-box:3900/ws/transcribe?api_key=<key>
@@ -229,11 +255,14 @@ atomically at most once. Same-origin UI WebSockets use the
 HttpOnly session cookie and must pass exact `Origin` validation; `null`, missing,
 and lookalike origins are rejected.
 
-The **share PIN does not authorize dictation** — the PIN gate is HTTP-only, and
-the dictation guard checks only the API key (or trusted-network membership). A
-LAN guest who has only entered a PIN can use the HTTP API but **not** live
-dictation. When neither the API key nor a trusted network applies, the handshake
-is closed with code **1008** and reason `loopback origin required`.
+The **share PIN does not authorize WebSockets** — the PIN gate is HTTP-only.
+A LAN guest who has only entered a PIN can use the HTTP consumption API but
+cannot use live dictation, streaming TTS or sidebar event updates. Configure an
+administrator API key/session or an explicitly trusted network for those
+streams. When neither a permitted credential nor a trusted network applies, the
+guard refuses the handshake before accepting it. The ASGI refusal uses code
+`1008` internally, but the server returns **HTTP 403**, without a WebSocket close
+frame or reason. Browsers may expose only a generic connection failure (`1006`).
 
 ---
 
@@ -268,14 +297,36 @@ proxies are unwrapped so they match IPv4 CIDRs; the value is read at request
 time, so in production **restart the backend** to apply a change. Default empty
 — no change to the strict loopback default.
 
+### Docker host loopback
+
+`OMNIVOICE_TRUST_HOST_LOOPBACK=1` (server mode only) lets the Docker host's own
+browser skip the **share PIN**. Inside the container that browser arrives from
+the default gateway, so only that exact socket address qualifies, only on the
+main port (not the LAN-share listener), and forwarded headers are never read
+for it. It grants the PIN's consumption rights only: the API-key gate and admin
+routes are unaffected. Default off. Risks and setup:
+[Docker install](install/docker.md#trust-host-loopback).
+
 ---
 
 ## Admin routes and server mode
 
 Admin routes — `/system/*` (including `set-env`, **RCE-class**),
 `/api/settings/*`, engine selection/install/uninstall, media tools, MCP
-bindings, pronunciation settings, and remote-worker management — sit on a
+bindings and pronunciation settings — sit on a
 stricter gate (`require_admin`, `backend/api/dependencies.py`) than consumption.
+Editing, deleting and importing stored content (voice/profile, project,
+glossary, persona, watermark settings, marketplace, batch-job delete) also uses
+this admin gate. Their read-only metadata and saved audio remain available to
+authenticated consumers, including PIN-paired phones, and so do the routes that
+only run a generation (translate, dub, batch submit/cancel/retry, voice convert,
+capture, describe voice, audiobook render, clone creation), marked with
+`@consumer_generation`. The OpenAI-compatible
+`/v1` API retains its consumption gate. A pending designed-voice preview can
+synthesize and save audio even though it is a GET, so it requires an admin
+credential too. Same-origin media requests can use an admin-session cookie
+without the JavaScript CSRF header; cross-site GETs remain rejected.
+
 On the desktop build they are **true-loopback-only**: no PIN, key, or trusted
 network reaches them from another machine.
 
@@ -302,6 +353,13 @@ requirement is dropped (issue #261, else the operator is 403'd out of their own
 Managed sidecar installation remains true-loopback-only even with an API key.
 Its installer fetches mutable source and creates an editable environment, so it
 must be run directly on that machine until the source supply chain is pinned.
+
+Runtime logs, the log stream, recent errors and the last-run crash report do
+not use the bare-server discovery exemption. They can contain host paths and
+diagnostic details, so remote server-mode reads require the administrator API
+key or a valid administrator session. A share PIN or trusted network alone does
+not authorize them. Genuine loopback reads remain available without a key;
+cross-site browser reads are refused.
 
 Host paths are never selected through HTTP. The Electron main process validates
 model-cache and export destinations (chosen in a native save/open dialog) plus
@@ -344,7 +402,10 @@ Each entry must be a bare origin — `scheme://host:port`, exactly what the
 browser sends in its `Origin` header — with no path and no trailing slash
 (`http://192.168.1.159:3901/` would never match). The variable **replaces**
 the default list, so restate the loopback and `app://voicestudio` origins
-alongside your own. (The in-app LAN share and Tailscale flows in
+alongside your own. A refused request's 403 names its origin and gives the full
+`OMNIVOICE_ALLOWED_ORIGINS=` line to add, defaults included. In the desktop
+app, put it in `~/.config/omnivoice/env` (macOS, Linux) or
+`%USERPROFILE%\.config\omnivoice\env` (Windows) and restart VoiceStudio. (The in-app LAN share and Tailscale flows in
 [docs/sharing.md](sharing.md) don't need this — they serve UI and API from the
 same origin.) If you only moved the Vite dev server's port, set
 `OMNIVOICE_UI_PORT` (the older `VOICESTUDIO_UI_PORT` name is still accepted)
@@ -355,13 +416,18 @@ answered before PIN/API-key enforcement, and gate-generated `401` responses
 retain CORS headers so the UI can read the actual failure and prompt for the
 right credential.
 
-TLS-terminating proxies must establish the effective scheme at the ASGI server
-boundary. Uvicorn's proxy-header handling trusts loopback by default, which
-covers Tailscale Serve; a custom proxy on another address must be listed with
-`--forwarded-allow-ips=<proxy-ip>` (and proxy headers must remain enabled).
-VoiceStudio deliberately does not trust a raw `X-Forwarded-Proto` header inside
-the application: once Uvicorn accepts a trusted proxy, the resolved ASGI scheme
-drives exact-Origin checks and the session cookie's `Secure` attribute.
+Uvicorn applies proxy-header rewrites only for peers in its
+`--forwarded-allow-ips` list (loopback by default), which covers bare-metal
+Tailscale Serve. Docker can present the proxy as a bridge gateway instead.
+VoiceStudio's effective-scheme helper also permits a one-way upgrade to HTTPS
+from `X-Forwarded-Proto`; it never uses that header to downgrade HTTPS. This
+supports exact-Origin checks and adds the session cookie's `Secure` attribute
+without trusting the proxy's claimed client address. The header does not prove
+that TLS or certificate validation succeeded: verify the client-facing HTTPS URL
+in the browser. Do not set `FORWARDED_ALLOW_IPS=*` or trust a shared Docker gateway
+merely to make sharing work. If original client-address forwarding is needed,
+trust only a controlled proxy that sanitizes those headers and cannot be
+bypassed. See [Docker with Tailscale](install/docker.md#private-remote-access-with-tailscale).
 For a public path prefix such as `/studio`, either strip that prefix before
 forwarding or configure the ASGI `root_path` to the same value. WebSocket ticket
 validation removes only that trusted, configured prefix; it never accepts an
@@ -375,7 +441,7 @@ traffic in **every** configuration, loopback included:
 
 - **Requests another website sends.** A state-changing request (`POST`, `PUT`,
   `PATCH`, `DELETE`) or WebSocket handshake whose `Origin` is not allowed is
-  refused with `403` (WebSocket close `1008`), as is one whose
+  refused with HTTP `403` (including a WebSocket handshake before acceptance), as is one whose
   `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed `Origin`.
   Browsers send no `Origin` on media and download `GET`s (`<video src>`,
   download links); those pass when their `Referer` is an allowed origin, and a
@@ -432,7 +498,7 @@ call the API directly need their origin in `OMNIVOICE_ALLOWED_ORIGINS`.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| **401** | Consumption auth failed — `{"detail": "PIN required"}` or `{"detail": "API key required"}`. | Supply the PIN / key (header, cookie, or query param above). A WebSocket surfaces this as close code **1008**. |
+| **401** | Consumption auth failed — `{"detail": "PIN required"}` or `{"detail": "API key required"}`. | Supply the PIN / key (header, cookie, or query param above). A refused WebSocket handshake returns HTTP **403**; browsers may expose a generic connection failure. |
 | **403** | Authorization failed: the request came from another website or used an unrecognized host name ([details](#requests-from-other-websites-and-host-names)), loopback/native access was required, cookie Origin/CSRF validation failed, a server-mode mutation lacked an admin credential, or a native path capability was invalid/expired. | A PIN cannot grant admin or filesystem access. Re-authenticate the UI; scripts should use the API-key header; run native operations from the desktop app. The admin gate names the key only when one can satisfy it: server mode with `OMNIVOICE_API_KEY` configured answers `{"detail": "loopback origin or admin API key required"}` (the bundled UI routes it to the API-key login form); PIN-only/no-key server mode and the desktop build answer `{"detail": "loopback origin required"}` (only loopback can satisfy the gate). |
 | **429** | A failed administrator-session exchange exceeded its per-client limit, the GPU pool is saturated, or a model download is rate-limited. Ships with `Retry-After`; workload throttles also carry `X-VoiceStudio-Retryable: true`. | Back off for `Retry-After` seconds. For authentication, verify the master before retrying; a correct master is never locked out. |
 
@@ -446,3 +512,11 @@ call the API directly need their origin in `OMNIVOICE_ALLOWED_ORIGINS`.
 - [docs/agentic-voice.md](agentic-voice.md) — pointing OpenAI-compatible agent
   frameworks at VoiceStudio.
 - [docs/mcp.md](mcp.md) — the MCP server for AI agents.
+
+
+## Gallery permissions
+
+Gallery browsing and preview requests use the consumption gate. Importing,
+uploading, editing, deleting or copying a gallery voice into a profile requires
+administrator authorization. A share PIN alone does not authorize those
+mutations; server deployments must configure an API key for remote management.

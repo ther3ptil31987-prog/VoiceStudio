@@ -11,6 +11,7 @@ explicit override that the UI cannot silently undo.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -33,14 +34,24 @@ _PREFS_PATH = os.path.join(DATA_DIR, "prefs.json")
 _MUTATE_LOCK = threading.RLock()
 
 
-def _load() -> dict:
+def _load(*, strict: bool = False) -> dict:
     try:
         with open(_PREFS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+            value = json.load(f)
+            return value if isinstance(value, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    except (UnicodeError, RecursionError) as e:
+        if strict:
+            # The file may be readable by another tool/version. A mutation
+            # must not replace undecodable or unbounded existing preferences.
+            raise OSError(errno.EILSEQ, "Preferences could not be decoded") from e
+        return {}
     except Exception as e:
-        logger.warning("prefs.json unreadable (%s); treating as empty", e)
+        if strict:
+            # Mutation must not replace unread existing settings with defaults.
+            raise
+        logger.warning("prefs.json unreadable (%s); treating as empty", type(e).__name__)
         return {}
 
 
@@ -64,34 +75,42 @@ def _save(data: dict) -> None:
         raise
 
 
+def _announce(key: str) -> None:
+    from core import change_hooks  # imported late: prefs loads before everything else
+
+    change_hooks.notify("prefs", key)
+
+
 def get(key: str, default: Any = None) -> Any:
     return _load().get(key, default)
 
 
 def set_(key: str, value: Any) -> None:
     with _MUTATE_LOCK:
-        data = _load()
+        data = _load(strict=True)
         data[key] = value
         _save(data)
+    _announce(key)
 
 
 def update_mapping(key: str, changes: dict, *, replace: bool = False) -> None:
     """Atomically update one preference object without losing concurrent edits."""
     with _MUTATE_LOCK:
-        data = _load()
+        data = _load(strict=True)
         current = data.get(key)
         value = dict(current) if isinstance(current, dict) and not replace else {}
         value.update(changes)
         data[key] = value
         _save(data)
+    _announce(key)
 
 
 def delete(key: str) -> None:
-    """Remove *key* from prefs.json if present."""
     with _MUTATE_LOCK:
-        data = _load()
+        data = _load(strict=True)
         data.pop(key, None)
         _save(data)
+    _announce(key)
 
 
 def resolve(key: str, *, env: Optional[str] = None, default: Any = None) -> Any:

@@ -20,6 +20,11 @@ as Model. Bedrock accepts a Bedrock API key or an existing `AWS_PROFILE` /
 AWS credentials, with region set in the AWS environment. Vertex uses Account ID
 as the Google project, application default credentials, and `VERTEXAI_LOCATION`
 (default `global`). Provider access and billing remain tied to your accounts.
+API Route uses `https://global.api-route.com/v1`, with `deepseek-v4.1-flash`
+as its default model. Select API Route and enter a key from
+[api-route.com](https://www.api-route.com); `API_ROUTE_API_KEY`,
+`API_ROUTE_BASE_URL` and `API_ROUTE_MODEL` also configure this entry.
+
 Model IDs vary by account; native SDK and CLI entries use manual model entry,
 while compatible endpoints offer model discovery. The generic LiteLLM entry
 requires a provider-prefixed model. Credentials can use a saved key, provider
@@ -57,7 +62,7 @@ migration of older plaintext translation-key preferences. The legacy compatible
 endpoint key uses the same encrypted storage. These paid requests
 require HTTPS, have bounded connection/read timeouts, and do not follow credential-bearing redirects.
 Connect also checks that the project/account stayed unchanged during verification.
-Credentialed LLM endpoints require HTTPS outside loopback; local HTTP servers remain supported.
+Credentialed LLM endpoints require HTTPS outside loopback; local HTTP servers remain supported. For an OpenAI-compatible server on your own network (such as `http://192.168.1.20:8000/v1`), turn on **Allow plain HTTP on my LAN** for that provider: the API key is then sent unencrypted, and only to a private, loopback or link-local IP address typed as a literal. Public hosts and DNS names are always refused, and SDK providers keep the HTTPS requirement.
 
 Provider protocol references: [LiteLLM](https://docs.litellm.ai/docs/providers),
 [Codex](https://developers.openai.com/codex/noninteractive/),
@@ -146,6 +151,13 @@ same-origin proxy only for its known local backend; remote overrides never fall
 back to a different server. The configured authentication is retained.
 
 LM Studio automatic discovery accepts only loaded `llm`/`vlm` entries from its native model metadata. If that metadata is unavailable, set a model explicitly in Settings; untyped OpenAI-compatible IDs are not used to guess whether a model supports chat. The authenticated native probe rejects redirects so credentials remain on the configured origin.
+
+Automatic model discovery applies the same credential-transport policy as
+inference before making a request, including LM Studio's native probe. A stored
+API key is sent only over HTTPS or loopback HTTP, unless **Allow plain HTTP on
+my LAN** is explicitly enabled for an eligible private IP literal. A refused
+configuration does not populate the discovery failure cache, so correcting the
+URL or opt-in takes effect immediately. Cached model IDs require no new request.
 
 SDK transport validates the final request URL, including environment-derived
 OpenAI endpoints, and disables redirects for OpenAI-compatible and native

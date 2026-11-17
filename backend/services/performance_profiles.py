@@ -5,11 +5,29 @@ import math
 import os
 
 from services.performance_budget import TIERS as _PERFORMANCE_TIERS
+from services.performance_readiness import inventory_only, package_available, asr_installed
+from services.performance_probe import active_asr_selection, selection_ready
+from services.performance_selection import selection_snapshot, unchanged_selection
 
 #: TTS engines whose sampling the performance tiers tune: native OmniVoice and
 #: the same model in its registered crash-isolated sidecar. The one source for
 #: the backend gates and the renderer (via ``tts_tiered_engines``).
 TIERED_TTS_ENGINES = frozenset({"omnivoice", "omnivoice-subprocess"})
+#: Untiered engines whose own default decode step count differs from the
+#: generic 16 the routes fall back to. omnivoice.cpp decodes 32 MaskGIT steps
+#: by default; filling 16 would halve its quality on every untouched request
+#: (#4084). Kept equal to ``engines.omnivoice_gguf.resident.DEFAULT_DECODE_STEPS``
+#: by tests/backend/engines/test_omnivoice_gguf.py.
+ENGINE_DEFAULT_NUM_STEP = {"omnivoice-gguf": 32}
+
+#: ASR engines the performance tiers manage: the CTranslate2 Whisper runtime and,
+#: on Apple Silicon, MLX Whisper (#3349). Any other active ASR engine (Parakeet
+#: MLX, PyTorch Whisper on ROCm, or one the user picked) is kept, and a Mac
+#: already on MLX Whisper only moves between MLX models: a preset must not move
+#: a Mac from its GPU engine to CPU faster-whisper.
+TIERED_ASR_ENGINES = frozenset(
+    {"faster-whisper", "faster-whisper-isolated", "whisperx", "mlx-whisper"}
+)
 
 
 _PERFORMANCE_PROFILE_KEY = "performance_profile"
@@ -92,24 +110,72 @@ def _installed_ct2_models() -> list[dict]:
     ]
 
 
-def _faster_whisper_backend() -> str | None:
+_CT2_EQUIVALENT_OF_MLX = {
+    "mlx-community/whisper-large-v3-mlx": "Systran/faster-whisper-large-v3",
+    "mlx-community/whisper-large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+}
+
+
+def _installed_mlx_whisper_model() -> dict | None:
+    """Return the supported, complete MLX Whisper cache available on this host."""
+    from api.routers.setup.models import (
+        KNOWN_MODELS,
+        _model_supported,
+        cache_is_complete,
+        is_cached,
+    )
     from services import asr_backend
 
-    if asr_backend._probe_available(asr_backend.FasterWhisperBackend):
+    if not (
+        asr_backend._mps_available()
+        and asr_installed(asr_backend.MLXWhisperBackend, asr_backend._DEEP_IMPORT_BROKEN)
+    ):
+        return None
+    repo_id = asr_backend.mlx_whisper_model_id()
+    model = next((m for m in KNOWN_MODELS if m.get("repo_id") == repo_id), None)
+    if (
+        model is None
+        or not _model_supported(model)
+        or not is_cached(repo_id)
+        or not cache_is_complete(model)
+    ):
+        return None
+    return model
+
+
+def _installed_asr_models() -> list[tuple[str, dict]]:
+    backend = _faster_whisper_backend()
+    models = [(backend, model) for model in _installed_ct2_models()] if backend else []
+    mlx = _installed_mlx_whisper_model()
+    if mlx is None:
+        return models
+    cpu_copy = _CT2_EQUIVALENT_OF_MLX.get(str(mlx["repo_id"]))
+    return [
+        *(item for item in models if item[1].get("repo_id") != cpu_copy),
+        ("mlx-whisper", mlx),
+    ]
+
+
+def _preset_asr_models(active_engine: str | None) -> list[tuple[str, dict]]:
+    """Installed ASR models a preset may select for the active ASR engine.
+
+    CTranslate2 hosts may move to MLX Whisper (CPU to GPU); a host already on
+    MLX Whisper keeps to MLX models so no tier moves it back to the CPU.
+    """
+    models = _installed_asr_models()
+    if active_engine == "mlx-whisper":
+        return [item for item in models if item[0] == "mlx-whisper"]
+    return models
+
+
+def _faster_whisper_backend() -> str | None:
+    """Choose an installed in-process or isolated faster-whisper backend."""
+    from services import asr_backend
+
+    if asr_installed(asr_backend.FasterWhisperBackend, asr_backend._DEEP_IMPORT_BROKEN):
         return "faster-whisper"
-    row = next(
-        (
-            item
-            for item in asr_backend.list_backends()
-            if item["id"] == "faster-whisper-isolated"
-        ),
-        None,
-    )
-    return (
-        "faster-whisper-isolated"
-        if row and row.get("available") and row.get("routing_status") != "unavailable"
-        else None
-    )
+    cls = asr_backend._REGISTRY["faster-whisper-isolated"]
+    return "faster-whisper-isolated" if asr_installed(cls, asr_backend._DEEP_IMPORT_BROKEN) else None
 
 
 def _dictation_supports_locale(spec, language: str | None) -> bool:
@@ -149,88 +215,108 @@ def _installed_dictation_models() -> list:
 
 
 def _activate_asr_model(tier: str) -> dict | None:
+    """Apply a ready ASR tier only while the captured user selection is unchanged."""
     from core import prefs
     from services import asr_backend
 
+    snapshot = selection_snapshot("asr")
     if os.environ.get("OMNIVOICE_ASR_BACKEND") or prefs.is_env_shadowed(
         "ASR_MODEL_FASTER"
     ):
         return None
-    model = _tier_choice(
-        _installed_ct2_models(), tier, size=lambda item: item.get("size_gb")
-    )
-    backend_id = _faster_whisper_backend()
-    if model is None or backend_id is None:
+    active = active_asr_selection()
+    if active not in TIERED_ASR_ENGINES:
         return None
-    repo_id = str(model["repo_id"])
-    if asr_backend.faster_whisper_model_id() != repo_id:
-        asr_backend.select_faster_whisper_model(repo_id)
-    if asr_backend.active_backend_id() != backend_id:
-        prefs.set_("asr_backend", backend_id)
-    return {"engine": backend_id, "model": repo_id}
+    choice = _tier_choice(
+        _preset_asr_models(active), tier, size=lambda item: item[1].get("size_gb")
+    )
+    if choice is None:
+        return None
+    backend_id, model = choice
+    if not selection_ready("asr", backend_id):
+        return None
+    with unchanged_selection(snapshot) as unchanged:
+        if not unchanged:
+            return None
+        repo_id = str(model["repo_id"])
+        if backend_id != "mlx-whisper" and asr_backend.faster_whisper_model_id() != repo_id:
+            asr_backend.select_faster_whisper_model(repo_id)
+        if active != backend_id:
+            prefs.set_("asr_backend", backend_id)
+        return {"engine": backend_id, "model": repo_id}
 
 
 def _activate_dictation_model(tier: str) -> dict | None:
+    """Apply a ready dictation tier without overwriting concurrent user choices."""
     from core import prefs
-    from services import asr_backend, sherpa_dictation
+    from services import asr_backend
 
+    snapshot = selection_snapshot("dictation")
     if os.environ.get("OMNIVOICE_SHERPA_ASR_MODEL"):
         return None
-    available, _ = sherpa_dictation.sherpa_available()
-    if not available:
+    if not package_available("sherpa_onnx"):
         return None
     model = _tier_choice(
         _installed_dictation_models(), tier, size=lambda item: item.size_gb
     )
     if model is None:
         return None
-    if prefs.get("dictation.model_id") != model.id:
-        prefs.set_("dictation.model_id", model.id)
-        asr_backend._capture_backend = None
-        asr_backend._capture_backend_key = None
-    return {"engine": model.kind, "model": model.id}
+    if not selection_ready("dictation", model.kind):
+        return None
+    with unchanged_selection(snapshot) as unchanged:
+        if not unchanged:
+            return None
+        if prefs.get("dictation.model_id") != model.id:
+            prefs.set_("dictation.model_id", model.id)
+            asr_backend._capture_backend = None
+            asr_backend._capture_backend_key = None
+        return {"engine": model.kind, "model": model.id}
 
 
 def _activate_translation_model(tier: str) -> dict | None:
+    """Select a ready local tier while preserving usable explicit providers."""
     from core import prefs
-    from services import translation_engines
 
+    snapshot = selection_snapshot("translation")
     current = str(prefs.get("translation_backend", "argos"))
     # Keep a usable explicitly chosen network provider. A stale provider whose
     # package/key disappeared must not strand Dubbing while an installed local
     # translator is ready.
-    if current not in {"argos", "nllb"} and translation_engines.is_ready(current):
+    if current not in {"argos", "nllb"} and selection_ready("translation", current):
         return None
     target = str(_PERFORMANCE_TARGETS["translation"][tier]["engine"])
-    if not translation_engines.is_ready(target):
+    if not selection_ready("translation", target):
         target = next(
             (
                 candidate
                 for candidate in ("argos", "nllb")
-                if translation_engines.is_ready(candidate)
+                if selection_ready("translation", candidate)
             ),
             "",
         )
     if not target:
         return None
-    if current != target:
-        prefs.set_("translation_backend", target)
-    return {
-        "engine": target,
-        "model": "facebook/nllb-200-distilled-600M" if target == "nllb" else target,
-    }
+    with unchanged_selection(snapshot) as unchanged:
+        if not unchanged:
+            return None
+        if current != target:
+            prefs.set_("translation_backend", target)
+        return {
+            "engine": target,
+            "model": "facebook/nllb-200-distilled-600M" if target == "nllb" else target,
+        }
 
 
 def _installed_selectable_families() -> set[str]:
-    from services import sherpa_dictation, translation_engines
+    """List model families with installed candidates eligible for tier selection."""
+    from services import translation_engines
 
     families: set[str] = set()
-    if _installed_ct2_models() and _faster_whisper_backend():
+    if _installed_asr_models():
         families.add("asr")
-    sherpa_available, _ = sherpa_dictation.sherpa_available()
-    if sherpa_available and _installed_dictation_models():
+    if package_available("sherpa_onnx") and _installed_dictation_models():
         families.add("dictation")
-    if translation_engines.is_ready("nllb"):
+    if translation_engines.is_ready("nllb", import_check=False):
         families.add("translation")
     return families
 
@@ -252,7 +338,9 @@ def _activate_installed_models(tier: str, family: str | None) -> dict[str, dict]
 
 
 
+@inventory_only
 def profile_state(choice: str | None = None) -> dict:
+    """Describe active selections, effective tiers, installed choices, and resource plans."""
     from core import prefs
     from services import asr_backend, diarization_runtime
     from services.sherpa_dictation import get_spec as dictation_spec
@@ -265,7 +353,7 @@ def profile_state(choice: str | None = None) -> dict:
     )
     diarisation_choices = diarization_runtime.installed_backends()
     tts_engine = active_tts()
-    asr_engine = asr_backend.active_backend_id()
+    asr_engine = active_asr_selection()
     translation_engine = str(prefs.get("translation_backend", "argos"))
 
     active_engines = {
@@ -276,7 +364,7 @@ def profile_state(choice: str | None = None) -> dict:
     }
     supported_engines = {
         "tts": TIERED_TTS_ENGINES,
-        "asr": {"faster-whisper", "faster-whisper-isolated"},
+        "asr": {"faster-whisper", "faster-whisper-isolated", "mlx-whisper"},
         "translation": {"nllb"},
         "dictation": {"offline-transducer", "online-transducer"},
     }
@@ -314,6 +402,8 @@ def profile_state(choice: str | None = None) -> dict:
             "engine": asr_engine,
             "model": asr_backend.faster_whisper_model_id()
             if asr_engine in {"faster-whisper", "faster-whisper-isolated"}
+            else asr_backend.mlx_whisper_model_id()
+            if asr_engine == "mlx-whisper"
             else asr_engine,
         },
         "dictation": {
@@ -360,8 +450,11 @@ def profile_state(choice: str | None = None) -> dict:
         # The renderer mirrors the TTS preset only for these engines.
         "tts_tiered_engines": sorted(TIERED_TTS_ENGINES),
         "targets": {
-            family: _PERFORMANCE_TARGETS[family][effective[family]]
-            for family in _PERFORMANCE_TARGETS
+            **{
+                family: _PERFORMANCE_TARGETS[family][effective[family]]
+                for family in _PERFORMANCE_TARGETS
+            },
+            **({"asr": {"engine": "mlx-whisper"}} if asr_engine == "mlx-whisper" else {}),
         },
         "selections": selections,
         "plan": plan,
@@ -386,6 +479,7 @@ def requested_tier(family: str) -> str | None:
     return tier if tier in _PERFORMANCE_TIERS else None
 
 
+@inventory_only
 def activate_maximum_capacity_models(family: str | None = None) -> dict:
     """Select the strongest already-installed compatible local models.
 
@@ -396,6 +490,7 @@ def activate_maximum_capacity_models(family: str | None = None) -> dict:
     return _activate_installed_models("max", family)
 
 
+@inventory_only
 def activate_performance_tier(tier: str, family: str | None = None) -> dict:
     """Apply installed-only model/runtime selections implied by a preset."""
     if family is None:
@@ -426,6 +521,9 @@ def _activate_budgeted_profile(tier: str) -> dict:
     from core import prefs
     from services import asr_backend, diarization_runtime, tts_backend
 
+    with prefs._MUTATE_LOCK:
+        snapshots = {family: selection_snapshot(family) for family in _PERFORMANCE_FAMILIES}
+        profile_snapshot = selection_snapshot("profile")
     state = profile_state(tier)
     activated = {}
     for family, entry in state["plan"]["families"].items():
@@ -433,30 +531,37 @@ def _activate_budgeted_profile(tier: str) -> dict:
         if selected is None or entry["reason"] == "kept":
             continue
         engine, model = selected["engine"], selected["model"]
-        if family == "tts":
-            if tts_backend.active_backend_id() != engine:
-                # Normal next-use switching releases the outgoing engine.
-                prefs.set_("tts_backend", engine)
-        elif family == "asr":
-            if asr_backend.faster_whisper_model_id() != model:
-                asr_backend.select_faster_whisper_model(model)
-            prefs.set_("asr_backend", engine)
-        elif family == "dictation":
-            if prefs.get("dictation.model_id") != model:
-                prefs.set_("dictation.model_id", model)
-                asr_backend._capture_backend = None
-                asr_backend._capture_backend_key = None
-        elif family == "translation":
-            prefs.set_("translation_backend", engine)
-        elif family == "diarisation":
-            if diarization_runtime.selected_backend() != engine:
-                diarization_runtime.select_backend(engine)
-            if engine == diarization_runtime.SORTFORMER:
-                from services import model_manager
-                model_manager.unload_diarization_pipeline()
-        activated[family] = selected
+        if not selection_ready(family, engine):
+            continue
+        with unchanged_selection(snapshots[family]) as unchanged:
+            if not unchanged:
+                continue
+            if family == "tts":
+                if tts_backend.active_backend_id() != engine:
+                    # Normal next-use switching releases the outgoing engine.
+                    prefs.set_("tts_backend", engine)
+            elif family == "asr":
+                if engine != "mlx-whisper" and asr_backend.faster_whisper_model_id() != model:
+                    asr_backend.select_faster_whisper_model(model)
+                prefs.set_("asr_backend", engine)
+            elif family == "dictation":
+                if prefs.get("dictation.model_id") != model:
+                    prefs.set_("dictation.model_id", model)
+                    asr_backend._capture_backend = None
+                    asr_backend._capture_backend_key = None
+            elif family == "translation":
+                prefs.set_("translation_backend", engine)
+            elif family == "diarisation":
+                if diarization_runtime.selected_backend() != engine:
+                    diarization_runtime.select_backend(engine)
+                if engine == diarization_runtime.SORTFORMER:
+                    from services import model_manager
+                    model_manager.unload_diarization_pipeline()
+            activated[family] = selected
     # Audio hot paths read the applied result, without probing model inventory.
-    prefs.update_mapping(_PERFORMANCE_PROFILE_KEY, {"resolved": state["effective"]})
+    with unchanged_selection(profile_snapshot) as unchanged:
+        if unchanged:
+            prefs.update_mapping(_PERFORMANCE_PROFILE_KEY, {"resolved": state["effective"]})
     return activated
 
 
@@ -484,7 +589,8 @@ def tts_defaults(engine: str = "omnivoice") -> dict:
     """Only map sampling controls verified for the selected engine family."""
     tier = requested_tier("tts")
     if tier is None or engine not in TIERED_TTS_ENGINES:
-        return {}
+        native = ENGINE_DEFAULT_NUM_STEP.get(engine)
+        return {"num_step": native} if native is not None else {}
     target = _PERFORMANCE_TARGETS["tts"][tier]
     return {"num_step": target["steps"], "postprocess_output": target["postprocess"]}
 

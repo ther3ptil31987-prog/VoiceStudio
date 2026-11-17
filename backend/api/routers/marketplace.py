@@ -21,18 +21,19 @@ Endpoints:
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
 import os
-import re
 import time
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from api.dependencies import require_consumer_reads_admin_writes
 from fastapi.responses import StreamingResponse
 
 from core.config import OUTPUTS_DIR, VOICES_DIR
@@ -41,12 +42,13 @@ from core import event_bus
 from core.version import APP_VERSION
 from core.http_headers import content_disposition
 from core.logging_utils import log_safe
+from core.media_types import MEDIA_EXTS
 from core.path_security import UnsafePath, resolve_within, safe_filename
 from core.safe_archive import ArchiveError, copy_member, open_bounded_zip, read_member
 
 logger = logging.getLogger("omnivoice.marketplace")
 
-router = APIRouter(prefix="/marketplace", tags=["Voice Marketplace"])
+router = APIRouter(prefix="/marketplace", tags=["Voice Marketplace"], dependencies=[Depends(require_consumer_reads_admin_writes)])
 
 # Local marketplace directory for published voices
 MARKETPLACE_DIR = Path(OUTPUTS_DIR) / "marketplace"
@@ -59,7 +61,6 @@ BUNDLE_VERSION = 1
 MAX_BUNDLE_BYTES = 100 * 1024 * 1024
 
 
-_MEMBER_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,8}")
 
 
 def _open_bundle(content: bytes) -> "tuple[zipfile.ZipFile, dict]":
@@ -89,6 +90,22 @@ def _open_bundle(content: bytes) -> "tuple[zipfile.ZipFile, dict]":
     return zf, metadata
 
 
+async def _require_bundle_audio(*filenames: "str | None") -> None:
+    """Refuse the bundle, removing what it wrote, unless every clip decodes as audio."""
+    from api.routers.profiles import _is_decodable_audio
+
+    paths = [os.path.join(VOICES_DIR, f) for f in filenames if f]
+    for path in paths:
+        if not await _is_decodable_audio(path):
+            for written in paths:
+                with contextlib.suppress(OSError):
+                    os.remove(written)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid .omnivoice bundle: its audio could not be read.",
+            )
+
+
 def _extract_bundle_audio(zf: zipfile.ZipFile, profile_id: str) -> "tuple[str | None, str | None]":
     """Copy the bundle's reference and locked audio into VOICES_DIR.
 
@@ -105,8 +122,10 @@ def _extract_bundle_audio(zf: zipfile.ZipFile, profile_id: str) -> "tuple[str | 
             name = found.get(prefix)
             if not name:
                 continue
-            ext = os.path.splitext(name)[1]
-            if not _MEMBER_EXT_RE.fullmatch(ext):
+            # A known media extension only: the file is served back from
+            # /voice_audio, so "ref_audio.html" must not keep its name.
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in MEDIA_EXTS:
                 ext = ".wav"
             filename = f"{profile_id}{suffix}{ext}"
             copy_member(zf, name, os.path.join(VOICES_DIR, filename))
@@ -142,6 +161,50 @@ def _voice_asset(value) -> Path | None:
     return resolved
 
 
+def _insert_bundle_profile(
+    metadata: dict,
+    profile_id: str,
+    ref_audio_filename: str,
+    locked_audio_filename: str | None,
+    *,
+    default_name: str,
+) -> bool:
+    """Store bundle metadata identically for uploads and marketplace installs."""
+    is_locked = bool(metadata.get("is_locked") and locked_audio_filename)
+    # Bundles are untrusted: only the two known kinds are stored, and design
+    # settings are stored as JSON text whatever shape the bundle carried.
+    kind = metadata.get("kind")
+    if kind not in ("clone", "design"):
+        kind = "clone"
+    vd_states = metadata.get("vd_states")
+    if vd_states is not None and not isinstance(vd_states, str):
+        vd_states = json.dumps(vd_states) if isinstance(vd_states, (dict, list)) else None
+    with db_conn() as conn:
+        conn.execute(
+            """INSERT INTO voice_profiles
+               (id, name, ref_audio_path, ref_text, instruct, language,
+                seed, personality, is_locked, locked_audio_path, created_at,
+                kind, vd_states)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                profile_id,
+                metadata.get("profile_name", default_name),
+                ref_audio_filename,
+                metadata.get("ref_text", ""),
+                metadata.get("instruct", ""),
+                metadata.get("language", "Auto"),
+                metadata.get("seed"),
+                metadata.get("personality", ""),
+                1 if is_locked else 0,
+                locked_audio_filename or "",
+                time.time(),
+                kind,
+                vd_states,
+            ),
+        )
+    return is_locked
+
+
 # ── Export ──────────────────────────────────────────────────────────────────
 
 
@@ -171,7 +234,7 @@ def _bundle_metadata(profile: dict, **extra) -> dict:
 
 
 @router.post("/export/{profile_id}")
-def export_profile(profile_id: str):
+def export_profile(profile_id: str, stored: bool = False):
     """Export a voice profile as a downloadable .omnivoice bundle (ZIP)."""
     with db_conn() as conn:
         row = conn.execute(
@@ -182,10 +245,15 @@ def export_profile(profile_id: str):
         raise HTTPException(status_code=404, detail="Voice profile not found")
 
     profile = dict(row)
+    if stored:
+        # Mobile copies use a bounded stored archive; legacy exports keep deflate.
+        assets = [_voice_asset(profile.get(key)) for key in ("ref_audio_path", "locked_audio_path") if profile.get(key)]
+        if any(path and path.is_file() and path.stat().st_size > 32 * 1024 * 1024 for path in assets):
+            raise HTTPException(status_code=413, detail="Voice reference is too large for a phone copy")
 
     # Build the ZIP bundle in memory
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED) as zf:
         # Metadata
         metadata = _bundle_metadata(
             profile, created_at=profile.get("created_at"), exported_at=time.time(),
@@ -208,6 +276,8 @@ def export_profile(profile_id: str):
                 ext = os.path.splitext(locked_path)[1] or ".wav"
                 zf.write(str(full_locked), f"locked_audio{ext}")
 
+    if stored and buf.tell() > 64 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Voice bundle is too large for a phone copy")
     buf.seek(0)
     safe_name = "".join(
         c if c.isalnum() or c in "-_ " else "" for c in profile.get("name", "voice")
@@ -249,34 +319,12 @@ async def import_profile(
             status_code=400,
             detail="Invalid .omnivoice bundle: no reference audio found.",
         )
+    await _require_bundle_audio(ref_audio_filename, locked_audio_filename)
 
-    # Create the profile in the database
-    is_locked = bool(metadata.get("is_locked") and locked_audio_filename)
-    with db_conn() as conn:
-        conn.execute(
-            """INSERT INTO voice_profiles
-               (id, name, ref_audio_path, ref_text, instruct, language,
-                seed, personality, is_locked, locked_audio_path, created_at,
-                kind, vd_states)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                profile_id,
-                metadata.get("profile_name", "Imported Voice"),
-                ref_audio_filename,
-                metadata.get("ref_text", ""),
-                metadata.get("instruct", ""),
-                metadata.get("language", "Auto"),
-                metadata.get("seed"),
-                metadata.get("personality", ""),
-                1 if is_locked else 0,
-                locked_audio_filename or "",
-                time.time(),
-                # Preserve the design/clone distinction across the round-trip;
-                # old bundles without these keys import as a clone.
-                metadata.get("kind") or "clone",
-                metadata.get("vd_states"),
-            ),
-        )
+    is_locked = _insert_bundle_profile(
+        metadata, profile_id, ref_audio_filename, locked_audio_filename,
+        default_name="Imported Voice",
+    )
 
     event_bus.emit("profiles", {"action": "created", "id": profile_id})
     logger.info(
@@ -426,28 +474,12 @@ async def install_from_marketplace(filename: str):
 
     if not ref_audio_filename:
         raise HTTPException(status_code=400, detail="No reference audio in bundle.")
+    await _require_bundle_audio(ref_audio_filename, locked_audio_filename)
 
-    is_locked = bool(metadata.get("is_locked") and locked_audio_filename)
-    with db_conn() as conn:
-        conn.execute(
-            """INSERT INTO voice_profiles
-               (id, name, ref_audio_path, ref_text, instruct, language,
-                seed, personality, is_locked, locked_audio_path, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                profile_id,
-                metadata.get("profile_name", "Marketplace Voice"),
-                ref_audio_filename,
-                metadata.get("ref_text", ""),
-                metadata.get("instruct", ""),
-                metadata.get("language", "Auto"),
-                metadata.get("seed"),
-                metadata.get("personality", ""),
-                1 if is_locked else 0,
-                locked_audio_filename or "",
-                time.time(),
-            ),
-        )
+    _insert_bundle_profile(
+        metadata, profile_id, ref_audio_filename, locked_audio_filename,
+        default_name="Marketplace Voice",
+    )
 
     event_bus.emit("profiles", {"action": "created", "id": profile_id})
 
@@ -474,5 +506,10 @@ def remove_from_marketplace(filename: str):
     try:
         os.unlink(bundle_path)
     except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete: {e}")
+        # Fixed text: an OS error names the path, and Windows escapes its
+        # separators, the one shape scrub_text does not match.
+        raise HTTPException(
+            status_code=500,
+            detail="The bundle could not be deleted. Close anything using it and try again.",
+        ) from e
     return {"success": True, "deleted": filename}

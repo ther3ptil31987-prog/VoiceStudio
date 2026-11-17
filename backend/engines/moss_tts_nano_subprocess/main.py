@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import inspect
 import json
 import os
+from pathlib import Path
 import re
 import struct
 import sys
@@ -23,6 +25,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 
 # Mirrors services/subprocess_backend.py::MAX_FRAME_BYTES.
 MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -71,8 +74,11 @@ def _recv(stream):
 
 def _measure_vram_mb() -> float:
     try:
-        import torch  # noqa: PLC0415
-
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return float(torch.cuda.memory_allocated()) / (1024 * 1024)
     except Exception:  # noqa: BLE001 — a probe, never fatal
@@ -121,6 +127,154 @@ def _heartbeat(stdout, stage: str):
         thread.join(timeout=_HEARTBEAT_S + 1)
 
 
+def _configure_tokenizer_cache(model):
+    """Keep cache roots stable and reuse a usable legacy tokenizer at load time."""
+    if getattr(model, "_voicestudio_tokenizer_cache_configured", False):
+        return model
+    from huggingface_hub.constants import HF_HUB_CACHE  # noqa: PLC0415
+
+    model._resolve_hf_cache_dir = lambda: HF_HUB_CACHE
+    model._patch_hf_dynamic_module_cache_dir = lambda cache_dir: None
+    legacy_cache = Path(inspect.getfile(type(model))).parent / ".cache" / "huggingface"
+    if legacy_cache.is_dir() and callable(getattr(model, "_load_resolved_text_tokenizer", None)):
+        # A strong reference to the bound loader would keep discarded GPU models
+        # alive until cyclic GC runs. The active caller already owns the model.
+        original_loader = weakref.WeakMethod(model._load_resolved_text_tokenizer)
+        use_fast = bool(getattr(getattr(model, "config", None), "tokenizer_use_fast", True))
+
+        def load_tokenizer_with_cache_fallback(resolved_path, cache_dir):
+            """Try existing Hub caches offline before the usual first-use loader."""
+            if not os.path.exists(os.path.expanduser(resolved_path)):
+                from transformers import AutoTokenizer  # noqa: PLC0415
+
+                for candidate in (cache_dir, str(legacy_cache)):
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(
+                            resolved_path, cache_dir=candidate, use_fast=use_fast,
+                            trust_remote_code=True, local_files_only=True,
+                        )
+                        # Some backends construct an empty vocabulary from
+                        # metadata alone; that cannot tokenize Nano's input.
+                        if tokenizer.vocab_size > 0:
+                            return tokenizer
+                    except Exception:  # noqa: BLE001 — cache probes are best-effort
+                        # The original loader below retains the normal failure
+                        # and first-use download behavior if neither cache works.
+                        pass
+            loader = original_loader()
+            if loader is None:
+                raise RuntimeError("MOSS-TTS-Nano model has been unloaded")
+            return loader(resolved_path=resolved_path, cache_dir=cache_dir)
+
+        model._load_resolved_text_tokenizer = load_tokenizer_with_cache_fallback
+    model._voicestudio_tokenizer_cache_configured = True
+    return model
+
+
+def _transformers_unions_ignore_patterns() -> bool:
+    """True where transformers unions ``_keys_to_ignore_*`` with its own set.
+
+    transformers 5.9.0 turned the additional load-ignore patterns into a set
+    and unions them with ``|``, so the list MOSS-TTS-Nano's model declares
+    fails every load with a ``TypeError`` (#3851). Everything before that —
+    transformers 4 and 5 through 5.8 — concatenates them with ``+``, where a
+    set on the left fails instead with ``set + list`` (#4063). The engine
+    venv pins transformers 4.57.1, so the shim is only needed, and only safe,
+    on the set side.
+    """
+    try:
+        import transformers  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — the PreTrainedModel import reports it too
+        return False
+    numbers = []
+    for part in str(getattr(transformers, "__version__", "")).split(".")[:2]:
+        digits = re.match(r"\d+", part)
+        numbers.append(int(digits.group(0)) if digits else 0)
+    if len(numbers) < 2:
+        # An unparsable version keeps the shim off: the load then fails with
+        # transformers' own error, which names the actual cause.
+        return False
+    return tuple(numbers) >= (5, 9)
+
+
+def _accept_list_ignore_patterns():
+    """Let transformers 5.9+ load remote code that lists its ignore patterns.
+
+    transformers 5.9.0 unions ``_keys_to_ignore_on_load_unexpected`` with a
+    set of its own patterns, so the list MOSS-TTS-Nano's model declares
+    (accepted by transformers 4) fails every load with a ``TypeError``
+    (#3851). The patterns are only ever matched, so a set is equivalent.
+    Earlier releases — transformers 4 and 5 through 5.8 — still concatenate
+    the patterns as lists, so the rewrite would break every load there with
+    ``set + list`` instead (#4063): only install the shim where transformers
+    actually needs it.
+    """
+    if not _transformers_unions_ignore_patterns():
+        return
+    try:
+        from transformers.modeling_utils import PreTrainedModel  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — upstream's own import reports it
+        return
+    original = getattr(PreTrainedModel, "_adjust_missing_and_unexpected_keys", None)
+    if original is None or getattr(original, "_voicestudio_accepts_lists", False):
+        return
+
+    def adjust_missing_and_unexpected_keys(self, *args, **kwargs):
+        for name in ("_keys_to_ignore_on_load_unexpected", "_keys_to_ignore_on_load_missing"):
+            patterns = getattr(self, name, None)
+            if isinstance(patterns, (list, tuple)):
+                setattr(self, name, set(patterns))
+        return original(self, *args, **kwargs)
+
+    adjust_missing_and_unexpected_keys._voicestudio_accepts_lists = True
+    adjust_missing_and_unexpected_keys.__wrapped__ = original
+    PreTrainedModel._adjust_missing_and_unexpected_keys = adjust_missing_and_unexpected_keys
+
+
+def _restore_non_persistent_buffers(model):
+    """Give the loaded model the buffer values its own constructor computes.
+
+    transformers 5 builds the model on the meta device and re-allocates every
+    non-persistent buffer with ``torch.empty_like``; it re-initializes only its
+    own rotary classes. MOSS-TTS-Nano's RoPE ``inv_freq`` (global and local
+    transformer) was left as uninitialized memory, so synthesis produced
+    NaN/Inf logits and failed (#3851). The checkpoint never stores these
+    buffers, so a model constructed on CPU from the same config has the exact
+    values; transformers 4 never takes this path.
+    """
+    if getattr(model, "_voicestudio_buffers_restored", False) or not callable(
+        getattr(model, "named_modules", None)
+    ):
+        return model
+    import copy  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    import transformers  # noqa: PLC0415
+
+    def non_persistent(module):
+        return {
+            f"{prefix}.{name}" if prefix else name: buffer
+            for prefix, sub in module.named_modules()
+            for name, buffer in sub.named_buffers(recurse=False)
+            if buffer is not None and name in getattr(sub, "_non_persistent_buffers_set", ())
+        }
+
+    major = int(str(getattr(transformers, "__version__", "0")).split(".")[0] or 0)
+    loaded = non_persistent(model) if major >= 5 else {}
+    if loaded:
+        reference = non_persistent(type(model)(copy.deepcopy(model.config)))
+        with torch.no_grad():
+            for name, buffer in loaded.items():
+                expected = reference.get(name)
+                if expected is None or expected.shape != buffer.shape:
+                    raise RuntimeError(
+                        f"MOSS-TTS-Nano buffer {name} cannot be restored after loading"
+                    )
+                buffer.copy_(expected.to(device=buffer.device, dtype=buffer.dtype))
+    model._voicestudio_buffers_restored = True
+    return model
+
+
 def _load_service(stdout):
     global _SERVICE
     if _SERVICE is not None:
@@ -142,6 +296,21 @@ def _load_service(stdout):
             # install folder (and see _handle_synthesize: one file, reused).
             output_dir=tempfile.mkdtemp(prefix="moss-tts-nano-"),
         )
+        # Upstream's text-tokenizer loader creates another HF cache beside its
+        # dynamically imported model file, then relocates HF_MODULES_CACHE into
+        # it. This defeats the app's short Windows cache path (#3137) and makes
+        # the tokenizer miss files already downloaded into the shared Hub cache.
+        # Keep both cache roots chosen by Hugging Face, including user overrides.
+        load_model = service._load_model_locked
+        _accept_list_ignore_patterns()
+
+        def load_model_with_shared_cache():
+            """Preserve cache roots and restore buffers for every model instance,
+            including reloads."""
+            return _configure_tokenizer_cache(_restore_non_persistent_buffers(load_model()))
+
+        # Inference errors and dtype recovery can discard and reload the model.
+        service._load_model_locked = load_model_with_shared_cache
         _with_retries(lambda: service.preload(load_model=True))
         _SERVICE = service
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 100})

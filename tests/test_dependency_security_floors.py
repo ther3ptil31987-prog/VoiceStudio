@@ -11,19 +11,30 @@ PYTHON_FLOORS = {
     "aiohttp": "3.14.3",
     "cryptography": "50.0.0",
     "gradio": "6.15.1",
+    # Hydra instantiate and logging-config callable resolution (1.3.7), and
+    # the legacy target blacklist missing PyYAML unsafe loaders (1.3.8).
+    "hydra-core": "1.3.8",
     # GHSA-qqmf-gpg7-g8gw: checkpoint _instantiator code execution, fixed in
     # 2.6.6. The advisory range is malformed (< 2022.6.15), so Dependabot
     # still flags fixed releases; this floor is the real guard.
     "lightning": "2.6.6",
-    "mako": "1.3.12",
+    # CVE-2026-114612: proxy admin escalation, fixed in 1.103.1.
+    "litellm": "1.103.1",
+    "mako": "1.4.2",
     "mcp": "1.28.1",
-    "msgpack": "1.2.1",
-    "nltk": "3.10.0",
+    # Unbounded memory leak in the C extension with strict_map_key, fixed in 1.2.3.
+    "msgpack": "1.2.3",
+    "multidict": "6.9.1",
+    # WekaClassifier model path bypassing nltk.pathsec, fixed in 3.10.4.
+    "nltk": "3.10.4",
     "pillow": "12.3.0",
     "protobuf": "5.29.6",
     "pydantic-settings": "2.14.2",
+    # Quadratic-time BER/DER decoding denial-of-service advisories, fixed in 0.6.5.
+    "pyasn1": "0.6.5",
     "pygments": "2.20.0",
-    "pypdf": "6.15.0",
+    # Infinite-loop and memory denial-of-service advisories, fixed in 6.21.4.
+    "pypdf": "6.21.4",
     "pytorch-lightning": "2.6.6",
     "python-multipart": "0.0.31",
     "starlette": "1.3.1",
@@ -56,6 +67,21 @@ def test_python_security_floors_are_locked():
     assert _versions_below_floors(resolved, PYTHON_FLOORS) == {}
 
 
+# The Dagger CI module resolves its own lockfile.
+DAGGER_FLOORS = {
+    # Memory leak in aborted validation (denial of service), fixed in 3.3.1.
+    "graphql-core": "3.3.1",
+    # GHSA-mf5v-w3w3-f6cg: quadratic-time traceparent parsing, fixed in 1.45.2.
+    "opentelemetry-api": "1.45.2",
+}
+
+
+def test_dagger_security_floors_are_locked():
+    lock = tomllib.loads(Path(".dagger/uv.lock").read_text(encoding="utf-8"))
+    resolved = _resolved_versions(lock["package"], DAGGER_FLOORS)
+    assert resolved.keys() == DAGGER_FLOORS.keys()
+    assert _versions_below_floors(resolved, DAGGER_FLOORS) == {}
+
 def test_duplicate_lock_entries_cannot_hide_a_vulnerable_version():
     packages = [
         {"name": "demo", "version": "2.0"},
@@ -65,3 +91,25 @@ def test_duplicate_lock_entries_cannot_hide_a_vulnerable_version():
     resolved = _resolved_versions(packages, floors)
     assert resolved == {"demo": [Version("2.0"), Version("0.9")]}
     assert _versions_below_floors(resolved, floors) == {"demo": ["0.9"]}
+
+
+def test_installed_keeps_the_first_copy_on_sys_path(monkeypatch):
+    """#4066: a stale apt copy later on sys.path must not shadow the imported one."""
+    import importlib.metadata as md
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
+    try:
+        import security_floors
+    finally:
+        sys.path.pop(0)
+
+    class Dist:
+        def __init__(self, name, version):
+            self.metadata = {"Name": name}
+            self.version = version
+
+    monkeypatch.setattr(
+        md, "distributions", lambda: iter([Dist("Mako", "1.4.3"), Dist("mako", "1.3.2.dev0")])
+    )
+    assert security_floors.installed() == {"mako": "1.4.3"}

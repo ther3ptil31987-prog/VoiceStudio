@@ -1,3 +1,4 @@
+import { dubSourceLanguage } from './source-language';
 import {
   startTranslationRun,
   appendTranslationLog,
@@ -8,6 +9,8 @@ import type { DubExportPreferences } from './dub-export';
 import { MAX_COOKIE_EXPORT_BYTES, _cookieTransportAllowed } from '@shared/utils/cookieExport';
 import { projectSession, type DubProject } from '../projects/project-format';
 import { DUB_DRAFT_KEY, restoreDubDraft } from './dub-draft';
+import { dubInputIssue, type DubInputIssue } from './dub-input-issue';
+import { toast } from 'sonner';
 import { Store } from '@tanstack/store';
 import { useStore } from '@tanstack/react-store';
 import { apiJson, ApiError } from '@/lib/api/client';
@@ -17,11 +20,25 @@ import { tr } from '@/lib/i18n-text';
 import { describeDubTranslationError } from './translation-error';
 import { beginAppActivity } from '@/lib/app-activity';
 import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
+import {
+  captureDiagnosticException,
+  prepareDiagnosticException,
+  capturePreparedDiagnostic,
+  observeDiagnosticConsent,
+  diagnosticConsentStillCurrent,
+  type DiagnosticConsentObservation,
+} from '@/lib/diagnostic-reports';
+import { parseSSELine } from '@shared/utils/sseParse';
+import diagnosticPolicy from '../../../../../../config/diagnostics.json';
+import { dialectWasIgnored } from '@shared/api/dialects';
 import { consumeTaskStream, type TaskEvent } from '@/lib/api/event-stream';
 import { publicFailureFromEvent, type PublicFailure } from '@/lib/api/failure';
 import {
   assignSpeakerProfile,
   applySpeakerCloneDefaults,
+  autoProfileId,
+  castParts,
+  castSpeakers,
   cueSourceId,
   segmentGenInputs,
   settleCueSources,
@@ -44,6 +61,8 @@ import {
 } from '@shared/utils/segmentParts';
 import { commitMoveResize } from '@shared/utils/timeline';
 import type { PasteTranslationRow } from '@shared/utils/pasteTranslations';
+import { getDubTranslationError } from './transcript-issues';
+import { translationTargetLabel } from '@/lib/translation-targets';
 import type {
   DubAgentTranslationRequest,
   DubAgentTranslationResult,
@@ -120,6 +139,7 @@ export interface DubSession {
     video_slow_cap?: number;
     gap_guard_s?: number;
     allow_video_retime?: boolean;
+    min_audio_rate?: number;
   };
   steps?: number;
   guidance?: number;
@@ -134,6 +154,10 @@ export interface DubSession {
   fingerprintsByLang?: Record<string, Record<string, string>>;
   project?: DubProject;
   translationFallback?: boolean;
+  /** The dialect was requested but the engine could not honour it (#2752). */
+  dialectIgnored?: boolean;
+  /** The variant the engine wrote instead, when it said (#3143). */
+  dialectUsed?: string;
   subtitleImport?: { file: string; stats: Record<string, number> };
   recovery: 'preparing' | 'generating' | 'transcribing' | null;
   target: string;
@@ -173,6 +197,8 @@ export interface DubSession {
   event: TaskEvent | null;
   error: string | null;
   failure?: PublicFailure | null;
+  /** A source the user can fix by choosing another file (shown on the file row). */
+  inputIssue?: DubInputIssue | null;
   asrModelMissing?: AsrModelMissing | null;
 }
 const initial: DubSession = {
@@ -198,11 +224,13 @@ const initial: DubSession = {
   event: null,
   error: null,
   failure: null,
+  inputIssue: null,
   asrModelMissing: null,
 };
 export const DUB_STOP_FAILED = 'DUB_STOP_FAILED';
 export const DUB_AGENT_UNAVAILABLE = 'DUB_AGENT_UNAVAILABLE';
 const AGENT_FIT_BLOCKING_ERRORS = new Set(['no-llm', 'fit-provider-failed']);
+class DubLocalValidationError extends Error {}
 class DubAsrModelMissingError extends Error {
   constructor(readonly payload: AsrModelMissing) {
     super(payload.detail || payload.error);
@@ -308,6 +336,17 @@ export const setDubProduction = (
 ) => {
   if (['idle', 'editing', 'done'].includes(dubSession.state.phase) && !dubSession.state.recovery)
     patch(value);
+};
+/** Smart Fit speed limits. An undefined value restores the server default. */
+export const setDubFitOptions = (
+  value: Partial<Pick<NonNullable<DubSession['fitOptions']>, 'audio_rate_cap' | 'min_audio_rate'>>,
+) => {
+  if (!['idle', 'editing', 'done'].includes(dubSession.state.phase) || dubSession.state.recovery)
+    return;
+  const next = { ...dubSession.state.fitOptions, ...value };
+  for (const key of Object.keys(value) as (keyof typeof value)[])
+    if (value[key] === undefined) delete next[key];
+  patch({ fitOptions: Object.keys(next).length ? next : undefined });
 };
 export const setDubExportPreferences = (value: Partial<DubExportPreferences>) => {
   if (!controller && !cancelling && !dubSession.state.recovery)
@@ -488,6 +527,15 @@ const patchSegment = (segment: DubSegment, value: Partial<DubSegment>) => {
   const next = fields.some((field) => QC_INVALIDATING_FIELDS.has(field))
     ? { ...invalidateQc(base), ...value, id: segment.id }
     : { ...base, ...value, id: segment.id };
+  if (value.translations && next.translate_errors) {
+    const errors = { ...next.translate_errors };
+    for (const [language, text] of Object.entries(value.translations)) {
+      if (text !== segment.translations?.[language]) delete errors[language];
+    }
+    next.translate_errors = Object.keys(errors).length ? errors : undefined;
+    // Removing the last saved failure must not revive the legacy fallback.
+    if (!next.translate_errors) delete next.translate_error;
+  }
   if (segment.merge_parts && fields.some((field) => MERGE_PART_FIELDS.has(field))) {
     next.merge_parts = undefined;
     if (fields.some((field) => ATTRIBUTION_FIELD_NAMES.has(field)))
@@ -568,6 +616,83 @@ export function assignDubSpeakerProfile(speakerId: string, profileId: string) {
   if (changed) commitSegmentEdit(next);
 }
 
+/** The next unused `Speaker N` label, matching the backend's default
+ *  speaker naming (`Speaker 1` when diarization found no one). */
+export function nextDubSpeakerId(segments: DubSegment[]): string {
+  const taken = new Set(castSpeakers(segments) as string[]);
+  let n = taken.size + 1;
+  while (taken.has(`Speaker ${n}`)) n += 1;
+  return `Speaker ${n}`;
+}
+
+/**
+ * Move lines to another speaker (#3515, #3419). A line that followed its old
+ * speaker's voice (no explicit voice, that speaker's `auto:` clone, or the
+ * voice the old speaker is cast with) follows the new speaker's voice; a voice
+ * the user picked for that line on purpose stays. Mirrors the backend's
+ * re-analysis rebind rule so manual and automatic speaker fixes agree.
+ */
+export function setDubSegmentsSpeaker(ids: ReadonlySet<string>, speakerId: string) {
+  const speaker = speakerId.trim();
+  if (!ids.size || !speaker) return;
+  const current = dubSession.state.segments;
+  // A speaker's cast voice is read the way the casting board shows it (its
+  // first row), over every row: excluding the moved rows would lose the cast
+  // voice when a whole speaker is selected.
+  const castVoice = (name: string) => {
+    const row = current.find((segment) => segment.speaker_id === name);
+    if (row) return row.profile_id || '';
+    const part = current
+      .flatMap(
+        (segment) => castParts(segment) as Array<{ speaker_id?: string; profile_id?: string }>,
+      )
+      .find((item) => item.speaker_id === name);
+    return part ? part.profile_id || '' : undefined;
+  };
+  const targetVoice = castVoice(speaker) ?? '';
+  let changed = false;
+  const next = current.map((segment) => {
+    if (!ids.has(segment.id) || segment.speaker_id === speaker) return segment;
+    changed = true;
+    const oldSpeaker = segment.speaker_id || 'Speaker 1';
+    const voice = segment.profile_id || '';
+    const followsSpeaker =
+      !voice || voice === autoProfileId(oldSpeaker) || voice === castVoice(oldSpeaker);
+    return patchSegment(segment, {
+      speaker_id: speaker,
+      ...(followsSpeaker ? { profile_id: targetVoice || undefined } : {}),
+    });
+  });
+  if (changed) commitSegmentEdit(next);
+}
+
+export function replaceDubSegmentTexts(
+  updates: ReadonlyArray<{ id: string; text: string }>,
+  targetCode?: string,
+) {
+  if (!updates.length) return 0;
+  const byId = new Map(updates.map((update) => [String(update.id), update.text]));
+  let changed = 0;
+  const next = dubSession.state.segments.map((segment) => {
+    const text = byId.get(String(segment.id));
+    if (text === undefined || text === segment.text) return segment;
+    changed += 1;
+    // Same rules as the row editor: a translated row rewrites its target
+    // translation; an untranslated row is a source edit, so text_original
+    // carries the corrected words into later translations and stale
+    // translations of the old source are dropped rather than counted as done.
+    if (targetCode && typeof segment.translations?.[targetCode] === 'string') {
+      return patchSegment(segment, {
+        text,
+        translations: { ...segment.translations, [targetCode]: text },
+      });
+    }
+    return patchSegment(segment, { text, text_original: text, translations: undefined });
+  });
+  if (!changed) return 0;
+  return commitSegmentEdit(next) ? changed : 0;
+}
+
 export function applyDubTranslationRows(targetCode: string, rows: PasteTranslationRow[]) {
   if (!targetCode || !rows.length) return false;
   const mapped = new Map(
@@ -579,12 +704,17 @@ export function applyDubTranslationRows(targetCode: string, rows: PasteTranslati
   let changed = false;
   const next = dubSession.state.segments.map((segment) => {
     const text = mapped.get(segment.id);
-    if (!text || (segment.text === text && segment.translations?.[targetCode] === text))
+    const failed = getDubTranslationError(segment, targetCode);
+    if (!text || (segment.text === text && segment.translations?.[targetCode] === text && !failed))
       return segment;
     changed = true;
+    // Accepting replacement text also resolves a failed attempt with identical text.
+    const errors = { ...segment.translate_errors };
+    delete errors[targetCode];
     return patchSegment(segment, {
       text,
       translations: { ...segment.translations, [targetCode]: text },
+      translate_errors: Object.keys(errors).length ? errors : undefined,
     });
   });
   return changed ? commitSegmentEdit(next) : false;
@@ -621,6 +751,28 @@ export function skipFailedDubTranslations(target: string) {
     };
   });
   if (changed) commitSegmentEdit(next);
+}
+
+/** Dub the transcript as it is: drop translations, keep the original words, and speak them in the source language when it is a known voice language (#3747). */
+export function keepDubSourceText(sourceLanguage?: string) {
+  const sourceCode = dubSourceLanguage(sourceLanguage, dubSession.state.sourceLang)?.toLowerCase();
+  const sourceLabel = translationTargetLabel(sourceCode);
+  const next = dubSession.state.segments.map((segment) => {
+    const text = segment.text_original || segment.text;
+    return {
+      ...segment,
+      text,
+      translations: undefined,
+      translate_error: undefined,
+      translate_errors: undefined,
+      translate_degraded: undefined,
+      agent_generated_lang: undefined,
+      translation_skipped: true,
+    };
+  });
+  if (!next.length) return;
+  commitSegmentEdit(next);
+  if (sourceLabel && sourceCode) setDubTarget(sourceLabel, sourceCode);
 }
 
 export function restoreDubSegments() {
@@ -805,9 +957,177 @@ export function applyDubQc(
     }),
   });
 }
+interface TaskDiagnosticProof {
+  consent: DiagnosticConsentObservation;
+  taskId: string;
+  baseline?: Promise<{ sequence: number; timestamp: number } | null>;
+}
+class DubTaskEventError extends Error {
+  readonly observed = observeDiagnosticConsent();
+  constructor(
+    message: string,
+    readonly proof: TaskDiagnosticProof | null,
+    readonly eventKey: string,
+    readonly error_code: string,
+  ) {
+    super(message);
+  }
+}
+function taskFailureCode(event: TaskEvent): string {
+  const code = typeof event.error_code === 'string' ? event.error_code.toUpperCase() : '';
+  return diagnosticPolicy.error_codes.includes(code) ? code : 'UNKNOWN';
+}
+function taskFailureKey(event: TaskEvent): string {
+  // A closed technical key only: never retain event messages or raw payloads
+  // while waiting for persisted evidence. Ambiguous matches fail closed below.
+  return JSON.stringify([
+    event.type,
+    taskFailureCode(event),
+    typeof event.error_class === 'string' &&
+    diagnosticPolicy.error_types.includes(event.error_class)
+      ? event.error_class
+      : 'OtherError',
+    typeof event.stage === 'string' && diagnosticPolicy.stages.includes(event.stage)
+      ? event.stage
+      : 'other',
+  ]);
+}
+interface PersistedTaskEvents {
+  job: { id: string; status: string; created_at: number; updated_at: number };
+  events: { seq: number; created_at: number; payload: string }[];
+  event_watermark?: { seq: number; created_at: number | null };
+}
+function taskDiagnosticProof(
+  taskId: string,
+  consent: DiagnosticConsentObservation | null,
+): TaskDiagnosticProof | null {
+  return consent ? { taskId, consent } : null;
+}
+function resumedTaskDiagnosticProof(
+  taskId: string,
+  signal: AbortSignal,
+): TaskDiagnosticProof | null {
+  const consent = observeDiagnosticConsent();
+  if (!consent) return null;
+  // This is concurrent with the stream, never a prerequisite for showing its
+  // result. Sequence evidence avoids trusting synchronized client/server clocks.
+  const baseline = apiJson<PersistedTaskEvents>(
+    '/jobs/' + encodeURIComponent(taskId) + '/events?limit=2000',
+    { signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]) },
+  )
+    .then((saved) => {
+      if (
+        !diagnosticConsentStillCurrent(consent) ||
+        saved.job?.id !== taskId ||
+        !['pending', 'running'].includes(saved.job.status) ||
+        !Array.isArray(saved.events)
+      )
+        return null;
+      const watermark = saved.event_watermark;
+      const visibleSequence = Math.max(0, ...saved.events.map((event) => event.seq));
+      // Missing old-server metadata cannot prove that a capped page is history's tail.
+      if (
+        !watermark ||
+        !Number.isSafeInteger(watermark.seq) ||
+        watermark.seq < visibleSequence ||
+        !Number.isSafeInteger(visibleSequence) ||
+        (watermark.seq > 0 && !Number.isFinite(watermark.created_at))
+      )
+        return null;
+      const sequence = watermark.seq;
+      const timestamp = Math.max(
+        saved.job.created_at,
+        saved.job.updated_at,
+        watermark.created_at ?? 0,
+        ...saved.events.map((event) => event.created_at),
+      );
+      return Number.isSafeInteger(sequence) && Number.isFinite(timestamp)
+        ? { sequence, timestamp }
+        : null;
+    })
+    .catch(() => null);
+  return { taskId, consent, baseline };
+}
+function reportTaskDiagnostic(
+  error: DubTaskEventError,
+  signal: AbortSignal,
+  category: 'generation_failed' | 'operation_failed',
+  stage: 'transcription' | 'translation' | 'dub',
+) {
+  // Copy only local provenance; do not retain the exception across metadata IO.
+  const { proof, observed, eventKey } = error;
+  if (!proof || !diagnosticConsentStillCurrent(proof.consent)) return;
+  const prepared = prepareDiagnosticException(error, category, stage, observed);
+  if (
+    !prepared ||
+    !observed ||
+    observed.revision !== proof.consent.revision ||
+    observed.grantEpoch !== proof.consent.grantEpoch ||
+    !diagnosticConsentStillCurrent(observed)
+  )
+    return;
+  const verify = async () => {
+    if (proof.baseline) {
+      const baseline = await proof.baseline;
+      if (
+        !baseline ||
+        !diagnosticConsentStillCurrent(proof.consent) ||
+        !diagnosticConsentStillCurrent(observed)
+      )
+        return false;
+      const saved = await apiJson<PersistedTaskEvents>(
+        '/jobs/' +
+          encodeURIComponent(proof.taskId) +
+          '/events?after_seq=' +
+          baseline.sequence +
+          '&limit=2000',
+        { signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]) },
+      );
+      if (saved.job?.id !== proof.taskId || !Array.isArray(saved.events)) return false;
+      const matching = saved.events.filter((record) => {
+        const payload = parseSSELine(
+          'data:' +
+            record.payload
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trimStart())
+              .join('\n'),
+        );
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+        const name = record.payload
+          .split('\n')
+          .find((line) => line.startsWith('event:'))
+          ?.slice(6)
+          .trim();
+        const object = payload as TaskEvent;
+        return taskFailureKey({ ...object, type: name || object.type || 'message' }) === eventKey;
+      });
+      // Ambiguous repeated errors are not evidence that the observed one is new.
+      if (
+        matching.length !== 1 ||
+        !Number.isSafeInteger(matching[0].seq) ||
+        matching[0].seq <= baseline.sequence ||
+        !Number.isFinite(matching[0].created_at) ||
+        matching[0].created_at < baseline.timestamp
+      )
+        return false;
+    }
+    return (
+      !signal.aborted &&
+      diagnosticConsentStillCurrent(proof.consent) &&
+      diagnosticConsentStillCurrent(observed)
+    );
+  };
+  void verify()
+    .then((fresh) => {
+      if (fresh) capturePreparedDiagnostic(prepared);
+    })
+    .catch(() => {});
+}
+type ObserveDiagnosticRequest = () => DiagnosticConsentObservation | null;
 async function run(
   phase: DubSession['phase'],
-  work: (signal: AbortSignal) => Promise<void>,
+  work: (signal: AbortSignal, observeRequest: ObserveDiagnosticRequest) => Promise<void>,
 ): Promise<boolean> {
   if (controller || cancelling) return false;
   const active = new AbortController();
@@ -816,6 +1136,7 @@ async function run(
     phase,
     error: null,
     failure: null,
+    inputIssue: null,
     event: null,
     asrModelMissing: null,
   });
@@ -828,14 +1149,42 @@ async function run(
           ? 'generate'
           : null;
   if (reportPhase) recordActionBreadcrumb(`dub:${reportPhase}:start`);
+  let diagnosticConsent = observeDiagnosticConsent();
+  const observeRequest = () => (diagnosticConsent = observeDiagnosticConsent());
   try {
-    await work(active.signal);
+    await work(active.signal, observeRequest);
     if (reportPhase) recordActionBreadcrumb(`dub:${reportPhase}:complete`);
     return true;
   } catch (error) {
     if (reportPhase)
       recordActionBreadcrumb(`dub:${reportPhase}:${active.signal.aborted ? 'cancel' : 'error'}`);
-    if (!active.signal.aborted) {
+    const inputIssue =
+      !active.signal.aborted && (phase === 'preparing' || phase === 'transcribing')
+        ? dubInputIssue(error, dubSession.state.failure)
+        : null;
+    if (
+      !active.signal.aborted &&
+      !inputIssue &&
+      !(error instanceof DubLocalValidationError) &&
+      !(error instanceof DubAsrModelMissingError) &&
+      !(error instanceof Error && error.name === 'AbortError')
+    ) {
+      const category = phase === 'generating' ? 'generation_failed' : 'operation_failed';
+      const stage =
+        phase === 'transcribing'
+          ? 'transcription'
+          : phase === 'translating'
+            ? 'translation'
+            : 'dub';
+      if (error instanceof DubTaskEventError)
+        reportTaskDiagnostic(error, active.signal, category, stage);
+      else captureDiagnosticException(error, category, stage, diagnosticConsent);
+    }
+    if (inputIssue) {
+      // The same file fails the same way on every retry: show it on the file
+      // row as a choose-another-file prompt, not as a recoverable failure.
+      patch({ error: null, failure: null, inputIssue });
+    } else if (!active.signal.aborted) {
       const translationError = phase === 'translating' ? describeDubTranslationError(error) : null;
       if (error instanceof DubAsrModelMissingError)
         patch({ error: null, asrModelMissing: error.payload });
@@ -848,8 +1197,9 @@ async function run(
     const current = dubSession.state;
     // A lost stream does not mean the backend stopped. Keep the task recoverable
     // until its terminal event or confirmed cancellation, including before reload.
-    const recovery =
-      current.taskId && (current.phase === 'preparing' || current.phase === 'generating')
+    const recovery = inputIssue
+      ? null
+      : current.taskId && (current.phase === 'preparing' || current.phase === 'generating')
         ? current.phase
         : current.recovery;
     patch({ phase: current.segments.length ? 'editing' : 'idle', recovery });
@@ -858,7 +1208,11 @@ async function run(
     if (controller === active) controller = null;
   }
 }
-function taskEvent(event: TaskEvent, terminal: string) {
+function taskEvent(
+  event: TaskEvent,
+  terminal: string,
+  task?: { proof: TaskDiagnosticProof | null },
+) {
   patch({ event });
   if (event.type === 'error' || event.type === 'cancelled') {
     patch({ taskId: null, recovery: null });
@@ -867,15 +1221,27 @@ function taskEvent(event: TaskEvent, terminal: string) {
       throw new DubAsrModelMissingError(event as unknown as AsrModelMissing);
     const failure = publicFailureFromEvent(event, 'Task failed');
     patch({ failure });
-    throw new Error(`${failure.stage ? failure.stage + ': ' : ''}${failure.reason}`);
+    const message = `${failure.stage ? failure.stage + ': ' : ''}${failure.reason}`;
+    if (task)
+      throw new DubTaskEventError(
+        message,
+        task.proof,
+        taskFailureKey(event),
+        taskFailureCode(event),
+      );
+    throw new Error(message);
   }
   return event.type === terminal;
 }
-async function transcribeJob(jobId: string, signal: AbortSignal) {
+async function transcribeJob(
+  jobId: string,
+  signal: AbortSignal,
+  observeRequest: ObserveDiagnosticRequest,
+) {
   const finishActivity = beginAppActivity('transcription');
   recordActionBreadcrumb('dub:transcribe:start');
   try {
-    await readTranscript(jobId, signal);
+    await readTranscript(jobId, signal, observeRequest);
     patch({ recovery: null });
     recordActionBreadcrumb('dub:transcribe:complete');
   } catch (error) {
@@ -888,14 +1254,31 @@ async function transcribeJob(jobId: string, signal: AbortSignal) {
     finishActivity();
   }
 }
-async function readTranscript(jobId: string, signal: AbortSignal) {
+/** Show what transcription fell back to: diarization, and speakers without a source voice (#3419). */
+export function announceTranscriptWarning(event: TaskEvent) {
+  const speakers = Array.isArray(event.fallback_speakers)
+    ? event.fallback_speakers.filter((speaker): speaker is string => typeof speaker === 'string')
+    : [];
+  if (speakers.length) {
+    toast.warning(tr('dub.voice_fallback_default', { speakers: speakers.join(', ') }));
+    return;
+  }
+  if (typeof event.detail === 'string' && event.detail) toast.warning(event.detail);
+}
+async function readTranscript(
+  jobId: string,
+  signal: AbortSignal,
+  observeRequest: ObserveDiagnosticRequest,
+) {
   patch({ phase: 'transcribing', taskId: null });
   let receivedTranscript = false;
+  observeRequest();
   await consumeTaskStream(
     '/dub/transcribe-stream/' +
       encodeURIComponent(jobId) +
       (dubSession.state.numSpeakers ? '?num_speakers=' + dubSession.state.numSpeakers : ''),
     (event) => {
+      if (event.type === 'warning') announceTranscriptWarning(event);
       if (event.type === 'final') {
         receivedTranscript = true;
         const raw = Array.isArray(event.segments) ? (event.segments as DubSegment[]) : [];
@@ -922,7 +1305,12 @@ async function readTranscript(jobId: string, signal: AbortSignal) {
   patch({ phase: 'editing' });
 }
 
-async function useDownloadedCaptions(jobId: string, signal: AbortSignal) {
+async function useDownloadedCaptions(
+  jobId: string,
+  signal: AbortSignal,
+  observeRequest: ObserveDiagnosticRequest,
+) {
+  observeRequest();
   const result = await apiJson<{
     segments: DubSegment[];
     source_lang?: string;
@@ -947,8 +1335,15 @@ async function useDownloadedCaptions(jobId: string, signal: AbortSignal) {
   });
 }
 
-async function finishPreparation(jobId: string, taskId: string, signal: AbortSignal) {
+async function finishPreparation(
+  jobId: string,
+  taskId: string,
+  signal: AbortSignal,
+  proof: TaskDiagnosticProof | null,
+  observeRequest: ObserveDiagnosticRequest,
+) {
   let hasDownloadedCaptions = false;
+  observeRequest();
   await consumeTaskStream(
     '/tasks/stream/' + encodeURIComponent(taskId),
     (event) => {
@@ -956,13 +1351,16 @@ async function finishPreparation(jobId: string, taskId: string, signal: AbortSig
         patch({ duration: Number(event.duration) });
       if (Array.isArray(event.youtube_subs) && event.youtube_subs.length > 0)
         hasDownloadedCaptions = true;
-      return taskEvent(event, 'ready');
+      // Tell the user now, not at export, that the dub will be speech only.
+      if ((event.type === 'demucs_done' || event.type === 'cached') && event.has_bg === false)
+        toast.warning(tr('dub.bg_separation_failed'));
+      return taskEvent(event, 'ready', { proof });
     },
     signal,
   );
   if (hasDownloadedCaptions) {
     try {
-      await useDownloadedCaptions(jobId, signal);
+      await useDownloadedCaptions(jobId, signal, observeRequest);
       return;
     } catch (error) {
       if (signal.aborted) throw error;
@@ -970,7 +1368,7 @@ async function finishPreparation(jobId: string, taskId: string, signal: AbortSig
       // The ordinary ASR path remains the transparent fallback.
     }
   }
-  await transcribeJob(jobId, signal);
+  await transcribeJob(jobId, signal, observeRequest);
 }
 
 export async function uploadDub(file: File) {
@@ -1005,24 +1403,39 @@ export async function uploadDub(file: File) {
     jobId,
     filename: file.name,
     inputType,
+    inputIssue: file.size === 0 ? 'empty' : null,
   }));
-  await run('preparing', async (signal) => {
+  // An empty file has nothing to upload; the file row asks for another one.
+  if (file.size === 0) return;
+  await run('preparing', async (signal, observeRequest) => {
     const body = new FormData();
     body.set('video', file);
     body.set('job_id', jobId);
     body.set('input_type', inputType);
     if (dubSession.state.sourceLanguage) body.set('source_lang', dubSession.state.sourceLanguage);
+    const consent = observeRequest();
     const upload = await apiJson<{ job_id: string; task_id: string }>('/dub/upload', {
       method: 'POST',
       body,
       signal,
     });
-    await prepareAndTranscribe(upload, signal);
+    await prepareAndTranscribe(upload, signal, consent, observeRequest);
   });
 }
-async function prepareAndTranscribe(job: { job_id: string; task_id: string }, signal: AbortSignal) {
+async function prepareAndTranscribe(
+  job: { job_id: string; task_id: string },
+  signal: AbortSignal,
+  consent: DiagnosticConsentObservation | null,
+  observeRequest: ObserveDiagnosticRequest,
+) {
   patch({ jobId: job.job_id, taskId: job.task_id });
-  await finishPreparation(job.job_id, job.task_id, signal);
+  await finishPreparation(
+    job.job_id,
+    job.task_id,
+    signal,
+    taskDiagnosticProof(job.task_id, consent),
+    observeRequest,
+  );
 }
 export function isDubUrl(value: string) {
   try {
@@ -1061,16 +1474,17 @@ export async function ingestDubUrl(value: string, cookieFile?: File, fetchSubs =
     filename: url,
     inputType: 'video',
   }));
-  await run('preparing', async (signal) => {
+  await run('preparing', async (signal, observeRequest) => {
     if (
       cookieFile &&
       !(window.location.protocol === 'app:' && window.location.hostname === 'voicestudio') &&
       !_cookieTransportAllowed('/api')
     )
-      throw new Error('DUB_COOKIE_TRANSPORT');
+      throw new DubLocalValidationError('DUB_COOKIE_TRANSPORT');
     if (cookieFile && cookieFile.size > MAX_COOKIE_EXPORT_BYTES)
-      throw new Error('DUB_COOKIE_TOO_LARGE');
+      throw new DubLocalValidationError('DUB_COOKIE_TOO_LARGE');
     const cookieText = cookieFile ? await cookieFile.text() : undefined;
+    const consent = observeRequest();
     const job = await apiJson<{ job_id: string; task_id: string }>('/dub/ingest-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1083,7 +1497,7 @@ export async function ingestDubUrl(value: string, cookieFile?: File, fetchSubs =
         fetch_subs: fetchSubs,
       }),
     });
-    await prepareAndTranscribe(job, signal);
+    await prepareAndTranscribe(job, signal, consent, observeRequest);
   });
 }
 
@@ -1146,16 +1560,18 @@ export async function translateDubWithAgent(
   if (!snapshot.jobId || !snapshot.segments.length || snapshot.recovery) return false;
   const finishActivity = beginAppActivity('translation');
   try {
-    return await run('translating', async (signal) => {
+    return await run('translating', async (signal, observeRequest) => {
+      observeRequest();
       const glossary = await apiJson<Array<{ source: string; target: string; note?: string }>>(
         `/glossary/${encodeURIComponent(snapshot.jobId!)}`,
         { signal },
       );
+      observeRequest();
       const translated = await runLocalTranslationAgent(
         {
           agent,
           purpose: 'translate',
-          sourceLanguage: snapshot.sourceLang || snapshot.sourceLanguage || undefined,
+          sourceLanguage: dubSourceLanguage(snapshot.sourceLanguage, snapshot.sourceLang),
           targetLanguage: targetLabel,
           dialect: snapshot.dialect,
           translationInstructions: snapshot.translationInstructions,
@@ -1176,6 +1592,8 @@ export async function translateDubWithAgent(
         quality: 'agent',
         agentCli: agent,
         translationFallback: false,
+        dialectIgnored: false,
+        dialectUsed: undefined,
         segments: snapshot.segments.map((segment) => {
           const text = rows.get(segment.id);
           if (!text) return segment;
@@ -1227,7 +1645,7 @@ export async function translateDub(
   let activityId: string | undefined;
   let activityAborted = false;
   try {
-    const completed = await run('translating', async (signal) => {
+    const completed = await run('translating', async (signal, observeRequest) => {
       activityId = startTranslationRun({
         jobId: snapshot.jobId!,
         agent: provider,
@@ -1252,14 +1670,17 @@ export async function translateDub(
         { once: true },
       );
 
+      observeRequest();
       const glossary = await apiJson<Array<{ source: string; target: string; note?: string }>>(
         `/glossary/${encodeURIComponent(snapshot.jobId!)}`,
         { signal },
       );
+      observeRequest();
       const translated = await apiJson<{
         cinematic_skipped?: string;
         dialect?: string;
         dialect_applied?: boolean;
+        dialect_used?: string;
         translated: Array<{
           id: string;
           text: string;
@@ -1277,7 +1698,7 @@ export async function translateDub(
         signal,
         body: JSON.stringify({
           job_id: snapshot.jobId,
-          source_lang: snapshot.sourceLang || undefined,
+          source_lang: dubSourceLanguage(snapshot.sourceLanguage, snapshot.sourceLang),
           target_lang: target,
           provider,
           quality: snapshot.quality,
@@ -1320,12 +1741,28 @@ export async function translateDub(
         }),
       });
       const fallback = translated.cinematic_skipped === 'no-llm-configured';
+      // The verdict only describes text that landed: a reply with row errors
+      // or no rows leaves the previous verdict standing.
+      const landed = requestedSegments.some((segment) => {
+        const row = translated.translated.find((r) => String(r.id) === segment.id);
+        return Boolean(row && !row.error && row.text);
+      });
+      const dialectIgnored = landed
+        ? dialectWasIgnored(translated)
+        : Boolean(snapshot.dialectIgnored);
+      const dialectUsed = landed
+        ? dialectIgnored
+          ? translated.dialect_used
+          : undefined
+        : snapshot.dialectUsed;
       agentFallback = fallback && snapshot.quality === 'agent';
       const rows = new Map(translated.translated.map((row) => [String(row.id), row]));
       clearDubEditHistory();
       patch({
         quality: fallback && !agentFallback ? 'fast' : snapshot.quality,
         translationFallback: fallback,
+        dialectIgnored,
+        dialectUsed,
         segments: snapshot.segments.map((segment) => {
           const row = rows.get(segment.id);
           if (!row) return segment;
@@ -1373,7 +1810,12 @@ export async function translateDub(
     finishActivity();
   }
 }
-async function watchGeneration(taskId: string, signal: AbortSignal) {
+async function watchGeneration(
+  taskId: string,
+  signal: AbortSignal,
+  segmentIds = dubSession.state.segments.map((segment) => segment.id),
+  proof: TaskDiagnosticProof | null = null,
+) {
   let result: { syncScores: number[] } = { syncScores: [] };
   await consumeTaskStream(
     '/tasks/stream/' + encodeURIComponent(taskId),
@@ -1423,7 +1865,19 @@ async function watchGeneration(taskId: string, signal: AbortSignal) {
             : {}),
         });
       }
-      return taskEvent(event, 'done');
+      // Mix failures may carry only the submitted row index.
+      // Resolve it once so later transcript edits cannot point the notice elsewhere.
+      if (
+        event.type === 'error' &&
+        event.error_code === 'dub_speech_missing' &&
+        event.segment_id == null &&
+        typeof event.segment === 'number' &&
+        Number.isInteger(event.segment)
+      ) {
+        const id = segmentIds[event.segment];
+        if (id !== undefined) return taskEvent({ ...event, segment_id: id }, 'done', { proof });
+      }
+      return taskEvent(event, 'done', { proof });
     },
     signal,
   );
@@ -1439,7 +1893,7 @@ export async function generateDub(
   if (!snapshot.jobId || !snapshot.segments.length || snapshot.recovery) return false;
   const finishActivity = beginAppActivity('synthesis');
   try {
-    return await run('generating', async (signal) => {
+    return await run('generating', async (signal, observeRequest) => {
       let regenOnly = options.regenOnly;
       const agentEnabled = snapshot.quality === 'agent';
       const maxAgentPasses = 2;
@@ -1470,6 +1924,8 @@ export async function generateDub(
               }
             : undefined,
         });
+        const segmentIds = current.segments.map((segment) => segment.id);
+        const consent = observeRequest();
         const job = await apiJson<{ task_id: string }>(
           '/dub/generate/' + encodeURIComponent(current.jobId!),
           {
@@ -1485,7 +1941,7 @@ export async function generateDub(
                 // Keeps the imported caption markup for unchanged exports (#2295).
                 cue_source_id: cueSourceId(segment),
               })),
-              segment_ids: current.segments.map((segment) => segment.id),
+              segment_ids: segmentIds,
               regen_only: regenOnly?.length ? regenOnly : null,
               language,
               language_code: languageCode,
@@ -1507,7 +1963,13 @@ export async function generateDub(
           taskId: job.task_id,
           pendingTiming: current.timingStrategy || 'strict_slot',
         });
-        const measured = await watchGeneration(job.task_id, signal);
+        observeRequest();
+        const measured = await watchGeneration(
+          job.task_id,
+          signal,
+          segmentIds,
+          taskDiagnosticProof(job.task_id, consent),
+        );
         if (!agentEnabled || agentPass >= maxAgentPasses) break;
 
         const afterRender = dubSession.state;
@@ -1543,12 +2005,13 @@ export async function generateDub(
             remaining: misses.length,
           },
         });
+        observeRequest();
         const fitted = current.agentCli
           ? await runLocalTranslationAgent(
               {
                 agent: current.agentCli,
                 purpose: 'fit',
-                sourceLanguage: current.sourceLang || current.sourceLanguage || undefined,
+                sourceLanguage: dubSourceLanguage(current.sourceLanguage, current.sourceLang),
                 targetLanguage: language,
                 dialect: current.dialect,
                 translationInstructions: current.translationInstructions,
@@ -1617,6 +2080,7 @@ export async function generateDub(
 export async function planDubIncremental(
   languageCode: string,
   signal?: AbortSignal,
+  language: string = languageCode,
 ): Promise<{ stale: string[]; fresh: string[] } | null> {
   const snapshot = dubSession.state;
   const stored = snapshot.fingerprintsByLang?.[languageCode];
@@ -1632,6 +2096,7 @@ export async function planDubIncremental(
       })),
       stored_hashes: stored,
       lang: languageCode,
+      language,
       voice_match: snapshot.voiceMatch || 'per_line',
     }),
   });
@@ -1927,23 +2392,28 @@ export async function resumeDub() {
   const { recovery, taskId, jobId } = dubSession.state;
   if (!recovery || !jobId || (recovery !== 'transcribing' && !taskId)) return;
   if (recovery === 'transcribing') {
-    await run('transcribing', (signal) => transcribeJob(jobId, signal));
+    await run('transcribing', (signal, observeRequest) =>
+      transcribeJob(jobId, signal, observeRequest),
+    );
     return;
   }
   if (!taskId) return;
-  await run(recovery, async (signal) => {
+  await run(recovery, async (signal, observeRequest) => {
     // Read and replay the existing persisted task. Never POST a replacement generation.
     try {
+      observeRequest();
       await apiJson('/jobs/' + encodeURIComponent(taskId), { signal });
     } catch (error) {
       if (error instanceof ApiError && error.status === 404)
         patch({ recovery: null, taskId: null });
       throw error;
     }
+    const proof = resumedTaskDiagnosticProof(taskId, signal);
     if (recovery === 'generating') {
-      await watchGeneration(taskId, signal);
+      observeRequest();
+      await watchGeneration(taskId, signal, undefined, proof);
       patch({ phase: 'done' });
-    } else await finishPreparation(jobId, taskId, signal);
+    } else await finishPreparation(jobId, taskId, signal, proof, observeRequest);
     patch({ recovery: null });
   });
 }
@@ -1951,9 +2421,10 @@ export async function resumeDub() {
 export async function importDubSubtitles(file: File) {
   const snapshot = dubSession.state;
   if (!snapshot.jobId || snapshot.recovery || controller || cancelling) return;
-  await run('importing', async (signal) => {
+  await run('importing', async (signal, observeRequest) => {
     const body = new FormData();
     body.set('file', file);
+    observeRequest();
     const result = await apiJson<{
       segments: DubSegment[];
       stats: Record<string, number>;
@@ -1978,108 +2449,101 @@ export async function importDubSubtitles(file: File) {
   });
 }
 
-/** `run` falls back to editing on failure; an action that edits segments
- * in place must leave the session in the phase it started from. */
-function restoreActionPhase(jobId: string, phase: DubSession['phase']) {
-  const current = dubSession.state;
-  if (current.jobId === jobId && current.phase !== phase) patch({ phase });
+/** run() lands on 'editing' after a failure; in-place actions hand the session
+ * back to whatever phase it was in before they began. */
+function returnToPhase(job: string, origin: DubSession['phase']) {
+  const now = dubSession.state;
+  if (now.jobId === job && now.phase !== origin) patch({ phase: origin });
 }
 
 export async function cleanupDubSegments(): Promise<number | null> {
-  const snapshot = dubSession.state;
-  if (!snapshot.jobId || !snapshot.segments.length || !editingAllowed()) return null;
-  const returnPhase = snapshot.phase;
-  const cleaned: { segments?: DubSegment[]; removed?: number } = {};
-  const completed = await run('cleaning', async (signal) => {
-    const result = await apiJson<{
-      segments: DubSegment[];
-      before: number;
-      after: number;
-    }>('/dub/cleanup-segments/' + encodeURIComponent(snapshot.jobId!), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal,
-      body: JSON.stringify({ segments: snapshot.segments }),
-    });
-    patch({ phase: returnPhase });
-    if (signal.aborted || dubSession.state.jobId !== snapshot.jobId) return;
-    cleaned.segments = result.segments.map((segment, index) => ({
-      ...segment,
-      id: String(segment.id ?? index),
-      text_original:
-        typeof segment.text_original === 'string' ? segment.text_original : segment.text,
-    }));
-    cleaned.removed = Math.max(0, result.before - result.after);
+  const start = dubSession.state;
+  const job = start.jobId;
+  if (!job || start.segments.length === 0 || !editingAllowed()) return null;
+  const origin = start.phase;
+  let received: DubSegment[] | undefined;
+  const finished = await run('cleaning', async (signal, observeRequest) => {
+    observeRequest();
+    const reply = await apiJson<{ segments: DubSegment[] }>(
+      `/dub/cleanup-segments/${encodeURIComponent(job)}`,
+      { method: 'POST', body: JSON.stringify({ segments: start.segments }), signal },
+    );
+    patch({ phase: origin });
+    if (!signal.aborted && dubSession.state.jobId === job) {
+      received = reply.segments.map((row, i) => ({
+        ...row,
+        id: String(row.id ?? i),
+        text_original: row.text_original ?? row.text,
+      }));
+    }
   });
-  // Committed after `run` releases its controller: edits are refused while
-  // any action owns the session.
-  if (!completed) restoreActionPhase(snapshot.jobId, returnPhase);
-  if (!completed || !cleaned.segments || dubSession.state.jobId !== snapshot.jobId) return null;
-  commitSegmentEdit(cleaned.segments);
-  return cleaned.removed ?? 0;
-}
-
-interface ProsodyMirrorResponse {
-  source: 'vocals' | 'mix';
-  segments: Array<{ id: string; direction: string; measured: boolean }>;
+  if (!finished) {
+    returnToPhase(job, origin);
+    return null;
+  }
+  const next = received as DubSegment[] | undefined;
+  if (!next || dubSession.state.jobId !== job) return null;
+  if (!commitSegmentEdit(next)) return null;
+  return Math.max(0, start.segments.length - next.length);
 }
 
 export interface ProsodyMirrorOutcome {
   applied: number;
   measured: number;
-  source: ProsodyMirrorResponse['source'];
+  source: 'vocals' | 'mix';
 }
 
-/**
- * Fill empty segment directions from the source actor's delivery. Lines the
- * user already directed are never overwritten, and the change is one undo step.
- */
+type MirrorRow = { id: string; direction?: string; measured?: boolean };
+type MirrorReply = { source: 'vocals' | 'mix'; segments: MirrorRow[] };
+
 export async function mirrorDubSourceDelivery(): Promise<ProsodyMirrorOutcome | null> {
-  const snapshot = dubSession.state;
-  if (!snapshot.jobId || !snapshot.segments.length || !editingAllowed()) return null;
-  const returnPhase = snapshot.phase;
-  const response: { value?: ProsodyMirrorResponse } = {};
-  const completed = await run('mirroring', async (signal) => {
-    const result = await apiJson<ProsodyMirrorResponse>(
-      '/dub/prosody-mirror/' + encodeURIComponent(snapshot.jobId!),
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          segments: snapshot.segments.map(({ id, start, end, speaker_id }) => ({
-            id,
-            start,
-            end,
-            speaker_id,
-          })),
-        }),
-      },
-    );
-    patch({ phase: returnPhase });
-    // `cancelDub` can release its guard before this independent request
-    // settles; a cancelled run must not edit the segments afterwards.
-    if (signal.aborted) return;
-    response.value = result;
+  const start = dubSession.state;
+  const job = start.jobId;
+  if (!job || start.segments.length === 0 || !editingAllowed()) return null;
+  const origin = start.phase;
+  const payload = JSON.stringify({
+    segments: start.segments.map(({ id, start: from, end, speaker_id }) => ({
+      id,
+      start: from,
+      end,
+      speaker_id: speaker_id ?? '',
+    })),
   });
-  if (!completed) restoreActionPhase(snapshot.jobId, returnPhase);
-  const result = response.value;
-  if (!completed || !result || dubSession.state.jobId !== snapshot.jobId) return null;
-  const suggested = new Map(
-    result.segments.filter((row) => row.direction).map((row) => [row.id, row.direction]),
-  );
-  let applied = 0;
-  const next = dubSession.state.segments.map((segment) => {
-    const direction = suggested.get(segment.id);
-    if (!direction || segment.direction?.trim()) return segment;
-    applied += 1;
-    return patchSegment(segment, { direction });
+  let answer: MirrorReply | undefined;
+  const finished = await run('mirroring', async (signal, observeRequest) => {
+    observeRequest();
+    const reply = await apiJson<MirrorReply>(`/dub/prosody-mirror/${encodeURIComponent(job)}`, {
+      method: 'POST',
+      body: payload,
+      signal,
+    });
+    patch({ phase: origin });
+    if (!signal.aborted && dubSession.state.jobId === job) answer = reply;
   });
-  if (applied) commitSegmentEdit(next);
+  if (!finished) {
+    returnToPhase(job, origin);
+    return null;
+  }
+  const reply = answer as MirrorReply | undefined;
+  if (!reply || dubSession.state.jobId !== job) return null;
+
+  const words = new Map<string, string>();
+  reply.segments.forEach((row) => {
+    const text = (row.direction ?? '').trim();
+    if (row.measured && text) words.set(String(row.id), text);
+  });
+  const filled = dubSession.state.segments.map((segment) => {
+    const text = words.get(segment.id);
+    return text && !(segment.direction ?? '').trim()
+      ? patchSegment(segment, { direction: text })
+      : segment;
+  });
+  const changes = filled.filter((segment, i) => segment !== dubSession.state.segments[i]).length;
+  const applied = changes > 0 && commitSegmentEdit(filled) ? changes : 0;
   return {
     applied,
-    measured: result.segments.filter((row) => row.measured).length,
-    source: result.source,
+    measured: reply.segments.filter((row) => row.measured).length,
+    source: reply.source,
   };
 }
 

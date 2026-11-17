@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readlinkSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -58,18 +58,23 @@ function fixture(t, options = {}) {
     writeFileSync(join(bin, name), '#!/bin/sh\nset -eu\n' + body, { mode: 0o755 });
   shim(
     'uname',
-    `case "$1" in -s) echo ${options.mac ? 'Darwin' : 'Linux'};; -m) echo ${options.mac ? 'arm64' : 'x86_64'};; esac\n`,
+    `case "$1" in -s) echo ${options.mac ? 'Darwin' : 'Linux'};; -m) echo ${options.machine ?? (options.mac ? 'arm64' : 'x86_64')};; esac\n`,
   );
   shim(
     'hdiutil',
     `
 if [ "$1" = attach ]; then
+ [ "$TEST_ATTACH_FAIL" = 0 ] || exit 1
  while [ "$1" != -mountpoint ]; do shift; done
  shift; mkdir -p "$1/VoiceStudio.app/Contents"
  printf fixture > "$1/VoiceStudio.app/Contents/Info.plist"
+ ${options.cli ? 'mkdir -p "$1/VoiceStudio.app/Contents/Resources/cli"; printf fixture > "$1/VoiceStudio.app/Contents/Resources/cli/voicestudio"; touch "$1/VoiceStudio.app/Contents/Resources/app.asar"; chmod +x "$1/VoiceStudio.app/Contents/Resources/cli/voicestudio"' : ':'}
 fi
 `,
   );
+  shim('sysctl', `[ "$TEST_ROSETTA" = 1 ] && echo 1 || echo 0\n`);
+  shim('xattr', 'printf "%s\\n" "$*" >> "$TEST_ROOT/xattr"\n');
+  shim('codesign', `printf "%s\\n" "$*" >> "$TEST_ROOT/codesign"\ncase "$*" in *--verify*) [ "$TEST_SIG_INVALID" = 0 ];; esac\n`);
   shim('ditto', 'cp -R "$1" "$2"\n');
   shim(
     'curl',
@@ -84,8 +89,11 @@ case "$url" in
  */latest) printf 'https://github.com/debpalash/VoiceStudio/releases/tag/v1.2.3';;
  */SHA256SUMS.txt)
    version=$(printf '%s' "$url" | sed 's|.*/download/v||; s|/.*||')
-   printf '%s  VoiceStudio-Electron-%s-${options.mac ? 'mac-arm64.dmg' : 'linux-x64.AppImage'}\\n' "$TEST_DIGEST" "$version" > "$out";;
- */VoiceStudio-Electron-*.AppImage|*/VoiceStudio-Electron-*.dmg)
+   : > "$out"
+   for brand in VoiceStudio VoiceStudio-Electron; do
+    printf '%s  %s-%s-${options.mac ? 'mac-arm64.dmg' : 'linux-x64.AppImage'}\\n%s  %s-%s-mac-x64.dmg\\n' "$TEST_DIGEST" "$brand" "$version" "$TEST_DIGEST" "$brand" "$version" >> "$out"
+   done;;
+ */VoiceStudio-*.AppImage|*/VoiceStudio-*.dmg)
    [ "$TEST_MISSING" = 0 ] || exit 22
    printf '${payload}' > "$out";;
  *) exit 22;;
@@ -110,14 +118,15 @@ else echo fixture-commit; fi
     `
 printf 'bun %s\\n' "$*" >> "$TEST_ROOT/commands"
 [ "$TEST_BUILD_FAIL" = 0 ] || exit 1
-if [ "$1 $2" = 'run electron-builder' ]; then printf '${payload}' > release/VoiceStudio-Electron-1.2.4-linux-x64.AppImage; fi
+if [ "$1 $2" = 'run electron-builder' ]; then printf '${payload}' > release/VoiceStudio-1.2.4-linux-x64.AppImage; fi
 `,
   );
   shim('cargo', 'exit 0\n');
+  shim('uv', 'exit 0\n');
   shim('readelf', 'exit 0\n');
   shim('zsyncmake', 'exit 0\n');
   shim('pgrep', options.linuxRunning
-    ? `case "$*" in *voicestudio-electron*) exit 0;; *) exit 1;; esac\n`
+    ? `case "$*" in *voicestudio-*) exit 0;; *) exit 1;; esac\n`
     : options.running ? 'exit 0\n' : 'exit 1\n');
   shim('lsregister', 'printf "%s\\n" "$*" >> "$TEST_ROOT/registration"\n' + (options.registrationFails ? 'exit 1\n' : ''));
   const settings = join(home, 'settings');
@@ -126,6 +135,9 @@ if [ "$1 $2" = 'run electron-builder' ]; then printf '${payload}' > release/Voic
     home,
     root,
     settings,
+    // macOS and Windows disks ignore case: ~/.local/bin/voicestudio is then
+    // ~/.local/bin/VoiceStudio, the Linux install location.
+    caseInsensitive: existsSync(join(home, '.LOCAL/BIN')),
     run(args = []) {
       return spawnSync('sh', [installer, ...args], {
         encoding: 'utf8',
@@ -140,6 +152,9 @@ if [ "$1 $2" = 'run electron-builder' ]; then printf '${payload}' > release/Voic
           VOICESTUDIO_INSTALL_DIR: options.installDir ?? (options.mac
             ? join(home, 'Applications')
             : join(home, '.local/bin')),
+          TEST_ROSETTA: options.rosetta ? '1' : '0',
+          TEST_SIG_INVALID: options.sigInvalid ? '1' : '0',
+          TEST_ATTACH_FAIL: options.attachFails ? '1' : '0',
           TEST_MISSING: options.missing ? '1' : '0',
           TEST_BUILD_FAIL: options.buildFails ? '1' : '0',
         },
@@ -148,9 +163,84 @@ if [ "$1 $2" = 'run electron-builder' ]; then printf '${payload}' > release/Voic
   };
 }
 
-for (const [name, args, version] of [
-  ['latest', [], '1.2.3'],
-  ['older release', ['--version', 'v1.0.0'], '1.0.0'],
+for (const mac of [false, true]) {
+  test(`installs, upgrades and removes only its owned command (${mac ? 'macOS' : 'Linux'})`, (t) => {
+    const f = fixture(t, { mac, cli: true });
+    writeFileSync(join(f.home, '.bashrc'), '# my settings\n');
+    const command = join(f.home, '.local/bin/voicestudio');
+    assert.equal(f.run().status, 0);
+    const target = mac ? join(f.home, 'Applications/VoiceStudio.app/Contents/Resources/cli/voicestudio')
+      : join(f.home, '.local/bin/VoiceStudio');
+    // Where both names are one file, the AppImage itself answers to `voicestudio`.
+    const check = () => !mac && f.caseInsensitive
+      ? assert.equal(readFileSync(command, 'utf8'), payload)
+      : assert.equal(readlinkSync(command), target);
+    check();
+    assert.equal(f.run().status, 0);
+    check();
+    const profile = readFileSync(join(f.home, '.bashrc'), 'utf8');
+    assert(profile.startsWith('# my settings\n'));
+    assert.equal(profile.match(/# VoiceStudio terminal command/g).length, 1);
+    assert.equal(f.run(['--uninstall']).status, 0);
+    assert.equal(existsSync(command), false);
+  });
+}
+
+test('Bash login files that exist get the PATH entry; absent ones are not created', (t) => {
+  for (const login of ['.bash_profile', '.bash_login']) {
+    const f = fixture(t, { cli: true });
+    // A login file that does not source .bashrc: only its own PATH line helps.
+    writeFileSync(join(f.home, login), '# login settings\n');
+    assert.equal(f.run().status, 0);
+    const text = readFileSync(join(f.home, login), 'utf8');
+    assert(text.startsWith('# login settings\n'));
+    assert.equal(text.match(/# VoiceStudio terminal command/g).length, 1);
+    assert.equal(f.run().status, 0);
+    const again = readFileSync(join(f.home, login), 'utf8');
+    assert.equal(again.match(/# VoiceStudio terminal command/g).length, 1);
+    const other = login === '.bash_profile' ? '.bash_login' : '.bash_profile';
+    assert.equal(existsSync(join(f.home, other)), false);
+  }
+});
+
+test('command collisions preserve the existing app and launcher', (t) => {
+  const f = fixture(t);
+  // Two files differing only by case cannot coexist there; nothing to collide.
+  if (f.caseInsensitive) return t.skip('case-insensitive filesystem');
+  const command = join(f.home, '.local/bin/voicestudio');
+  const app = join(f.home, '.local/bin/VoiceStudio');
+  writeFileSync(app, 'old app');
+  writeFileSync(command, '#!/bin/sh\nexport CLI_TEST_SETTING=sample\nexec old-app\n');
+  const result = f.run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Existing command/);
+  assert.equal(readFileSync(app, 'utf8'), 'old app');
+  assert.match(readFileSync(command, 'utf8'), /CLI_TEST_SETTING=sample/);
+});
+
+test('desktop installation preserves a command already owned by the CLI package', (t) => {
+  const f = fixture(t);
+  const command = join(f.home, '.local/bin/voicestudio');
+  const cli = '#!/usr/bin/python3\nfrom voicestudio_cli.__main__ import main\nmain()\n';
+  writeFileSync(command, cli);
+  const result = f.run();
+  if (f.caseInsensitive) {
+    // The AppImage would overwrite the command: refuse instead, changing nothing.
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /VOICESTUDIO_INSTALL_DIR/);
+  } else {
+    assert.equal(result.status, 0, result.stderr);
+  }
+  assert.equal(readFileSync(command, 'utf8'), cli);
+});
+
+// Releases up to v0.5.7-beta.3 named their packages VoiceStudio-Electron-*.
+for (const [name, args, version, brand] of [
+  ['latest', [], '1.2.3', 'VoiceStudio'],
+  ['older release', ['--version', 'v1.0.0'], '1.0.0', 'VoiceStudio'],
+  ['next beta', ['--version', '0.5.7-beta.4'], '0.5.7-beta.4', 'VoiceStudio'],
+  ['legacy-named beta', ['--version', '0.5.7-beta.3'], '0.5.7-beta.3', 'VoiceStudio-Electron'],
+  ['legacy-named release', ['--version', '0.5.6'], '0.5.6', 'VoiceStudio-Electron'],
 ]) {
   test(`installs ${name} Electron package and preserves data`, (t) => {
     const f = fixture(t);
@@ -159,7 +249,7 @@ for (const [name, args, version] of [
     assert.equal(readFileSync(join(f.home, '.local/bin/VoiceStudio'), 'utf8'), payload);
     assert.equal(readFileSync(f.settings, 'utf8'), 'preserve me');
     const requests = readFileSync(join(f.root, 'requests'), 'utf8');
-    assert.match(requests, new RegExp(`download/v${version}/VoiceStudio-Electron-`));
+    assert.match(requests, new RegExp(`download/v${version}/${brand}-${version.replaceAll('.', '\\.')}-linux-x64\\.AppImage`));
     assert.doesNotMatch(requests, /latest\.json/);
     if (args.length) assert.doesNotMatch(requests, /releases\/latest/);
   });
@@ -211,6 +301,43 @@ test('macOS installs the verified Electron bundle and replaces only the app', (t
   assert.equal(existsSync(join(app, 'old-file')), false);
   assert.equal(readFileSync(f.settings, 'utf8'), 'preserve me');
   assert.match(readFileSync(join(f.root, 'registration'), 'utf8'), /-f .*VoiceStudio\.app/);
+});
+
+for (const [name, options, asset, intel] of [
+  ['Apple Silicon', { mac: true, machine: 'arm64' }, 'mac-arm64.dmg', false],
+  ['Intel', { mac: true, machine: 'x86_64' }, 'mac-x64.dmg', true],
+  ['Apple Silicon terminal under Rosetta', { mac: true, machine: 'x86_64', rosetta: true }, 'mac-arm64.dmg', false],
+]) {
+  test(`macOS ${name} downloads ${asset}`, (t) => {
+    const f = fixture(t, options);
+    const r = f.run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(readFileSync(join(f.root, 'requests'), 'utf8'), new RegExp(`/VoiceStudio-1\\.2\\.3-${asset.replace('.', '\\.')}`));
+    assert.equal(r.stdout.includes('Intel Mac'), intel);
+  });
+}
+
+test('macOS clears quarantine and repairs an invalid signature after install', (t) => {
+  const f = fixture(t, { mac: true, sigInvalid: true });
+  const r = f.run();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(readFileSync(join(f.root, 'xattr'), 'utf8'), /-dr com\.apple\.quarantine .*VoiceStudio\.app/);
+  assert.match(readFileSync(join(f.root, 'codesign'), 'utf8'), /--force --deep --sign - .*VoiceStudio\.app/);
+  assert.match(r.stdout, /Repaired the app signature/);
+});
+
+test('macOS leaves a valid signature untouched', (t) => {
+  const f = fixture(t, { mac: true });
+  assert.equal(f.run().status, 0);
+  assert.doesNotMatch(readFileSync(join(f.root, 'codesign'), 'utf8'), /--force/);
+});
+
+test('macOS reports an unreadable disk image clearly and installs nothing', (t) => {
+  const f = fixture(t, { mac: true, attachFails: true });
+  const r = f.run();
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /Could not open the disk image VoiceStudio-1\.2\.3-mac-arm64\.dmg/);
+  assert.equal(existsSync(join(f.home, 'Applications/VoiceStudio.app')), false);
 });
 
 test('refuses replacement and uninstall while VoiceStudio is running', (t) => {

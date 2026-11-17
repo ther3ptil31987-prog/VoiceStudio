@@ -2,8 +2,13 @@
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, it } from 'vitest';
-import { CrashJournal } from './crash-journal';
+import { describe, expect, it } from 'vitest';
+import {
+  applyWeightLoadFallback,
+  CrashJournal,
+  SEQUENTIAL_WEIGHT_LOAD_ENV,
+  threadedWeightLoadCrash,
+} from './crash-journal';
 it('retains three bounded records across restart and ignores other versions without rewriting', () => {
   const path = join(mkdtempSync(join(tmpdir(), 'voice-crash-')), 'crashes.json');
   const journal = new CrashJournal(path, '1');
@@ -122,4 +127,146 @@ it('records the loading frame below deep recursion and the other threads (#2382)
   expect(kept).toContain('[Previous line repeated 299 more times]');
   expect(kept).toContain('backend/services/model_manager.py", line 2901 in _load_model_sync');
   expect(kept).toContain('backend/services/asr_backend.py", line 812 in _transcribe_chunk');
+});
+
+describe('crash context', () => {
+  const contextLine = (fields: Record<string, unknown>) =>
+    `VOICESTUDIO_CRASH_CONTEXT=${JSON.stringify(fields)}`;
+  const journal = () => new CrashJournal(join(mkdtempSync(join(tmpdir(), 'crash-')), 'j.json'), '1');
+
+  it('attaches the last activity and memory to the crash record', () => {
+    const crashes = journal();
+    crashes.captureLine(contextLine({ kind: 'task', detail: 'generate' }));
+    crashes.captureLine(
+      contextLine({
+        kind: 'model_load',
+        detail: 'omnivoice-tts',
+        engine: 'omnivoice',
+        device: 'cpu',
+        ram_free_gb: 3.1,
+        ram_total_gb: 7.7,
+        swap_free_gb: 1,
+        swap_total_gb: 2,
+      }),
+    );
+    const record = crashes.record(3221225477, null, 1000, []);
+    expect(record?.context).toMatchObject({
+      kind: 'model_load',
+      detail: 'omnivoice-tts',
+      engine: 'omnivoice',
+      device: 'cpu',
+      ram_free_gb: 3.1,
+    });
+    expect(record?.context?.seconds_before_exit).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps context when the fault dump starts after it', () => {
+    const crashes = journal();
+    crashes.captureLine(contextLine({ kind: 'model_load' }));
+    crashes.captureLine('Windows fatal exception: access violation');
+    expect(crashes.record(3221225477, null, 1000, [])?.context?.kind).toBe('model_load');
+  });
+
+  it('does not carry context into the next process crash', () => {
+    const crashes = journal();
+    crashes.captureLine(contextLine({ kind: 'model_load' }));
+    crashes.record(1, null, 1000, []);
+    expect(crashes.record(1, null, 1000, [])?.context).toBeUndefined();
+  });
+
+  it('does not blame a new process for what the previous one was doing', () => {
+    const crashes = journal();
+    crashes.captureLine(contextLine({ kind: 'model_load' }));
+    crashes.startProcess();
+    expect(crashes.record(1, null, 1000, [])?.context).toBeUndefined();
+  });
+
+  it('measures the age of the activity at the exit, not at the later recording', () => {
+    const crashes = journal();
+    crashes.captureLine(contextLine({ kind: 'model_load' }));
+    const record = crashes.record(1, null, 1000, [], Date.now() + 60_000);
+    expect(record?.context?.seconds_before_exit).toBeGreaterThanOrEqual(59);
+    expect(record?.context?.seconds_before_exit).toBeLessThanOrEqual(61);
+  });
+
+  it('keeps only known fields of safe shape', () => {
+    const crashes = journal();
+    crashes.captureLine(
+      contextLine({ kind: 'task', detail: 'C:/Users/me/secret.wav', ram_free_gb: 'lots', x: 1 }),
+    );
+    expect(crashes.record(1, null, 1000, [])?.context).toEqual({
+      kind: 'task',
+      seconds_before_exit: expect.any(Number),
+    });
+  });
+
+  it('ignores a malformed line', () => {
+    const crashes = journal();
+    crashes.captureLine('VOICESTUDIO_CRASH_CONTEXT={nope');
+    expect(crashes.record(1, null, 1000, [])?.context).toBeUndefined();
+  });
+});
+
+describe('weight-loader fallback', () => {
+  // The faulting thread from #3767 and #3772, as the shell streams it.
+  const dump = [
+    'Windows fatal exception: access violation',
+    '',
+    'Current thread 0x00007780 (most recent call first):',
+    '  File "E:\\VoiceStudio\\project\\.venv\\Lib\\site-packages\\torch\\storage.py", line 470 in __getitem__',
+    '  File "E:\\VoiceStudio\\project\\.venv\\Lib\\site-packages\\transformers\\core_model_loading.py", line 1219 in _materialize_copy',
+    '  File "E:\\VoiceStudio\\project\\.venv\\Lib\\site-packages\\transformers\\core_model_loading.py", line 1243 in _job',
+    '  File "E:\\VoiceStudio\\.python\\cpython-3.11-windows-x86_64-none\\Lib\\concurrent\\futures\\thread.py", line 58 in run',
+    '',
+    'Thread 0x000017cc (most recent call first):',
+    '  File "E:\\VoiceStudio\\project\\omnivoice\\models\\omnivoice.py", line 570 in from_pretrained',
+  ];
+  const crashed = (
+    lines: string[],
+    exitCode: number | null = 3221225477,
+    signal: string | null = null,
+  ) => {
+    const path = join(mkdtempSync(join(tmpdir(), 'voice-crash-')), 'crashes.json');
+    const crashes = new CrashJournal(path, '1');
+    for (const line of lines) crashes.captureLine(line);
+    crashes.record(exitCode, signal, 1000, lines);
+    return { crashes, path };
+  };
+
+  it('loads weights one at a time after a native crash in the threaded loader', () => {
+    const { crashes } = crashed(dump);
+    expect(threadedWeightLoadCrash(crashes.all())).toBeDefined();
+    const env: NodeJS.ProcessEnv = {};
+    const reason = applyWeightLoadFallback(env, crashes.all());
+    expect(env[SEQUENTIAL_WEIGHT_LOAD_ENV]).toBe('1');
+    expect(reason).toContain('0xC0000005 STATUS_ACCESS_VIOLATION');
+    expect(reason).toContain('HF_DEACTIVATE_ASYNC_LOAD=1');
+    // POSIX dumps carry the same thread under a signal.
+    expect(threadedWeightLoadCrash(crashed(dump, null, 'SIGSEGV').crashes.all())).toBeDefined();
+  });
+
+  it('holds across an app restart for the same version only', () => {
+    const { path } = crashed(dump);
+    expect(threadedWeightLoadCrash(new CrashJournal(path, '1').all())).toBeDefined();
+    expect(threadedWeightLoadCrash(new CrashJournal(path, '2').all())).toBeUndefined();
+  });
+
+  it('leaves everything else alone', () => {
+    // The loader merely running in another thread is not the faulting frame.
+    const elsewhere = [
+      'Windows fatal exception: access violation',
+      'Current thread 0x1 (most recent call first):',
+      '  File "C:\\x\\torch\\nn\\modules\\linear.py", line 125 in forward',
+      'Thread 0x2 (most recent call first):',
+      '  File "C:\\x\\transformers\\core_model_loading.py", line 1219 in _materialize_copy',
+    ];
+    expect(threadedWeightLoadCrash(crashed(elsewhere).crashes.all())).toBeUndefined();
+    // An ordinary exit is not a native crash.
+    expect(threadedWeightLoadCrash(crashed(dump, 1).crashes.all())).toBeUndefined();
+    // The user's own setting wins.
+    const env: NodeJS.ProcessEnv = { [SEQUENTIAL_WEIGHT_LOAD_ENV]: '0' };
+    expect(applyWeightLoadFallback(env, crashed(dump).crashes.all())).toBeUndefined();
+    expect(env[SEQUENTIAL_WEIGHT_LOAD_ENV]).toBe('0');
+    expect(applyWeightLoadFallback({}, [])).toBeUndefined();
+  });
 });

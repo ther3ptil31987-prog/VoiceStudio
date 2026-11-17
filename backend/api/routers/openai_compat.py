@@ -35,12 +35,16 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, wait
+from threading import Lock
 from typing import Annotated, Any, Literal, Optional, Union
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from api.dependencies import require_consumer
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
@@ -147,7 +151,7 @@ class OpenAIErrorRoute(APIRoute):
         return route
 
 
-router = APIRouter(prefix="/v1", tags=["OpenAI-Compatible Audio API"], route_class=OpenAIErrorRoute)
+router = APIRouter(prefix="/v1", tags=["OpenAI-Compatible Audio API"], route_class=OpenAIErrorRoute, dependencies=[Depends(require_consumer)])
 
 
 # ── OpenAI model / voice aliases ────────────────────────────────────────────
@@ -289,7 +293,8 @@ class SpeechRequest(BaseModel):
     stream_format: Optional[Literal["audio", "sse"]] = Field(
         default=None,
         description="'audio' streams raw audio bytes (the default); 'sse' streams "
-        "`speech.audio.delta` / `speech.audio.done` server-sent events.",
+        "`speech.audio.delta` / `speech.audio.done` server-sent events. "
+        "PCM without an explicit duration is synthesized sentence by sentence.",
     )
     # VoiceStudio extensions (not part of OpenAI spec, but accepted if sent)
     language: Optional[str] = Field(default=None, description="Language code (ISO 639-1)")
@@ -302,29 +307,29 @@ class SpeechRequest(BaseModel):
     duration: Optional[float] = Field(
         default=None,
         gt=0,
-        description="VoiceStudio extension: target output duration in seconds.",
+        description="Aim for this many seconds of audio (seconds, must be positive). Outside the OpenAI spec; used by VoiceStudio engines that can honour it.",
     )
     seed: Optional[int] = Field(
         default=None,
-        description="VoiceStudio extension: deterministic sampling seed.",
+        description="Fixes the random seed so the same request can be reproduced. Outside the OpenAI spec; VoiceStudio only.",
     )
     denoise: bool = Field(
         default=True,
-        description="VoiceStudio extension: prepend denoise control when supported.",
+        description="Set false to skip the denoise step on engines that offer one. Outside the OpenAI spec; VoiceStudio only.",
     )
     preprocess_prompt: bool = Field(
         default=True,
-        description="VoiceStudio extension: trim/preprocess reference prompt when supported.",
+        description="Set false to use the reference clip untouched instead of preprocessing it, where the engine supports that. Outside the OpenAI spec; VoiceStudio only.",
     )
     chunk_duration: Optional[float] = Field(
         default=None,
         ge=0,
-        description="OmniVoice GGUF extension: long-form internal chunk duration.",
+        description="Seconds of speech per internal chunk for long texts; read by the OmniVoice GGUF engine only. Outside the OpenAI spec.",
     )
     chunk_threshold: Optional[float] = Field(
         default=None,
         ge=0,
-        description="OmniVoice GGUF extension: long-form internal chunk threshold.",
+        description="Length above which the OmniVoice GGUF engine starts splitting long texts into chunks. Outside the OpenAI spec.",
     )
     # #1014: these two were silently DISCARDED before (pydantic ignores
     # undeclared fields) — a 200 OK that quietly dropped the caller's quality
@@ -583,16 +588,19 @@ def _typed_speech_http_error(e: Exception) -> Optional[HTTPException]:
 
 def _run_tts(backend, text: str, kw: dict):
     """Run TTS inference in the GPU thread pool."""
-    from services.audio_dsp import apply_mastering, normalize_audio
+    import torch
+    from services.audio_dsp import apply_mastering, normalize_audio, trim_speech_padding
     from services.watermark import mark_synthetic
     wav = backend.generate(text, **kw)
     sr = backend.sample_rate
-    # Engines that already emit mastered, studio-grade audio (e.g. VoxCPM2's
-    # native 48 kHz) opt out of apply_mastering via `applies_own_mastering`.
-    # That chain's highpass + Compressor is tuned for VoiceStudio's 24 kHz clone
-    # output; applied to a studio engine it adds an audible level pump that
-    # degrades the very output we want clean. Loudness normalisation still
-    # runs — it's a benign peak scale, not dynamics.
+    # Strip the engine's lead-in/tail silence, as /generate does — unless the
+    # caller asked for an exact `duration`, which a trim would shorten.
+    if not kw.get("duration") and torch.is_tensor(wav):
+        wav = trim_speech_padding(wav, sr)
+    # Finished studio engines, such as VoxCPM2's native 48 kHz output, declare
+    # that they master themselves.  The shared high-pass/compressor was tuned
+    # for 24 kHz cloned audio and can make studio output pump audibly.  Peak-only
+    # loudness normalisation below remains safe and applies to every engine.
     if not getattr(backend, "applies_own_mastering", False):
         wav = apply_mastering(wav, sample_rate=sr)
     wav = normalize_audio(wav, target_dBFS=-2.0)
@@ -626,16 +634,209 @@ def _engine_instructions(backend, instructions: Optional[str]) -> Optional[str]:
 _STREAM_CHUNK = 32 * 1024
 
 
+def _speech_event(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def _speech_delta(audio: bytes) -> str:
+    return _speech_event({"type": "speech.audio.delta", "audio": base64.b64encode(audio).decode("ascii")})
+
+
+def _speech_done() -> str:
+    return _speech_event({
+        "type": "speech.audio.done",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    })
+
+
 def _sse_events(audio: bytes):
-    """OpenAI's speech SSE stream: base64 `speech.audio.delta` events, then a
-    `speech.audio.done`. VoiceStudio synthesises the whole clip first, so the
-    events carry the finished audio in chunks (no token usage to report)."""
-    for i in range(0, len(audio), _STREAM_CHUNK):
-        delta = base64.b64encode(audio[i:i + _STREAM_CHUNK]).decode("ascii")
-        yield f"data: {json.dumps({'type': 'speech.audio.delta', 'audio': delta})}\n\n"
-    done = {"type": "speech.audio.done",
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
-    yield f"data: {json.dumps(done)}\n\n"
+    for chunk in _audio_chunks(audio):
+        yield _speech_delta(chunk)
+    yield _speech_done()
+
+
+async def _stream_speech_pcm(first: bytes, sentences: list[str], render, *, sse: bool):
+    """Render on demand so a disconnected client does not queue more speech."""
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
+    for chunk in _audio_chunks(first):
+        yield _speech_delta(chunk) if sse else chunk
+    for sentence in sentences:
+        try:
+            audio = await diagnostic_reports.await_owned(render(sentence), diagnostic_epoch)
+        except Exception as exc:
+            if diagnostic_epoch is not None:
+                diagnostic_reports.capture_failure("generation", error=exc, expected_epoch=diagnostic_epoch)
+            if not sse:
+                raise
+            logger.warning("Progressive OpenAI TTS failed after the first segment")
+            yield _speech_event({
+                "type": "error",
+                "error": {"code": "speech_generation_failed", "message": "Speech generation failed."},
+            })
+            return
+        for chunk in _audio_chunks(audio):
+            yield _speech_delta(chunk) if sse else chunk
+    if sse:
+        yield _speech_done()
+
+
+_native_pcm_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native-tts")
+_native_pcm_lock = Lock()
+_NATIVE_PCM_CLEANUP_TIMEOUT_S = 5.0
+
+
+def _native_pcm_busy() -> HTTPException:
+    return HTTPException(
+        status_code=429, detail="Native speech streaming is busy.",
+        headers={"Retry-After": "1", "X-OmniVoice-Retryable": "true"},
+    )
+
+
+async def _native_pcm_stream(backend, text, kw, *, sse, timed=False):
+    from services.model_manager import generate_timeout_s
+    from contextvars import copy_context
+    from time import perf_counter
+    from services.inference_cancellation import current_cancellation
+    from services.tts_backend import EngineBusyError, MLXAudioBackend, engine_in_use
+    from services.watermark import mark_synthetic
+
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
+    closed = False
+
+    def encode_next():
+        if closed:
+            return None
+        started = perf_counter()
+        wav = next(iterator, None)
+        if wav is None:
+            return None
+        rate = backend.sample_rate
+        context = "tts_stream.native" if timed else "openai_compat.speech"
+        pcm = _pcm24k(mark_synthetic(wav, rate, context=context), rate)
+        return (pcm, perf_counter() - started) if timed else pcm
+
+    def encode_mlx_next():
+        # Reserve a shared GPU slot only while the thread-affine step runs.
+        step = _native_pcm_worker.submit(copy_context().run, encode_next)
+        cancellation = current_cancellation()
+        while not wait((step,), timeout=0.05).done:
+            if cancellation is not None and cancellation.cancelled.is_set():
+                # The dedicated worker still owns the iterator. Its queued
+                # cleanup releases the lease when the native step returns.
+                step.cancel()
+                return None
+        return step.result()
+
+    mlx = isinstance(backend, MLXAudioBackend)
+
+    # Reject contention before committing response headers. Never enqueue an
+    # unbounded number of streams behind a backpressured or stalled reader.
+    if not _native_pcm_lock.acquire(blocking=False):
+        raise _native_pcm_busy()
+    iterator = None
+    lease = None
+    entered = False
+
+    def close_on_worker():
+        nonlocal closed
+        closed = True
+        try:
+            if iterator is not None:
+                iterator.close()
+        except Exception:
+            logger.exception("Native speech stream cleanup failed")
+        finally:
+            try:
+                if entered:
+                    lease.__exit__(None, None, None)
+            finally:
+                _native_pcm_lock.release()
+
+    emitted = False
+    cleanup = None
+    try:
+        # Entering the lease can fail; the lock is already held, so the
+        # ``finally`` below must see it and release it.
+        lease = engine_in_use(backend, native=True)
+        try:
+            lease.__enter__()
+        except EngineBusyError:
+            # Another job holds this engine; never interleave with it.
+            raise _native_pcm_busy() from None
+        entered = True
+        iterator = backend.stream_audio(text, **kw)
+        while True:
+            chunk = await diagnostic_reports.await_owned(run_on_gpu_pool_guarded(
+                encode_mlx_next if mlx else encode_next,
+                what="Native TTS generate" if timed else "Native OpenAI TTS generate",
+                executor=None if mlx else _native_pcm_worker,
+                timeout=generate_timeout_s(text, engine=backend),
+            ), diagnostic_epoch)
+            if chunk is None:
+                break
+            emitted = True
+            yield _speech_delta(chunk) if sse else chunk
+        if not emitted:
+            raise RuntimeError("Native speech generation produced no audio.")
+    except Exception as exc:
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("generation", error=exc, engine_id=backend.id, expected_epoch=diagnostic_epoch)
+        if not emitted or not sse:
+            raise
+        logger.exception("Native OpenAI TTS failed after the first chunk")
+        yield _speech_event({
+            "type": "error",
+            "error": {"code": "speech_generation_failed", "message": "Speech generation failed."},
+        })
+        return
+    finally:
+        # The iterator must close on the same thread, after any abandoned
+        # generation step finishes. Do not make the client await that step.
+        cleanup = _native_pcm_worker.submit(close_on_worker)
+    # Reached only on normal exhaustion (errors, cancellation and early close
+    # leave through the ``finally`` above without waiting). Release the lock and
+    # lease before the caller reports completion so a back-to-back request
+    # is not rejected as busy. Shield it: a timeout must not cancel the cleanup.
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(asyncio.wrap_future(cleanup)), timeout=_NATIVE_PCM_CLEANUP_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        if timed:
+            raise RuntimeError("Native speech cleanup is still pending. Retry once the engine is free.") from exc
+        logger.warning("Native speech stream cleanup is still pending; continuing")
+    if sse:
+        yield _speech_done()
+
+
+class _PrimedSpeechResponse(StreamingResponse):
+    def __init__(self, first, stream, *, send_timeout, **kwargs):
+        self._stream = stream
+        self._send_timeout = send_timeout
+
+        async def body():
+            yield first
+            async for chunk in stream:
+                yield chunk
+
+        super().__init__(body(), **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        from anyio import CancelScope, fail_after
+
+        async def send_bounded(message):
+            # A client that stops reading must eventually release the native
+            # worker even if the transport has not reported a disconnect.
+            with fail_after(self._send_timeout):
+                await send(message)
+
+        try:
+            await super().__call__(scope, receive, send_bounded)
+        finally:
+            with CancelScope(shield=True):
+                await self._stream.aclose()
 
 
 def _audio_chunks(audio: bytes):
@@ -669,20 +870,58 @@ async def create_speech(req: SpeechRequest):
         raise OpenAIError(400, _routing["routing_reason"], param="model", code="model_not_available")
     _routing_notice = routing_notice(_routing)  # (status, reason) or None
 
+    # Engines whose runtime has no quality-knob flags reject explicit
+    # values here, where "the caller asked" is still known — deeper layers
+    # can't tell an explicit request from an internal default fill (dubbing
+    # previews always pass num_step=8), and anything later would first evict
+    # the resident engine and warm this one for a request that is already
+    # doomed (#3654 review). Per-knob flags: supertonic3 honors num_step but
+    # not guidance_scale, audio.cpp honors guidance_scale but not num_step.
+    # Raised as the same OpenAIError the generate-step mapper builds for
+    # TTSInputError (400, param="input") — this site runs before that try
+    # block, and an unmapped TTSInputError would fall through to the generic
+    # 500.
+    asked = [
+        (key, supported)
+        for key, supported in (
+            ("num_step", getattr(backend, "supports_num_step", True)),
+            ("guidance_scale", getattr(backend, "supports_guidance_scale", True)),
+        )
+        if getattr(req, key) is not None and not supported
+    ]
+    if asked:
+        names = ", ".join(key for key, _ in asked)
+        raise OpenAIError(
+            400,
+            f"Engine '{backend.id}' does not support {names}: the bundled "
+            f"runtime has no such options, so returning audio would silently "
+            f"ignore them. Omit {names} or use the in-process omnivoice engine.",
+            param="input",
+        )
+    num_step_range = getattr(backend, "num_step_range", None)
+    if (
+        req.num_step is not None
+        and num_step_range is not None
+        and not (num_step_range[0] <= req.num_step <= num_step_range[1])
+    ):
+        raise OpenAIError(
+            400,
+            f"Engine '{backend.id}' supports num_step {num_step_range[0]}–{num_step_range[1]}; "
+            f"got {req.num_step}, which it would silently clamp. Omit num_step "
+            f"or pick a value in range.",
+            param="num_step",
+        )
+
     # Build kwargs for the backend's generate() method
     kw: dict = {
         "speed": req.speed,
         "denoise": req.denoise,
         "preprocess_prompt": req.preprocess_prompt,
     }
-    if req.duration is not None:
-        kw["duration"] = req.duration
-    if req.seed is not None:
-        kw["seed"] = req.seed
-    if req.chunk_duration is not None:
-        kw["chunk_duration"] = req.chunk_duration
-    if req.chunk_threshold is not None:
-        kw["chunk_threshold"] = req.chunk_threshold
+    for opt in ("duration", "seed", "chunk_duration", "chunk_threshold"):
+        given = getattr(req, opt)
+        if given is not None:
+            kw[opt] = given
     if req.num_step is not None:
         kw["num_step"] = req.num_step
     if req.guidance_scale is not None:
@@ -702,9 +941,11 @@ async def create_speech(req: SpeechRequest):
     # (#2617), resolves the reference clip; anything else is forwarded as an
     # engine preset (e.g. KittenTTS).
     voice = req.voice
+    pronunciation_profile_id = None
     if not _name_is_reserved(voice):
         row = _resolve_voice_profile(voice)
         if row:
+            pronunciation_profile_id = row["id"]
             from core.config import VOICES_DIR
             if row["is_locked"] and row["locked_audio_path"]:
                 kw["ref_audio"] = contained_join(VOICES_DIR, row["locked_audio_path"])
@@ -712,21 +953,36 @@ async def create_speech(req: SpeechRequest):
                 kw["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
             if row["ref_text"]:
                 kw["ref_text"] = row["ref_text"]
-            if row["instruct"] and not instruct:
-                kw["instruct"] = row["instruct"]
+            if not instruct:
+                from services.voice_design_profiles import profile_instruct
+                stored_instruct = profile_instruct(row, backend.id)
+                if stored_instruct:
+                    kw["instruct"] = stored_instruct
+            # A profile's remembered seed keeps repeat requests for it reproducible.
             if req.seed is None and row["seed"] is not None:
                 kw["seed"] = row["seed"]
         else:
             # Not a profile — forward as an engine preset name.
             kw["voice"] = voice
 
-    # Engine-agnostic text normalization (junk strip, numbers→words,
-    # abbreviations) at this route's text→engine choke point — the same
-    # pre-pass as /generate, applied exactly once per request. `req.language`
-    # is everything this route knows about the language (None → universal
-    # safety filters only). Pref-gated (default ON), idempotent, never raises.
-    from services.text_normalization import normalize_for_tts
-    text = normalize_for_tts(req.input, req.language)
+    # Normalize, then resolve saved/inline pronunciation before either native
+    # streaming or sentence dispatch. Use the resolved profile ID, even when
+    # the caller selected that profile by name.
+    from services.pronunciation import prepare_speech_text
+    text = await asyncio.to_thread(
+        prepare_speech_text, req.input, req.language, profile_id=pronunciation_profile_id,
+    )
+
+    can_stream = getattr(backend, "can_stream", None)
+    native = (
+        req.stream_format and req.response_format == "pcm" and req.duration is None
+        and can_stream is not None and can_stream(**kw)
+    )
+
+    # Refuse an already busy stream before touching the shared GPU pool.
+    # The generator still atomically claims the slot before starting.
+    if native and _native_pcm_lock.locked():
+        raise _native_pcm_busy()
 
     # VRAM eviction runs in get_model()'s warm-return path now, covering every
     # native TTS generate (this route, WS TTS, dub, batch, audiobook).
@@ -748,12 +1004,14 @@ async def create_speech(req: SpeechRequest):
     # loading gets OMNIVOICE_MODEL_LOAD_TIMEOUT (default 1200s); once warm
     # this is a per-request no-op.
     from services.model_manager import _model_load_timeout
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     try:
-        await run_on_gpu_pool_guarded(
+        await diagnostic_reports.await_owned(run_on_gpu_pool_guarded(
             backend.ensure_ready,
             what=f"TTS engine '{backend.id}' model load",
             timeout=_model_load_timeout(),
-        )
+        ), diagnostic_epoch)
     # Catch the BUILTIN TimeoutError base, not GpuJobTimeoutError by name:
     # several tests reload services.model_manager mid-suite, so a class
     # imported at call time can differ in identity from the one the guard
@@ -776,6 +1034,8 @@ async def create_speech(req: SpeechRequest):
     except Exception as e:
         if type(e).__name__ == "ModelLoadInterruptedByShutdown":
             raise
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("model_load", error=e, engine_id=backend.id, expected_epoch=diagnostic_epoch)
         # A sidecar engine's load can also hit the #1172 class (broken venv
         # interpreter / placeholder binary) — surface the typed 503 here too.
         http = _typed_speech_http_error(e)
@@ -813,37 +1073,92 @@ async def create_speech(req: SpeechRequest):
                      "X-OmniVoice-Retryable": "true"},
         ) from e
 
+    # PCM segments can be joined without a container header or an encoder
+    # reset. Preserve whole-utterance timing for an explicit duration.
+    sentences = [text]
+    if not native and req.stream_format and req.response_format == "pcm" and req.duration is None:
+        from api.routers.tts_stream import split_normalized_sentences
+
+        sentences = split_normalized_sentences(text, req.language)
+
+    from services.model_manager import generate_timeout_s
+    from services.tts_backend import EngineBusyError, engine_in_use
+
+    async def render(segment: str) -> tuple[bytes, str, str]:
+        def generate():
+            with engine_in_use(backend, yield_to_native=True):
+                return _run_tts(backend, segment, kw)
+
+        try:
+            wav, sr = await run_on_gpu_pool_guarded(
+                generate, what="OpenAI TTS generate",
+                timeout=generate_timeout_s(segment, engine=backend))
+        except EngineBusyError:
+            # A native stream owns this engine until it closes.
+            raise _native_pcm_busy() from None
+        return await _encode_audio(wav, sr, req.response_format, ffmpeg)
+
+    # Finish the first segment before sending headers so validation and
+    # first-render errors retain their normal HTTP status.
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     try:
-        # Bounded + pool-reset on hang so a wedged TTS request can't starve the
-        # GPU pool and brick the backend (#730 class). The budget is the shared
-        # length-scaled one (#1190) — this route used to hardcode the flat 300s,
-        # so long inputs failed here even after v0.3.22 shipped the scaling.
-        from services.model_manager import generate_timeout_s
-        wav, sr = await run_on_gpu_pool_guarded(
-            lambda: _run_tts(backend, text, kw), what="OpenAI TTS generate",
-            timeout=generate_timeout_s(text, engine=backend))
+        if native:
+            sse = req.stream_format == "sse"
+            stream = _native_pcm_stream(backend, text, kw, sse=sse)
+            first = await diagnostic_reports.await_owned(anext(stream), diagnostic_epoch)
+            mime_type, ext = ("text/event-stream" if sse else "audio/pcm"), "pcm"
+        else:
+            audio_bytes, mime_type, ext = await diagnostic_reports.await_owned(render(sentences[0]), diagnostic_epoch)
+    except HTTPException:
+        raise
     except Exception as e:
-        # #1172/#1173: typed failures get their real status + actionable
-        # message (400 bad input / 503 broken engine binary) instead of a
-        # generic 500 wrapping an errno or an ONNX abort.
         http = _typed_speech_http_error(e)
         if http is not None:
             logger.warning("OpenAI TTS failed (typed): %s", e)
             raise http from e
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("generation", error=e, engine_id=backend.id, expected_epoch=diagnostic_epoch)
         logger.exception("OpenAI TTS failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    audio_bytes, mime_type, ext = await _encode_audio(wav, sr, req.response_format, ffmpeg)
+    # The primed stream owns the engine lock until the response takes it over;
+    # any failure while building the response must close it here.
+    try:
+        _headers = {
+            "Content-Disposition": content_disposition(f"speech.{ext}", disposition="inline"),
+        }
+        if _routing_notice:
+            from services.engine_routing import header_safe_reason
+            _headers["X-OmniVoice-Routing"] = _routing_notice[0]
+            _hr = header_safe_reason(_routing_notice[1])
+            if _hr:
+                _headers["X-OmniVoice-Routing-Reason"] = _hr
+        if native:
+            if sse:
+                _headers.pop("Content-Disposition")
+                _headers["Cache-Control"] = "no-cache"
+            return _PrimedSpeechResponse(
+                first, stream, media_type=mime_type, headers=_headers,
+                send_timeout=generate_timeout_s(text, engine=backend),
+            )
+    except BaseException:
+        if native:
+            await stream.aclose()
+        raise
+    if len(sentences) > 1:
+        async def render_pcm(segment: str) -> bytes:
+            audio, _, _ = await render(segment)
+            return audio
 
-    _headers = {
-        "Content-Disposition": content_disposition(f"speech.{ext}", disposition="inline"),
-    }
-    if _routing_notice:
-        from services.engine_routing import header_safe_reason
-        _headers["X-OmniVoice-Routing"] = _routing_notice[0]
-        _hr = header_safe_reason(_routing_notice[1])
-        if _hr:
-            _headers["X-OmniVoice-Routing-Reason"] = _hr
+        sse = req.stream_format == "sse"
+        if sse:
+            _headers.pop("Content-Disposition")
+            _headers["Cache-Control"] = "no-cache"
+        return StreamingResponse(
+            _stream_speech_pcm(audio_bytes, sentences[1:], render_pcm, sse=sse),
+            media_type="text/event-stream" if sse else mime_type,
+            headers=_headers,
+        )
     if req.stream_format == "sse":
         _headers.pop("Content-Disposition")
         return StreamingResponse(_sse_events(audio_bytes), media_type="text/event-stream",
@@ -888,8 +1203,7 @@ def _is_asr_engine_id(model: Optional[str]) -> bool:
 
 
 def _backend_request_kwargs(backend, options: dict) -> dict:
-    """The subset of OpenAI-derived decode options this backend's
-    ``transcribe()`` declares (shared with dictation's vocabulary prompt)."""
+    """Decode options from the request that this backend's ``transcribe`` accepts."""
     from services.asr_backend import transcribe_request_kwargs
     return transcribe_request_kwargs(backend, options)
 
@@ -905,9 +1219,11 @@ def _reported_language(result: dict, requested: Optional[str], task: str) -> str
 
 def _num(value, default: float = 0.0) -> float:
     try:
-        return float(value) if value is not None else default
+        number = float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+    # MLX Whisper's temperature fallback can leave NaN/inf scores; strict JSON rejects them.
+    return number if math.isfinite(number) else default
 
 
 def _result_segments(result: dict) -> list[dict]:
@@ -960,6 +1276,8 @@ async def _transcribe_request(
     response_format: str, temperature: Optional[float],
     timestamp_granularities: Optional[list[str]] = None, stream: Optional[bool] = None,
 ):
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     from services.asr_backend import (
         ASRModelMissingError,
         asr_model_missing_detail,
@@ -1044,7 +1362,7 @@ async def _transcribe_request(
         explicit_engine = model if _is_asr_engine_id(model) else None
 
         def _run():
-            backend = load_active_asr_backend()
+            backend = load_active_asr_backend(warm=True)
             if explicit_engine and getattr(backend, "id", None) != explicit_engine:
                 raise _ModelNotActive(explicit_engine, getattr(backend, "id", "?"))
             extra = _backend_request_kwargs(backend, options)
@@ -1056,7 +1374,8 @@ async def _transcribe_request(
                 raise _TaskUnsupported(backend.id)
             return backend.transcribe(tmp_path, word_timestamps=word_ts, **extra)
 
-        result = await run_transcribe_guarded(_gpu_pool, _run, what="OpenAI")
+        result = await diagnostic_reports.await_owned(
+            run_transcribe_guarded(_gpu_pool, _run, what="OpenAI", audio_path=tmp_path), diagnostic_epoch)
 
         segments = _result_segments(result)
         full_text = (result.get("text") or "").strip() if not segments else " ".join(
@@ -1146,15 +1465,20 @@ async def _transcribe_request(
         raise OpenAIError(403, e.detail(), param="model", code=e.detail()["code"]) from e
     except TimeoutError as e:
         # ASRTimeoutError (subclass): backend alive, ASR too heavy for compute.
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("transcription", error=e, expected_epoch=diagnostic_epoch)
         logger.warning("OpenAI transcription timed out: %s", e)
         raise HTTPException(status_code=504, detail=str(e))
     except Exception as e:
         from core.failure import NO_AUDIO_TRACK_MESSAGE, NoAudioTrackError
         from services.ffmpeg_utils import raise_for_audio_extract_failure
         try:
-            await asyncio.to_thread(raise_for_audio_extract_failure, str(e), tmp_path)
+            await diagnostic_reports.await_owned(
+                asyncio.to_thread(raise_for_audio_extract_failure, str(e), tmp_path), diagnostic_epoch)
         except NoAudioTrackError:
             raise OpenAIError(400, NO_AUDIO_TRACK_MESSAGE, param="file", code="no_audio_track")
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("transcription", error=e, expected_epoch=diagnostic_epoch)
         logger.exception("OpenAI transcription failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1317,18 +1641,30 @@ def list_voices():
                 "SELECT id, name, language FROM voice_profiles ORDER BY name"
             ).fetchall()
         name_counts = Counter(_voice_name_key(r["name"]) for r in rows)
+        # An exact id always wins in _resolve_voice_profile, so a profile
+        # named exactly like ANOTHER profile's id is not name-addressable
+        # (#2751). Self-ID names stay addressable; case/whitespace variants
+        # still resolve by name because the id lookup is exact.
+        profile_ids = {r["id"] for r in rows}
         for row in rows:
             key = _voice_name_key(row["name"])
+            collides_with_other_id = row["name"] in profile_ids and row["name"] != row["id"]
             voices.append({
                 "voice_id": row["id"],
                 "name": row["name"],
                 "type": "profile",
                 "language": row["language"],
                 "addressable_by_name": bool(key) and name_counts[key] == 1
-                and not _name_is_reserved(key),
+                and not _name_is_reserved(key)
+                and not collides_with_other_id,
             })
     except Exception:
         logger.warning("Voice profiles could not be loaded; returning built-in aliases only")
+
+    # OpenAI-compatible clients such as Open WebUI read each voice's `id`
+    # (#2679); `voice_id` stays for existing callers.
+    for voice in voices:
+        voice["id"] = voice["voice_id"]
 
     return {"voices": voices, "engines": backends}
 

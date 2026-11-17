@@ -9,11 +9,9 @@ inference staying on the powerful machine.
 > gate (share PIN, API key, dictation WebSocket, trusted networks) with the exact
 > headers, params, and `401`/`403`/`429` meanings.
 
-> Want to keep working *here* and only send individual jobs to another GPU? That
-> is a different feature — see [docs/remote-workers.md](remote-workers.md). This
-> page moves the whole backend (and your projects with it) to the other machine;
-> remote workers keep everything local and farm out single tasks. Both are
-> supported, and setting one up does not affect the other.
+This page covers the retained **remote backend** mode: the whole backend and its
+projects run on the other machine. It is distinct from Network sharing, which
+serves the current backend's UI to other devices on the LAN.
 
 This is opt-in and off by default: with no API key set, the backend stays
 loopback-only exactly as before.
@@ -76,15 +74,16 @@ tailscale serve 3900
 # now reachable at https://gpu-box.your-tailnet.ts.net
 ```
 
-Serve terminates on the node and forwards from `127.0.0.1`, so to the backend
-the request looks like loopback — which is why the **API key is still
-required** in that path (the bearer gate doesn't rely on the source address
-for non-local exposure; set the key and it always applies to keyed clients).
-Uvicorn trusts proxy headers from loopback by default, so Serve's forwarded
-HTTPS scheme becomes the authoritative ASGI scheme and browser session cookies
-receive `Secure`. For a non-loopback reverse proxy, explicitly configure
-Uvicorn's `--forwarded-allow-ips=<proxy-ip>`; the application never trusts an
-arbitrary `X-Forwarded-Proto` header itself.
+Serve terminates TLS on the host and proxies to the local backend. Keep the
+**API key configured**; tailnet access is not administrator authentication.
+Uvicorn accepts proxy-header rewrites from loopback by default. VoiceStudio also
+recognizes a one-way HTTPS upgrade from `X-Forwarded-Proto` for deployments such
+as Docker, where the proxy can appear as a bridge gateway. That scheme hint
+supports exact-Origin checks and `Secure` cookies; it does not verify the
+client-facing connection or its certificate. Open the HTTPS URL printed by
+Serve and verify the browser accepts the certificate without bypassing an error.
+Do not broadly trust forwarded client addresses to make HTTPS work. Docker
+operators should use the [host-managed Serve instructions](install/docker.md#private-remote-access-with-tailscale).
 
 > **Do not use `tailscale funnel`** (public-internet exposure) for this. Even
 > with a key, a voice-cloning backend should not be on the open internet.

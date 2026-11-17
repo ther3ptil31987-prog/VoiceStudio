@@ -216,7 +216,6 @@ def test_get_model_revocation_stops_a_resident_model(store, mm, monkeypatch, ma)
 
 def test_preload_skips_quietly_when_unaccepted(store, mm, monkeypatch, caplog):
     monkeypatch.setattr(mm, "model", None)
-    monkeypatch.setattr(mm, "_headless_worker", lambda: False)
     caps = importlib.import_module("core.device_caps")
 
     monkeypatch.setattr(caps, "detect_host_caps", lambda: type("C", (), {"family": "cpu"})())
@@ -246,14 +245,3 @@ def test_failure_payload_carries_code_and_models(ma):
     assert fields["code"] == "model_licence_required"
     assert fields["models"] == [{"repo_id": GATED_REPO}]
     assert "code" not in build_failure(ValueError("x"), stage="tts", include_diagnostic=False)
-
-
-def test_remote_worker_reports_licence_not_install(store, engine_cache, monkeypatch, tts_backend):
-    executor = importlib.import_module("worker.executor")
-
-    cls = _engine("indextts2")
-    monkeypatch.setattr(tts_backend, "get_backend_class", lambda engine_id: cls)
-    with pytest.raises(executor.TaskFailure) as err:
-        executor.TaskExecutor._load_backend("indextts2")
-    assert err.value.error.code == "MODEL_LICENCE_REQUIRED"
-    assert cls.built == 0

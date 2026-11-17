@@ -36,6 +36,7 @@ no quantifier overlap, so matching is linear in the input length.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Optional
 
 # Speed multipliers. ``None`` means "engine default" (no override emitted).
@@ -139,17 +140,145 @@ def parse_ssml_lite(text: str) -> list[dict]:
     return segments
 
 
+def _grapheme_units(text: str) -> list[str]:
+    """Split text into user-perceived characters (grapheme clusters).
+
+    Iterating a Python ``str`` yields Unicode code points, not grapheme
+    clusters: ``é`` in NFD (the letter ``e`` plus the combining acute
+    U+0301) is two code points, and a regional-indicator pair like
+    ``🇺🇸`` is two code points whose visible meaning only exists as a pair.
+    Naive code-point iteration would space those clusters apart and let the
+    engine speak a stray combining mark or a half-flag.
+
+    A full grapheme-cluster segmentation belongs in a dedicated library
+    (``grapheme`` / ``regex`` ``\\X``); the deps file does not pull one in
+    directly. This stdlib-only helper covers the cases that actually reach
+    the longform spelling path today:
+
+    1. NFC-normalize first so common decomposed sequences (Latin diacritics,
+       precomposed vs. conjoining-jamo Hangul) collapse to a single code
+       point.
+    2. Walk the NFC text; any code point whose Unicode general category is
+       ``Mn`` (non-spacing mark), ``Mc`` (spacing combining mark — used by
+       Indic scripts such as Devanagari vowel signs), or ``Me`` (enclosing
+       mark) is appended to the previous unit instead of starting a new
+       one. ``unicodedata.combining`` alone misses ``Mc`` (it reports 0
+       for spacing combining marks), so checking the category is the
+       portable signal.
+
+    The unit buffer is a list of single-character strings, not a single
+    string that we keep growing with ``+=``: ``str += str`` copies the
+    whole left-hand side each time, so a long run of trailing combining
+    marks (pathological but reachable through user input or imports)
+    would be O(n²). Joining once at the end is O(n).
+    """
+    if not text:
+        return []
+    normalized = unicodedata.normalize("NFC", text)
+    units: list[list[str]] = []
+    for ch in normalized:
+        if units and _extends_unit(units[-1], ch):
+            units[-1].append(ch)
+        else:
+            units.append([ch])
+    return ["".join(unit) for unit in units]
+
+
+_ZWJ = "\u200d"
+
+
+def _is_regional_indicator(ch: str) -> bool:
+    return "\U0001f1e6" <= ch <= "\U0001f1ff"
+
+
+# Approximate Unicode Extended_Pictographic ranges (UAX #29 rule GB11). The
+# stdlib has no property lookup, so this covers the emoji blocks; regional
+# indicators and skin-tone modifiers are not pictographic and stay out.
+_PICTOGRAPHIC_RANGES = (
+    ("\u00a9", "\u00a9"),
+    ("\u00ae", "\u00ae"),
+    ("\u203c", "\u203c"),
+    ("\u2049", "\u2049"),
+    ("\u2122", "\u2122"),
+    ("\u2139", "\u2139"),
+    ("\u2194", "\u21aa"),
+    ("\u2300", "\u23ff"),
+    ("\u25aa", "\u25fe"),
+    ("\u2600", "\u27bf"),
+    ("\u2934", "\u2935"),
+    ("\u2b00", "\u2bff"),
+    ("\u3030", "\u3030"),
+    ("\u303d", "\u303d"),
+    ("\u3297", "\u3297"),
+    ("\u3299", "\u3299"),
+    ("\U0001f000", "\U0001f1e5"),
+    ("\U0001f200", "\U0001f3fa"),
+    ("\U0001f400", "\U0001faff"),
+)
+
+
+def _is_pictographic(ch: str) -> bool:
+    return any(lo <= ch <= hi for lo, hi in _PICTOGRAPHIC_RANGES)
+
+
+def _is_emoji_tag(ch: str) -> bool:
+    # TAG characters spell subdivision flags such as Scotland (UTS #51).
+    return "\U000e0020" <= ch <= "\U000e007f"
+
+
+def _extends_unit(unit: list[str], ch: str) -> bool:
+    """Whether ``ch`` belongs to the grapheme unit ``unit`` instead of a new one.
+
+    Besides combining marks (see :func:`_grapheme_units`), this keeps emoji
+    clusters whole: a skin-tone modifier stays on its base, a zero-width
+    joiner stays on the code point before it, a pictograph after an emoji
+    ZWJ stays in the sequence (``👩‍💻``), emoji tag characters stay on their
+    base (subdivision flags), and regional indicators pair up into one flag
+    (``🇺🇸``). A letter after a ZWJ starts a new unit, as UAX #29 says, so
+    ``"م\u200dی"`` is still spelled as two letters.
+    """
+    if unicodedata.category(ch) in ("Mn", "Mc", "Me"):
+        return True
+    if ch == _ZWJ or _is_emoji_tag(ch):
+        return True
+    if unit[-1] == _ZWJ:
+        # UAX #29 GB11: a pictograph joins only when the code point before the
+        # ZWJ (skipping combining marks, skin tones and tags) is a pictograph.
+        # Looking back from the ZWJ keeps long ZWJ runs linear (no list copies).
+        if not _is_pictographic(ch):
+            return False
+        i = len(unit) - 2
+        while i >= 0 and (
+            unicodedata.category(unit[i]) in ("Mn", "Mc", "Me")
+            or "\U0001f3fb" <= unit[i] <= "\U0001f3ff"
+            or _is_emoji_tag(unit[i])
+        ):
+            i -= 1
+        return i >= 0 and _is_pictographic(unit[i])
+    if "\U0001f3fb" <= ch <= "\U0001f3ff":  # emoji skin-tone modifiers
+        return True
+    return (
+        _is_regional_indicator(ch)
+        and len(unit) == 1
+        and _is_regional_indicator(unit[0])
+    )
+
+
 def spell_out(word: str) -> str:
     """Space out a run for the ``[spell]`` case: ``"USA"`` → ``"U S A"``.
 
-    Collapses surrounding whitespace, then joins the remaining characters with
-    single spaces so the engine pronounces each letter discretely. Whitespace
-    inside the run is treated as a separator (each token spelled, joined by a
-    single space), so ``"go USA"`` → ``"g o U S A"``.
+    Collapses surrounding whitespace, then joins the remaining *grapheme
+    units* with single spaces so the engine pronounces each visible
+    character discretely. Whitespace inside the run is treated as a
+    separator (each token spelled, joined by a single space), so
+    ``"go USA"`` → ``"g o U S A"``. See :func:`_grapheme_units` for why
+    ``str`` code-point iteration alone is not enough.
     """
     if not word:
         return ""
-    # Drop all existing whitespace, then interleave the visible characters with
-    # spaces. ``split()`` + ``"".join`` removes runs of whitespace first.
-    compact = "".join(word.split())
-    return " ".join(compact)
+    # Drop all existing whitespace, then interleave the visible characters
+    # with spaces. ``split()`` + ``"".join`` removes runs of whitespace
+    # first.
+    # Group each whitespace-separated token on its own so separate jamo or
+    # letters never fuse into one syllable across a space.
+    return " ".join(unit for token in word.split() for unit in _grapheme_units(token))

@@ -1,0 +1,28 @@
+diff --git a/templates/nsis/include/allowOnlyOneInstallerInstance.nsh b/templates/nsis/include/allowOnlyOneInstallerInstance.nsh
+--- a/templates/nsis/include/allowOnlyOneInstallerInstance.nsh
++++ b/templates/nsis/include/allowOnlyOneInstallerInstance.nsh
+@@ -36,2 +36,4 @@
+   StrCpy $PowerShellPath "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
++  # Keep the path out of PowerShell source (install folders may contain quotes).
++  System::Call 'kernel32::SetEnvironmentVariableW(w "ELECTRON_BUILDER_INSTALL_ROOT", w "$INSTDIR")i.r0'
+   !ifmacrodef customCheckAppRunning
+@@ -47,3 +49,3 @@
+   # Try running PowerShell with a simple command to check if it's available
+-  nsExec::Exec `"$PowerShellPath" -C "if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"`
++  nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"`
+   Pop $0  # Return code (0 = success, other = error)
+@@ -52,3 +54,3 @@
+     # PowerShell is available, check if it's not blocked by policies
+-    nsExec::Exec `"$PowerShellPath" -C "if ((Get-ExecutionPolicy -Scope Process) -eq 'Restricted') { exit 1 } else { exit 0 }"`
++    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if ((Get-ExecutionPolicy -Scope Process) -eq 'Restricted') { exit 1 } else { exit 0 }"`
+     Pop $0
+@@ -65,3 +67,3 @@
+   ${if} $IsPowerShellAvailable == 0
+-    nsExec::Exec `"$PowerShellPath" -C "if ((Get-CimInstance -ClassName Win32_Process | ? {$$_.Path -and $$_.Path.StartsWith('$INSTDIR', 'CurrentCultureIgnoreCase')}).Count -gt 0) { exit 0 } else { exit 1 }"`
++    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "if ((Get-CimInstance -ClassName Win32_Process | ? {$$_.ExecutablePath -and $$_.ProcessId -ne $pid -and $$_.ExecutablePath.StartsWith(($$env:ELECTRON_BUILDER_INSTALL_ROOT.TrimEnd([char]92) + [char]92), 'OrdinalIgnoreCase')}).Count -gt 0) { exit 0 } else { exit 1 }"`
+     Pop ${_RETURN}
+@@ -93,3 +95,3 @@
+   ${if} $IsPowerShellAvailable == 0
+-    nsExec::Exec `"$PowerShellPath" -C "Get-CimInstance -ClassName Win32_Process | ? {$$_.Path -and $$_.Path.StartsWith('$INSTDIR', 'CurrentCultureIgnoreCase')} | % { Stop-Process -Id $$_.ProcessId $0 }"`
++    nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -C "Get-CimInstance -ClassName Win32_Process | ? {$$_.ExecutablePath -and $$_.ProcessId -ne $pid -and $$_.ExecutablePath.StartsWith(($$env:ELECTRON_BUILDER_INSTALL_ROOT.TrimEnd([char]92) + [char]92), 'OrdinalIgnoreCase')} | % { Stop-Process -Id $$_.ProcessId $0 }"`
+   ${else}

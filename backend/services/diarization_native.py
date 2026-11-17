@@ -29,7 +29,41 @@ def _sortformer_command(binary: Path, model: Path, device, source: Path, output:
     ]
 
 
+def _read_turns_output(output: Path) -> list:
+    """Parse the native Sortformer ``turns.json`` written by ``audiocpp_cli``.
+
+    A successful subprocess exit (``code == 0``) does not guarantee a
+    parseable output file: the sidecar can be killed by an OOM, hit a
+    filesystem error mid-write, or hand back a non-UTF-8 byte fragment
+    that survived a write-through-binary buffer. Without a guarded read
+    here, any of those surfaces as a raw ``UnicodeDecodeError`` or
+    ``json.JSONDecodeError`` to the caller, with no hint that the bug is
+    in the sidecar output rather than in the request. Raise a clear
+    ``RuntimeError`` that names the file and the underlying error type so
+    the user has a chance to file a useful bug report.
+    """
+    try:
+        raw = output.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"Native Sortformer output {output.name} could not be read as UTF-8: "
+            f"{type(exc).__name__}"
+        ) from exc
+    try:
+        turns = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Native Sortformer output {output.name} is not valid JSON: "
+            f"{type(exc).__name__}"
+        ) from exc
+    if not isinstance(turns, list):
+        raise ValueError("Invalid native speaker-turn output")
+    return turns
+
+
 def _validated_turn(turn: dict, audio_frames: int) -> tuple[int, int, str]:
+    if not isinstance(turn, dict):
+        raise ValueError("Invalid native speaker-turn boundaries")
     start, end = turn.get("start_sample"), turn.get("end_sample")
     speaker = turn.get("speaker_id")
     if (
@@ -50,6 +84,14 @@ def _validated_turn(turn: dict, audio_frames: int) -> tuple[int, int, str]:
 def is_running() -> bool:
     with _process_lock:
         return bool(_processes)
+
+
+def _check_duration(seconds: float) -> None:
+    if seconds > MAX_V1_AUDIO_SECONDS:
+        raise ValueError(
+            "Sortformer v1 supports recordings up to 120 seconds; "
+            "select pyannote for longer recordings"
+        )
 
 
 class NativeSortformer:
@@ -96,12 +138,13 @@ class NativeSortformer:
 
         check_cancelled()
 
-        audio_info = sf.info(str(audio_path))
-        if audio_info.duration > MAX_V1_AUDIO_SECONDS:
-            raise ValueError(
-                "Sortformer v1 supports recordings up to 120 seconds; "
-                "select pyannote for longer recordings"
-            )
+        try:
+            audio_info = sf.info(str(audio_path))
+        except sf.LibsndfileError:
+            # libsndfile can't read m4a/webm/aac etc.; ffmpeg normalises those below.
+            audio_info = None
+        if audio_info is not None:
+            _check_duration(audio_info.duration)
         device = resolve_compute_selection().device
         with TemporaryDirectory(prefix="voicestudio-sortformer-") as directory:
             source = Path(audio_path).resolve()
@@ -146,7 +189,7 @@ class NativeSortformer:
                         tail = diagnostic.read().decode("utf-8", errors="replace")
                     logger.error("Sortformer exited with %s; native log tail:\n%s", code, tail)
                     raise RuntimeError(f"Native Sortformer failed (exit {code})")
-            if (audio_info.samplerate != 16000 or audio_info.channels != 1
+            if (audio_info is None or audio_info.samplerate != 16000 or audio_info.channels != 1
                 or audio_info.format != "WAV" or audio_info.subtype != "PCM_16"):
                 from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
                 normalized = Path(directory) / "input.wav"
@@ -157,11 +200,10 @@ class NativeSortformer:
                 ], tool="ffmpeg"), "normalize.log")
                 source = normalized
                 audio_info = sf.info(str(source))
+                _check_duration(audio_info.duration)
                 command[command.index("--audio") + 1] = str(source)
             run_owned(command, "native.log")
-            turns = json.loads(output.read_text(encoding="utf-8"))
-            if not isinstance(turns, list):
-                raise ValueError("Invalid native speaker-turn output")
+            turns = _read_turns_output(output)
             annotation = Annotation()
             for index, turn in enumerate(turns):
                 start, end, speaker = _validated_turn(turn, audio_info.frames)

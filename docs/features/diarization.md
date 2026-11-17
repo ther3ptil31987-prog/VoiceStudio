@@ -7,7 +7,17 @@ the same stack the original WhisperX paper used.
 ## What diarization buys you
 
 - Multi-speaker dubbing: each detected speaker gets its own voice clone in
-  the target language.
+  the target language. A line whose words belong to two speakers is split at
+  the speaker change, on every transcription path (the app, the CLI and the
+  phone companion). A one-word reply that is a sentence of its own ("Fine.")
+  is split off too; a single word inside a sentence is treated as diarization
+  noise. Words and lines that fall in a gap between turns take the nearest
+  turn's speaker. A speaker who only speaks in short turns still gets a
+  clone, cut from their turns with the edges next to other speakers trimmed
+  off; only a speaker with less than about 3 s of clean speech falls back to
+  the default voice, never another speaker's clone, and transcription names
+  those speakers in a warning. A line that overlaps another speaker's line
+  gets no line-specific reference, so its voice is never a blend of the two.
 - Subtitle styling: speaker labels (`SPEAKER_00:`, `SPEAKER_01:`, …) on the
   exported SRT/VTT files.
 - Audio editing: per-speaker tracks in the timeline view.
@@ -20,7 +30,7 @@ the model's license once.
 
 1. Get a HF token if you don't have one — see
    [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
-2. Set the token via **Settings → API Keys** (or any of the other supported
+2. Set the token via **Settings → Credentials** (or any of the other supported
    paths).
 3. While signed in to HuggingFace with the same account, visit:
    - https://huggingface.co/pyannote/speaker-diarization-3.1 → **"Agree and
@@ -78,4 +88,4 @@ downloads models or changes app data. On the maintained Windows RTX 4090 fixture
 processed a real 60-second Dubbing source through Vulkan in 3.27 seconds, returned 16 bounded
 turns, and cancelled the 120-second variant in 1.2 seconds without leaving a registered process.
 
-audio.cpp v0.7.4 contains the newer Sortformer v2.1 streaming runtime. Its NVIDIA Open Model License checkpoint currently has no redistributable GGUF package, so VoiceStudio does not advertise a download that upstream cannot legally supply. A locally converted mixed F16/F32 checkpoint is the planned long-recording path once the model can be offered through an explicit local-package workflow.
+The pinned audio.cpp runtime (v0.7.4 and later) contains the newer Sortformer v2.1 streaming runtime. Its NVIDIA Open Model License checkpoint currently has no redistributable GGUF package, so VoiceStudio does not advertise a download that upstream cannot legally supply. A locally converted mixed F16/F32 checkpoint is the planned long-recording path once the model can be offered through an explicit local-package workflow.

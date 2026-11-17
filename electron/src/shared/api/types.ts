@@ -20,9 +20,9 @@ export type EngineFamily = 'tts' | 'asr' | 'llm';
 // (it gates with `??` / `?.length` and suppresses the routing badge).
 type GPUTarget = 'cuda' | 'mps' | 'rocm' | 'vulkan' | 'xpu' | 'cpu';
 // Where an engine actually runs on THIS host. `network` is LLM-only (remote).
-type EffectiveDevice = GPUTarget | 'network';
+type EffectiveDevice = GPUTarget | 'network' | 'unknown';
 // `n/a` is LLM-only; resolve_routing only ever returns the first four.
-type RoutingStatus = 'accelerated' | 'cpu_fallback' | 'cpu_only' | 'unavailable' | 'n/a';
+type RoutingStatus = 'accelerated' | 'cpu_fallback' | 'cpu_only' | 'unavailable' | 'n/a' | 'unknown';
 
 export interface EngineBackend {
   id: string;
@@ -156,6 +156,9 @@ export interface EngineSelfTestResponse {
   num_samples?: number | null;
   audio_seconds?: number | null;
   timed_out?: boolean;
+  // OmniVoice GGUF only: the Vulkan adapter and a path-free runtime log.
+  runtime_device?: string | null;
+  runtime_log?: string | null;
 }
 
 // ── System / diagnostics ─────────────────────────────────────────────────
@@ -219,6 +222,7 @@ export interface Profile {
   ref_text?: string;
   instruct?: string;
   vd_states?: string | null;
+  design_recipe?: string | null;
   description?: string;
   created_at?: string;
   is_locked?: boolean;

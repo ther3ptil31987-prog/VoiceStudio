@@ -18,7 +18,7 @@ Design notes (single source of truth for the choices):
   ``pip install git+https://…`` path was rejected because the engine
   *directory* must exist on disk anyway: the sidecar resolves its venv
   and model weights relative to it.
-* **Managed install root:** ``DATA_DIR/engines/<engine_id>/`` — always
+* **Managed install root:** ``DATA_DIR/engines/<engine_id>/`` (or ``$OMNIVOICE_ENGINES_DIR/<engine_id>/``) — always
   user-writable (works in frozen/packaged builds where ``backend/`` is
   read-only), survives app updates, and never collides with a user's own
   clone. A user-managed install (env var already pointing at their clone)
@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, NamedTuple, Optional
 
-from core.config import DATA_DIR
+from core.config import DATA_DIR, get_engines_dir
 from core.contained_subprocess import OwnedPopen, WindowsJobPopen, spawn_owned
 
 logger = logging.getLogger("omnivoice.sidecar_install")
@@ -170,6 +170,12 @@ class SidecarSpec:
     # fails loudly at install time. False keeps the engine's existing host
     # behaviour (see _rocm_pin_args, #2371).
     uses_rocm_index: bool = False
+    # The exact torch (and torchaudio) version an upstream pins itself, for an
+    # engine without ``torch_pins``. On a ROCm host it selects the matching
+    # build from PyTorch's ROCm index (core.torch_indexes
+    # ROCM_INDEX_TAIL_FOR_TORCH), so the sidecar can drive an AMD GPU while
+    # keeping the version upstream tested.
+    upstream_torch: str = ""
     # torch/torchaudio pins for an upstream that leaves torch unpinned. Left
     # to the resolver, PyPI's newest torch (CPU-only on Windows) pairs with a
     # CUDA torchaudio from the other index. The host picks the build of the
@@ -236,6 +242,16 @@ def _dots_installed() -> bool:
     return is_dots_tts_installed()
 
 
+def _ming_invalidate() -> None:
+    from engines.ming_tts import bootstrap
+    bootstrap.invalidate()
+
+
+def _ming_installed() -> bool:
+    from engines.ming_tts.bootstrap import is_ming_tts_installed
+    return is_ming_tts_installed()
+
+
 def _host_family() -> str:
     """The accelerator family this host runs, or "cpu" when it cannot tell."""
     try:
@@ -245,13 +261,40 @@ def _host_family() -> str:
         return "cpu"
 
 
+def _host_machine() -> str:
+    """This host's CPU architecture, lower-cased (``x86_64``, ``aarch64``…)."""
+    import platform
+    return platform.machine().lower()
+
+
+def _local_build_pins(spec: "SidecarSpec", suffix: str) -> list[str]:
+    """The spec's torch pins forced to one local build (``+cu128``/``+cpu``).
+
+    On Linux ARM64 only torch is forced: PyTorch's cu128 and CPU indexes ship
+    aarch64 torchaudio 2.7.0 without a local label, so a forced ``+cu128`` or
+    ``+cpu`` torchaudio pin cannot resolve. An unlabelled pin is still
+    satisfied by the labelled torch under PEP 440, but which index its wheel
+    comes from is not guaranteed: on a version tie uv may take PyPI's build.
+
+    This covers the cu128 and CPU branches only. The ROCm path forces its own
+    local tags in ``_rocm_pin_args`` and is not handled here.
+    """
+    arm_linux = sys.platform == "linux" and _host_machine() in ("aarch64", "arm64")
+    # Matches exact ``torch==`` pins only, the format every spec uses today; a
+    # looser specifier (``torch>=…``) would be left unlabelled on ARM64.
+    return [
+        pin if arm_linux and not pin.startswith("torch==") else f"{pin}{suffix}"
+        for pin in spec.torch_pins
+    ]
+
+
 def _torch_pin_args(spec: "SidecarSpec") -> list[str]:
     from core.torch_indexes import UV_PIP_CPU_ARGS, UV_PIP_CU128_ARGS
 
     if _host_family() == "cuda":
-        return [f"{pin}+cu128" for pin in spec.torch_pins] + list(UV_PIP_CU128_ARGS)
+        return _local_build_pins(spec, "+cu128") + list(UV_PIP_CU128_ARGS)
     if sys.platform in ("win32", "linux"):
-        return [f"{pin}+cpu" for pin in spec.torch_pins] + list(UV_PIP_CPU_ARGS)
+        return _local_build_pins(spec, "+cpu") + list(UV_PIP_CPU_ARGS)
     return list(spec.torch_pins)
 
 
@@ -277,36 +320,57 @@ def _rocm_index_url() -> Optional[str]:
 
 
 def _rocm_pin_args() -> list[str]:
-    """ROCm torch for a sidecar venv on a ROCm host (#2371).
+    """ROCm Torch for the shared sidecar stack, honoring custom indexes."""
+    from core.torch_indexes import ROCM_TORCH_PINS
+    from services.rocm_sidecar_index import rocm_torch_args
 
-    ``--no-sources`` is required for an upstream that routes torch through its
-    own ``[tool.uv.sources]`` (IndexTTS pins it to the cu128 index): without it
-    every ``+rocm`` pin is looked up on the cu128 index and fails. The local
-    tag comes from the index name (``…/rocm6.4`` → ``+rocm6.4``) so a custom
-    ``OMNIVOICE_TORCH_INDEX`` keeps resolving; a mirror without a rocm-style
-    name falls back to the bare pin and lets the extra index win by PEP 440
-    ordering (a tagged build sorts above the bare version).
+    versions = [pin.split("==", 1)[1] for pin in ROCM_TORCH_PINS]
+    return rocm_torch_args(_rocm_index_url(), *versions,
+                           custom=bool(os.environ.get("OMNIVOICE_TORCH_INDEX")))
+
+
+def _spec_torch_versions(spec: "SidecarSpec") -> tuple[str, str] | None:
+    """The exact (torch, torchaudio) versions this engine installs, if known.
+
+    From the spec's own pins, its declared upstream pin, or (dots.tts) the
+    ``torch==`` line of the upstream constraints file in the checkout.
     """
-    from core.torch_indexes import (
-        PYTORCH_ROCM_INDEX_URL,
-        ROCM_TORCH_PINS,
-        UV_PIP_ROCM_ARGS,
+    pins = dict(
+        pin.split("==", 1) for pin in spec.torch_pins
+        if pin.startswith(("torch==", "torchaudio=="))
     )
+    if "torch" in pins:
+        return pins["torch"], pins.get("torchaudio", pins["torch"])
+    if spec.upstream_torch:
+        return spec.upstream_torch, spec.upstream_torch
+    if spec.engine_id == "dots-tts":
+        constraints = managed_checkout(spec) / "constraints" / "recommended.txt"
+        try:
+            text = constraints.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        found = dict(re.findall(
+            r"(?m)^(torch|torchaudio)\s*==\s*([0-9][0-9.]*)\s*(?:#.*)?$", text,
+        ))
+        if "torch" in found:
+            return found["torch"], found.get("torchaudio", found["torch"])
+    return None
 
-    index = _rocm_index_url() or ""
-    tail = index.rstrip("/").rsplit("/", 1)[-1]
-    tag = f"+{tail}" if tail.startswith("rocm") else ""
-    # uv must resolve against the SAME index the pins were derived from:
-    # the tag above already comes from OMNIVOICE_TORCH_INDEX, so appending
-    # the hard-coded public index would look a mirror's pins up on someone
-    # else's server (and bypass the mirror entirely).
-    idx_args = [
-        (index or PYTORCH_ROCM_INDEX_URL)
-        if arg == PYTORCH_ROCM_INDEX_URL
-        else arg
-        for arg in UV_PIP_ROCM_ARGS
-    ]
-    return ["--no-sources", *(f"{pin}{tag}" for pin in ROCM_TORCH_PINS), *idx_args]
+
+def _spec_rocm_torch_args(spec: "SidecarSpec") -> Optional[list[str]]:
+    """Resolve ROCm pins without rewriting a user-selected mirror."""
+    index = _rocm_index_url()
+    if index is None:
+        return None
+    if spec.uses_rocm_index:
+        return _rocm_pin_args()
+    versions = _spec_torch_versions(spec)
+    if versions is None:
+        return None
+    from services.rocm_sidecar_index import rocm_torch_args
+
+    return rocm_torch_args(index, *versions,
+                           custom=bool(os.environ.get("OMNIVOICE_TORCH_INDEX")))
 
 
 def venv_torch_hip(venv_dir: Path) -> Optional[bool]:
@@ -316,6 +380,10 @@ def venv_torch_hip(venv_dir: Path) -> Optional[bool]:
     Reads the wheel's generated ``version.py`` instead of importing torch, so it
     is safe on every engine-list refresh."""
     matches = sorted((venv_dir / "lib").glob("python*/site-packages/torch/version.py"))
+    if not matches:
+        win_version = venv_dir / "Lib" / "site-packages" / "torch" / "version.py"
+        if win_version.is_file():
+            matches = [win_version]
     if not matches:
         return None
     try:
@@ -348,12 +416,36 @@ def _moss_host() -> tuple[bool, str]:
     )
 
 
+def _sfx_installed() -> bool:
+    from engines.moss_sfx.bootstrap import is_sfx_installed
+    return is_sfx_installed()
+
+
+def _sfx_host() -> tuple[bool, str]:
+    from engines.moss_sfx import host_support
+    return host_support()
+
+
 def _dots_host() -> tuple[bool, str]:
     if sys.platform != "win32":
         return True, ""
     return False, (
-        "dots.tts publishes no Windows install. Run VoiceStudio on Linux or "
-        "macOS, or under WSL2, to use it."
+        "dots.tts publishes no Windows install. Use the audio.cpp dots.tts "
+        "engine instead, which runs natively on Windows."
+    )
+
+
+def _ming_host() -> tuple[bool, str]:
+    # Upstream tests torch 2.6 + CUDA 12.4 on NVIDIA Linux only. Its pinned
+    # torch==2.6.0 is the CUDA build from PyPI on Linux but CPU-only on Windows,
+    # and the app's shared CUDA index (cu128) has no 2.6.0, so the one-click
+    # install cannot give Windows a CUDA torch.
+    if sys.platform == "linux" and _host_family() == "cuda":
+        return True, ""
+    return False, (
+        "Ming-3.0-tts's one-click install is for Linux with an NVIDIA GPU "
+        "(upstream tests CUDA only). On other machines pick another engine; "
+        "its guide covers a manual install on a CUDA host."
     )
 
 
@@ -446,7 +538,10 @@ SPECS: dict[str, SidecarSpec] = {
         source_revision="934d6826b084c46a0d033402174d5f8ac4ed2519",
         source_required_path="pyproject.toml",
         venv_args=("--python", "3.11"),
-        install_args=("-e", "{checkout}[torch-runtime]"),
+        # == permits the +cu128 decoder, which requires NVIDIA NPP even
+        # for CPU reference-audio decoding. === excludes that local build.
+        install_args=("-e", "{checkout}[torch-runtime]", "torchcodec===0.8.1"),
+        install_revision="cpu-decoder-v1",
         uses_cuda_index=True,
         host_supported=_moss_host,
         docs_path="docs/engines/moss-tts-v15.md",
@@ -479,8 +574,10 @@ SPECS: dict[str, SidecarSpec] = {
         venv_args=("--python", "3.10"),
         install_args=("-r", "{checkout}/requirements.txt"),
         # torch==2.7.0: CPU-only from PyPI on Windows; the CUDA index supplies
-        # 2.7.0+cu128, which satisfies the same pin.
+        # 2.7.0+cu128, which satisfies the same pin. A ROCm host takes
+        # 2.7.0+rocm6.3 instead (upstream_torch).
         uses_cuda_index=True,
+        upstream_torch="2.7.0",
         docs_path="docs/engines/confucius4-tts.md",
         # ~7 GB venv now, ~5 GB of weights on first synthesis.
         required_bytes=14 * _GIB,
@@ -515,6 +612,73 @@ SPECS: dict[str, SidecarSpec] = {
         disk_confidence="estimated",
         invalidate=_dots_invalidate,
         installed_probe=_dots_installed,
+    ),
+    # Ming-3.0-tts-0.5b (#3793). Upstream is not pip-installable (flat modules,
+    # requirements.txt only); the sidecar puts the checkout on sys.path. The
+    # ~3 GB weights come only from the Model Catalogue row the user starts.
+    "ming-tts": SidecarSpec(
+        engine_id="ming-tts",
+        display_name="Ming-3.0-tts",
+        repo_url="https://github.com/inclusionAI/Ming-3.0-tts.git",
+        tarball_url=(
+            "https://github.com/inclusionAI/Ming-3.0-tts/archive/"
+            "a39b80660bdc5a4394d5e1d41af6dbfd9c443a54.tar.gz"
+        ),
+        checkout_dirname="Ming-3.0-tts",
+        env_var="OMNIVOICE_MING_TTS_DIR",
+        probe_module="ming_tts",
+        probe_code="import sys; sys.path.insert(0, {checkout_repr}); import ming_tts",
+        source_revision="a39b80660bdc5a4394d5e1d41af6dbfd9c443a54",
+        # No pyproject.toml upstream: requirements.txt is its manifest.
+        source_manifest="requirements.txt",
+        source_required_path="ming_tts.py",
+        # The upstream flash-attn wheel and the tiny model both target 3.10.
+        venv_args=("--python", "3.10"),
+        install_args=("-r", "{checkout}/requirements.txt"),
+        host_supported=_ming_host,
+        docs_path="docs/engines/ming-tts.md",
+        # ~7 GB venv (torch 2.6 + CUDA libs), ~3 GB of weights from the Model Catalogue.
+        required_bytes=12 * _GIB,
+        dependency_bytes=8 * _GIB,
+        temporary_free_bytes=8 * _GIB,
+        disk_confidence="estimated",
+        invalidate=_ming_invalidate,
+        installed_probe=_ming_installed,
+    ),
+    # MOSS-SoundEffect v2.0 (#3577): text to sound effects, not speech. Upstream
+    # pins numpy==1.26.4 / transformers==4.57.1 and CUDA 12.8 torch 2.9.0, so it
+    # gets its own Python 3.12 venv; the weights are the diffusers-style v2.0
+    # repository, downloaded only when the user clicks Install.
+    "moss-soundeffect": SidecarSpec(
+        engine_id="moss-soundeffect",
+        display_name="MOSS-SoundEffect v2.0",
+        repo_url="https://github.com/OpenMOSS/MOSS-TTS.git",
+        tarball_url=(
+            "https://github.com/OpenMOSS/MOSS-TTS/archive/"
+            "934d6826b084c46a0d033402174d5f8ac4ed2519.tar.gz"
+        ),
+        checkout_dirname="MOSS-TTS",
+        env_var="OMNIVOICE_MOSS_SFX_DIR",
+        probe_module="moss_soundeffect_v2",
+        source_revision="934d6826b084c46a0d033402174d5f8ac4ed2519",
+        source_required_path="moss_soundeffect_v2/pyproject.toml",
+        # Upstream requires-python is >=3.12.
+        venv_args=("--python", "3.12"),
+        install_args=("-e", "{checkout}/moss_soundeffect_v2"),
+        torch_pins=("torch==2.9.0", "torchaudio==2.9.0", "torchvision==0.24.0"),
+        weights_repo_id="OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+        weights_revision="e35df4d82fbe87fcd5d14e5d100e349c0c3c076d",
+        weights_subdir="checkpoints",
+        weights_config_names=("model_index.json",),
+        host_supported=_sfx_host,
+        docs_path="docs/engines/moss-soundeffect.md",
+        # ~8 GB venv (CUDA torch + gradio + audiotools) and 11.2 GB of weights.
+        required_bytes=22 * _GIB,
+        weights_bytes=11_230_170_282,
+        dependency_bytes=8 * _GIB,
+        temporary_free_bytes=8 * _GIB,
+        disk_confidence="estimated",
+        installed_probe=_sfx_installed,
     ),
     # PyPI packages rather than repositories: nothing to clone, and the managed
     # root holds only the engine's own venv. The pins are the app's own
@@ -613,6 +777,8 @@ SPECS: dict[str, SidecarSpec] = {
         install_args=("-e", "{checkout}", "soundfile"),
         install_revision="audio-backend-v1",
         uses_cuda_index=True,
+        # Upstream pins torch/torchaudio==2.7.0; a ROCm host takes +rocm6.3.
+        upstream_torch="2.7.0",
         # torch 2.7 (CUDA build on NVIDIA hosts) + transformers + onnxruntime.
         # The model and its audio tokenizer download on first synthesis.
         required_bytes=8 * _GIB,
@@ -671,14 +837,13 @@ SPECS: dict[str, SidecarSpec] = {
         ),
         venv_args=("--python", "3.10"),
         install_args=("-r", _COSYVOICE_REQUIREMENTS, "{checkout}/third_party/PyWorld"),
-        install_revision="inference-imports-v2",
+        install_revision="rocm-routing-v5",
         torch_pins=("torch==2.7.0", "torchaudio==2.7.0"),
         weights_repo_id="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
         weights_revision="29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
         weights_subdir="pretrained_models/Fun-CosyVoice3-0.5B",
         weights_config_names=("cosyvoice3.yaml",),
-        # Also a Model Catalogue download, used by the in-process engine and
-        # by remote workers that run it.
+        # Also a Model Catalogue download used by the in-process engine.
         weights_catalogue_download=True,
         weights_allow_patterns=(
             "cosyvoice3.yaml", "config.json", "configuration.json",
@@ -745,11 +910,14 @@ def persistent_env_vars() -> set[str]:
 
 def managed_root(spec: SidecarSpec) -> Path:
     """Per-engine managed install root (checkout lives inside it)."""
-    return Path(DATA_DIR) / "engines" / spec.engine_id
+    return Path(get_engines_dir(DATA_DIR)) / spec.engine_id
 
 
 def managed_checkout(spec: SidecarSpec) -> Path:
-    return managed_root(spec) / spec.checkout_dirname
+    from services.sidecar_generations import selected_generation
+
+    root = managed_root(spec)
+    return selected_generation(spec, root, os.environ.get(spec.env_var)) or root / spec.checkout_dirname
 
 
 def engine_venv_python(env_var: str) -> Optional[Path]:
@@ -962,6 +1130,14 @@ def disk_space_error(spec: SidecarSpec) -> Optional[str]:
     # marker makes _step_fetch_source delete the whole checkout.
     preserved, dependency_peak_credit = _preserved_install_bytes(spec, checkout)
     remaining = max(0, spec.required_bytes - preserved)
+    rocm_args = _spec_rocm_torch_args(spec)
+    if (rocm_args is not None or
+            (spec.engine_id == "dots-tts" and _rocm_index_url() is not None)):
+        from services.rocm_sidecar_index import rocm_minimum_install_bytes
+
+        torch_pin = next((arg for arg in rocm_args or () if arg.startswith("torch==")), None)
+        version = torch_pin.split("==", 1)[1].split("+", 1)[0] if torch_pin else None
+        remaining = max(remaining, rocm_minimum_install_bytes(spec.required_bytes, preserved, version))
     if spec.temporary_free_bytes is not None:
         # Resumable model weights are unrelated to uv's dependency-build peak.
         remaining = max(
@@ -999,6 +1175,11 @@ STEP_IDS = (
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+
+from core import activity as _activity  # noqa: E402
+
+_activity.register_probe("engine-installs", lambda: any(
+    job.get("state") == "running" for job in list(_jobs.values())))
 
 # Guards each job's log deque: the worker thread appends while the status
 # poll copies it, and list() over a deque raises RuntimeError if it mutates
@@ -1062,6 +1243,54 @@ def _output_shows_disk_full(lines: Iterable[str]) -> bool:
     return is_disk_full_error("\n".join(lines))
 
 
+# Output a source build prints when no C/C++ compiler is installed. CosyVoice
+# builds PyWORLD from source and dots.tts builds pynini, so on a machine
+# without build tools the one-click install died with only "a network hiccup,
+# re-run" (#3423). Lower-cased substrings from setuptools/distutils, MSVC
+# detection, Xcode's stub tools and meson/CMake.
+_MISSING_COMPILER_MARKERS = (
+    "microsoft visual c++ 14.0 or greater is required",
+    "unable to find vcvarsall.bat",
+    "xcrun: error: invalid active developer path",
+    "no developer tools were found",
+    "unable to execute 'gcc'",
+    "unable to execute 'g++'",
+    "unable to execute 'c++'",
+    "command 'gcc' failed: no such file",
+    "command 'g++' failed: no such file",
+    "command 'c++' failed: no such file",
+    "unknown compiler(s)",
+    "no cmake_cxx_compiler could be found",
+    "no cmake_c_compiler could be found",
+)
+
+
+def _output_shows_missing_compiler(lines: Iterable[str]) -> bool:
+    """True when a failing build's own output says no compiler is installed."""
+    text = "\n".join(lines).lower()
+    return any(marker in text for marker in _MISSING_COMPILER_MARKERS)
+
+
+def _missing_compiler_remediation(platform: str = sys.platform) -> str:
+    if platform == "win32":
+        tools = (
+            "install Visual Studio Build Tools with the \"Desktop development "
+            "with C++\" workload (free from Microsoft)"
+        )
+    elif platform == "darwin":
+        tools = "run `xcode-select --install` to add Apple's Command Line Tools"
+    else:
+        tools = (
+            "install your distribution's C++ build tools (for example "
+            "`sudo apt install build-essential`)"
+        )
+    return (
+        "This engine builds part of its code on your machine and no C++ "
+        f"compiler was found. To fix it, {tools}, then re-run the install. It "
+        "resumes from where it stopped."
+    )
+
+
 def _log(job: dict, line: str) -> None:
     line = line.rstrip()
     if line:
@@ -1087,12 +1316,14 @@ def get_status(engine_id: str) -> dict:
         raise KeyError(engine_id)
     with _jobs_lock:
         job = _serialize_job(_jobs.get(engine_id))
-    installed = _healthy(spec)
+    installed = _healthy(spec, check_rocm=False)
+    repair_available = installed and not _healthy(spec)
     checkout = managed_checkout(spec)
     env_dir = os.environ.get(spec.env_var)
     return {
         "engine_id": engine_id,
         "installed": installed,
+        "repair_available": repair_available,
         # True when the on-disk install is the app-managed one (uninstallable
         # from the app). A user's own clone is never "managed".
         "managed": bool(
@@ -1121,7 +1352,7 @@ def _user_managed_dir(spec: SidecarSpec) -> Optional[Path]:
     return None
 
 
-def _healthy(spec: SidecarSpec) -> bool:
+def _healthy(spec: SidecarSpec, *, check_rocm: bool = True) -> bool:
     """A COMPLETE install: for a user-managed dir, trust the engine's own
     probe (their clone, their layout); for the app-managed install require
     the venv AND the fully-downloaded weights, so a partial install repairs
@@ -1157,9 +1388,13 @@ def _healthy(spec: SidecarSpec) -> bool:
         # where it applies (the deps step is idempotent: venv and weights
         # stay, torch is swapped). User-managed clones keep their own
         # layout; every other host keeps "installed means installed".
-        if spec.uses_rocm_index and _rocm_index_url() is not None:
+        if check_rocm and _spec_rocm_torch_args(spec) is not None:
             return _venv_torch_is_rocm(checkout / ".venv")
         return True
+    # Same repair for marker-based engines that now take a ROCm torch on this
+    # host: a venv provisioned before still carries the CUDA/CPU wheel.
+    if check_rocm and _spec_rocm_torch_args(spec) is not None and not _venv_torch_is_rocm(checkout / ".venv"):
+        return False
     return _install_marker_valid(spec, checkout)
 
 
@@ -1169,9 +1404,13 @@ def _install_marker_valid(spec: SidecarSpec, checkout: Path) -> bool:
     if not spec.install_revision:
         return marker.is_file()
     try:
-        return marker.read_text(encoding="utf-8").splitlines() == [
-            spec.probe_module, spec.install_revision,
-        ]
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        accepted = {spec.install_revision}
+        # v5 changes only requirements comments and external Torch selection.
+        # Keep working v4 installs; _healthy separately enforces HIP on AMD.
+        if spec.engine_id == "cosyvoice" and spec.install_revision == "rocm-routing-v5":
+            accepted.add("security-floors-v4")
+        return len(lines) == 2 and lines[0] == spec.probe_module and lines[1] in accepted
     except (OSError, UnicodeError):
         return False
 
@@ -1181,13 +1420,15 @@ def _persist(spec: SidecarSpec) -> None:
     use, prefs.json ``env.*`` for the next launch, and invalidate the
     engine's memoised venv resolution so it re-probes without a restart."""
     checkout = managed_checkout(spec)
-    os.environ[spec.env_var] = str(checkout)
     from core import prefs
     prefs.set_(f"env.{spec.env_var}", str(checkout))
+    os.environ[spec.env_var] = str(checkout)
     try:
         spec.invalidate()
     except Exception:
         pass  # best-effort cache invalidation — the env var is already set
+    from services.sidecar_revisions import advance
+    advance(spec.engine_id)
 
 
 def start_install(engine_id: str) -> dict:
@@ -1219,9 +1460,14 @@ def start_install(engine_id: str) -> dict:
                 _persist(spec)
             return {"status": "already_installed", "engine": engine_id}
         job = _new_job(engine_id)
+        job["_expected_env"] = os.environ.get(spec.env_var)
+        job["_preserve_existing"] = _healthy(spec, check_rocm=False)
         _jobs[engine_id] = job
+    from core import diagnostic_reports
+    # The user-started install owns its observed grant through subprocess
+    # completion and output-drain cleanup, including an explicitly OFF owner.
     th = threading.Thread(
-        target=_run_install, args=(spec, job),
+        target=diagnostic_reports.bind_callable(_run_install), args=(spec, job),
         name=f"sidecar-install-{engine_id}", daemon=True,
     )
     th.start()
@@ -1275,6 +1521,10 @@ def uninstall(engine_id: str) -> dict:
 
 
 def _run_install(spec: SidecarSpec, job: dict) -> None:
+    stage = None
+    promotion_started = False
+    original_checkout = None
+    expected_env = job.get("_expected_env", os.environ.get(spec.env_var))
     step_fns: list[tuple[str, Callable[[SidecarSpec, dict], None]]] = [
         ("preflight", _step_preflight),
         ("fetch_source", _step_fetch_source),
@@ -1285,10 +1535,42 @@ def _run_install(spec: SidecarSpec, job: dict) -> None:
         ("persist", _step_persist),
     ]
     try:
+        try:
+            if _user_managed_dir(spec) is not None:
+                raise _StepError("The engine now points to a user-managed install.",
+                                 "Repair that installation manually or restore the managed path.")
+            if job.get("_preserve_existing") or (_healthy(spec, check_rocm=False) and _spec_rocm_torch_args(spec) is not None):
+                from core import prefs
+                from services.sidecar_generations import new_generation
+                if prefs.is_env_shadowed(spec.env_var):
+                    raise _StepError("The engine path is pinned by an external environment variable.",
+                                     "Remove that external setting and restart before repairing the managed engine.")
+                original_checkout = managed_checkout(spec)
+                stage = new_generation(spec, managed_root(spec))
+                spec = stage
+        except _StepError:
+            raise
+        except Exception as exc:
+            raise _StepError(f"Could not create a separate repair: {_redact(exc)}",
+                             "Free space or check the engine directory permissions, then retry.") from exc
         for step_id, fn in step_fns:
             step = _job_step(job, step_id)
             step["state"] = "running"
             try:
+                if step_id == "fetch_source" and stage is not None:
+                    from services.sidecar_generations import copy_preserved_checkout
+                    if os.environ.get(spec.env_var) != expected_env:
+                        raise _StepError("The selected engine path changed during repair.",
+                                         "The newer selection was kept; retry only if needed.")
+                    copy_preserved_checkout(original_checkout, managed_checkout(spec), managed_root(spec))
+                if step_id == "persist" and stage is not None and os.environ.get(spec.env_var) != expected_env:
+                    raise _StepError("The selected engine path changed during repair.",
+                                     "The newer selection was kept; retry only if needed.")
+                if step_id == "persist" and stage is not None and not _venv_torch_is_rocm(managed_checkout(spec) / ".venv"):
+                    raise _StepError("The replacement does not contain ROCm Torch.",
+                                     "Check the selected package index and retry; the existing engine remains available.")
+                if step_id == "persist" and stage is not None:
+                    promotion_started = True
                 fn(spec, job)
             except _StepError:
                 step["state"] = "error"
@@ -1307,11 +1589,20 @@ def _run_install(spec: SidecarSpec, job: dict) -> None:
         job["state"] = "succeeded"
         _log(job, f"{spec.display_name} installed successfully.")
     except _StepError as exc:
+        from core import diagnostic_reports
+        diagnostic_reports.capture_failure("install", error=exc, engine_id=spec.engine_id)
         job["state"] = "failed"
         job["error"] = str(exc)
         job["remediation"] = exc.remediation
         _log(job, f"FAILED: {exc}")
     finally:
+        if stage is not None and job["state"] == "failed" and not promotion_started:
+            from services.sidecar_generations import cleanup_failed_generation
+            if os.environ.get(stage.env_var) != str(managed_checkout(stage)):
+                try:
+                    cleanup_failed_generation(stage, managed_root(stage))
+                except OSError:
+                    _log(job, "Could not remove the failed repair generation.")
         job["finished_at"] = time.time()
 
 
@@ -1548,7 +1839,7 @@ def _existing_venv_compatible(spec: SidecarSpec, py: Path) -> bool:
     try:
         result = subprocess.run(
             [str(py), "-I", "-c", "import sys; print('%s.%s' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, errors="replace", timeout=15,
         )
         version = result.stdout.strip()
         if result.returncode != 0 or not version or not all(
@@ -1598,7 +1889,7 @@ def _step_create_venv(spec: SidecarSpec, job: dict) -> None:
     # Keep uv's cache on the engines volume (D:-install class) — see
     # uv_subprocess_env. The cache parent is the shared engines root, so
     # every sidecar engine reuses one cache.
-    uv_env = uv_subprocess_env(Path(DATA_DIR) / "engines")
+    uv_env = uv_subprocess_env(Path(get_engines_dir(DATA_DIR)))
     rc = _run_logged(job, [uv, "venv", str(venv_dir), *spec.venv_args],
                      timeout=_UV_VENV_TIMEOUT_S, env=uv_env)
     if rc != 0 or not py.is_file():
@@ -1629,8 +1920,9 @@ def _step_install_deps(spec: SidecarSpec, job: dict) -> None:
         from engines.dots_tts.install import compatible_constraints
         constraint = compatible_constraints(checkout / "constraints" / "recommended.txt")
         target[target.index("-c") + 1] = constraint.resolve().as_uri()
-    if _rocm_index_url() and spec.uses_rocm_index:
-        target += _rocm_pin_args()
+    rocm_args = _spec_rocm_torch_args(spec)
+    if rocm_args is not None:
+        target += rocm_args
     elif spec.torch_pins:
         target += _torch_pin_args(spec)
     elif spec.cpu_torch_index:
@@ -1646,12 +1938,17 @@ def _step_install_deps(spec: SidecarSpec, job: dict) -> None:
         job,
         [uv, "pip", "install", "--python", str(py), *target],
         timeout=_UV_PIP_INSTALL_TIMEOUT_S,
-        env=uv_subprocess_env(Path(DATA_DIR) / "engines"),
+        env=uv_subprocess_env(Path(get_engines_dir(DATA_DIR))),
     )
     if rc != 0:
         if _output_shows_disk_full(job.get("_last_run_output") or ()):
             raise _StepError(f"uv pip install failed (exit {rc}): no space left on device.",
                              _DISK_FULL_REMEDIATION)
+        if _output_shows_missing_compiler(job.get("_last_run_output") or ()):
+            raise _StepError(
+                f"uv pip install failed (exit {rc}): no C++ compiler found.",
+                _missing_compiler_remediation(),
+            )
         hint = (
             "Usually a network hiccup — re-run the install to resume. Behind a "
             "proxy, set HTTPS_PROXY in Settings → Environment first."
@@ -1799,17 +2096,14 @@ def _step_fetch_weights(spec: SidecarSpec, job: dict) -> None:
         # other model download in the app — see setup/download.py): the
         # source checkout is unpinned upstream `main` anyway, and hf_hub
         # checksum-verifies each artifact. Hence the B615 waiver below.
-        # Unwrap to the bearer string: snapshot_download takes `token: str |
-        # None`, and a ResolvedToken record is ignored in favour of ambient
-        # discovery, so gated engine weights 401 for a user whose token lives
-        # in VoiceStudio's settings rather than HF's own cache (#2163).
-        _resolved = resolve_token()
+        # resolve() returns a record (or None); huggingface_hub needs the string.
+        _record = resolve_token()
+        _bearer = getattr(_record, "token", None) if _record else None
         endpoint = endpoint_race.effective_endpoint()
         kwargs: dict = {
             "repo_id": spec.weights_repo_id,
             "local_dir": str(wdir),
-            # Hugging Face hosts only — a mirror never receives the token.
-            "token": token_for_endpoint(endpoint, _resolved.token if _resolved else None),
+            "token": token_for_endpoint(endpoint, _bearer),
         }
         if spec.weights_revision:
             kwargs["revision"] = spec.weights_revision
@@ -1820,16 +2114,30 @@ def _step_fetch_weights(spec: SidecarSpec, job: dict) -> None:
         tqdm_cls = hf_progress.tracked_tqdm_class()
         if tqdm_cls is not None:
             kwargs["tqdm_class"] = tqdm_cls
-        try:
-            snapshot_download(**kwargs)  # nosec B615 — deliberate default-branch policy, see above
-        except Exception as exc:
-            if _is_disk_full(exc):
-                raise _StepError(f"Model weight download failed: {_redact(exc)}", _DISK_FULL_REMEDIATION) from exc
-            raise _StepError(
-                f"Model weight download failed: {_redact(exc)}",
-                "Re-run the install — the download resumes where it stopped. "
-                "Check Settings → Network (HF endpoint / proxy) if it keeps failing.",
-            ) from exc
+        for attempt in range(2):
+            try:
+                snapshot_download(**kwargs)  # nosec B615 — deliberate default-branch policy, see above
+                break
+            except Exception as exc:
+                if _is_disk_full(exc):
+                    raise _StepError(f"Model weight download failed: {_redact(exc)}", _DISK_FULL_REMEDIATION) from exc
+                # A public probe cannot prove that this repository's files
+                # work. Match setup/cache repair: only an automatic, network-
+                # classified failure that changes the winner gets one retry.
+                if attempt == 0 and endpoint_race.reselect_after_failure(spec.weights_repo_id, str(exc)):
+                    endpoint = endpoint_race.effective_endpoint()
+                    if endpoint:
+                        kwargs["endpoint"] = endpoint
+                    else:
+                        kwargs.pop("endpoint", None)
+                    kwargs["token"] = token_for_endpoint(endpoint, _bearer)
+                    _log(job, "Download endpoint changed — retrying model weights once.")
+                    continue
+                raise _StepError(
+                    f"Model weight download failed: {_redact(exc)}",
+                    "Re-run the install — the download resumes where it stopped. "
+                    "Check Settings → Network (HF endpoint / proxy) if it keeps failing.",
+                ) from exc
     finally:
         hf_progress.unregister_listener(listener_id)
         hf_progress.current_repo_id.reset(repo_token)

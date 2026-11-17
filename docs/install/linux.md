@@ -19,7 +19,32 @@ resolves anywhere, the app downloads its own checksummed static build;
 **Settings → Audio tools** shows which binaries are in use and lets you
 override them or update yt-dlp.
 
-## Install (AppImage or .deb)
+## Install (Snap, AppImage or .deb)
+
+<a id="install-snap"></a>
+
+**Snap Store** (Ubuntu and other distributions with snapd):
+
+<a href="https://snapcraft.io/voicestudio"><img src="https://snapcraft.io/en/dark/install.svg" alt="Get it from the Snap Store" height="40" /></a>
+
+or from a terminal:
+
+```bash
+sudo snap install voicestudio
+```
+
+The snap updates itself through snapd. Recording and dictation need the
+microphone interface; if VoiceStudio cannot hear you, connect it once:
+
+```bash
+sudo snap connect voicestudio:audio-record
+```
+
+The snap runs through XWayland by default because native Wayland crashed it on
+some GNOME releases. To try native Wayland, launch it with
+`VOICESTUDIO_SNAP_OZONE_PLATFORM=wayland voicestudio`; on a revision built by
+Snapcraft Builds the variable is not read, so use
+`voicestudio --ozone-platform=wayland` instead.
 
 <a id="install-appimage"></a>
 
@@ -28,14 +53,14 @@ Download a package from the
 
 | Package | File |
 |---|---|
-| AppImage (any distribution) | `VoiceStudio-Electron-<version>-linux-x64.AppImage` |
-| Debian / Ubuntu package | `VoiceStudio-Electron-<version>-linux-x64.deb` |
+| AppImage (any distribution) | `VoiceStudio-<version>-linux-x64.AppImage` |
+| Debian / Ubuntu package | `VoiceStudio-<version>-linux-x64.deb` |
 
 **AppImage:**
 
 ```bash
-chmod +x VoiceStudio-Electron-*-linux-x64.AppImage
-./VoiceStudio-Electron-*-linux-x64.AppImage
+chmod +x VoiceStudio-*-linux-x64.AppImage
+./VoiceStudio-*-linux-x64.AppImage
 ```
 
 The AppImage uses the static AppImage runtime, so it does not need `libfuse2`.
@@ -43,15 +68,27 @@ The [shell installer](script.md) (`curl -fsSL https://voicestudio.sh/install | s
 downloads the latest AppImage, verifies it against the release's
 `SHA256SUMS.txt`, and installs it as `~/.local/bin/VoiceStudio`.
 
+Current builds include the unified terminal command. Debian packages expose
+`voicestudio` through `/usr/bin` and the shell installer through `~/.local/bin`.
+A downloaded AppImage links `~/.local/bin/voicestudio` on first launch and, if
+your shell does not already search `~/.local/bin`, adds it to your shell profile
+once. Open a new terminal afterwards. `voicestudio` opens
+the app, and commands start it in the background when it is not running; no
+separate Python installation is needed. Existing custom launchers are not
+replaced; see [Terminal command](script.md#terminal-command).
+The .deb also keeps the pre-rename `voicestudio-electron` command as a link to
+`voicestudio`, so existing scripts keep working.
+
 **.deb:**
 
 ```bash
-sudo apt install ./VoiceStudio-Electron-<version>-linux-x64.deb
+sudo apt install ./VoiceStudio-<version>-linux-x64.deb
 ```
 
-The in-app updater's Linux feed carries the AppImage. Update a `.deb`
-installation by installing the newer `.deb`; remove it with your package
-manager.
+The in-app updater's Linux feed carries the AppImage, which installs a
+downloaded update when you quit. A `.deb` installation never installs on quit
+(that needs an administrator prompt); update it with **Restart** in the app or
+by installing the newer `.deb`, and remove it with your package manager.
 
 Compare any download with the release's `SHA256SUMS.txt` before installing.
 
@@ -81,7 +118,7 @@ Prerequisites:
 - **Bun** — `curl -fsSL https://bun.sh/install | bash`
 - **uv** — `curl -LsSf https://astral.sh/uv/install.sh | sh` (it provides the
   managed Python 3.11 the backend uses)
-- **Node.js 22+**, **Rust / Cargo**
+- **Node.js 22.12.0 or newer**, **Rust / Cargo**
   (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`), and the
   native development libraries used by the Electron native helper. If you use
   rustup, reopen the shell or run `source "$HOME/.cargo/env"` first.
@@ -98,18 +135,29 @@ Prerequisites:
     libXtst-devel libX11-devel libxkbcommon-devel wayland-devel openssl-devel
 
   # Arch
-  sudo pacman -S --needed base-devel alsa-lib xdotool libxtst libx11 \
-    libxkbcommon wayland openssl
+  sudo pacman -S --needed base-devel alsa-lib xdotool libxtst libx11 libxkbcommon wayland openssl
   ```
 
-  `bun run dist` also needs `readelf` (binutils) and `zsyncmake` (zsync) to
-  embed AppImage update information.
+  `bun run dist` also needs `readelf` (binutils) and `zsyncmake` (part of the
+  `zsync` package) to embed AppImage update information.
+
+  The dictation helper links the shared `libxdo` (through `enigo`'s default
+  `xdo` feature). nixpkgs' `xdotool` ships no shared `libxdo`, so the Nix flake
+  builds it — see [Nix / NixOS](#nix--nixos) below.
 
 Then, from a clone of the repository:
 
 ```bash
 git clone https://github.com/debpalash/VoiceStudio.git
 cd VoiceStudio
+node electron/scripts/node-version.mjs
+```
+
+If the Node check fails, stop here, upgrade Node.js, and reopen your terminal
+before continuing. Then install dependencies and prepare the local backend
+(skip API setup when using an external backend or an Intel Mac):
+
+```bash
 bun install
 bun run setup:api   # create the Python environment with uv
 bun run dev         # Electron with hot reload; it starts and supervises the backend
@@ -132,12 +180,37 @@ a model.
 
 ```bash
 yay -S voicestudio-bin   # or paru -S voicestudio-bin
+# Development build from the current main branch:
+yay -S voicestudio-git
 ```
 
-`voicestudio-bin` is a community-maintained AUR package that installs the
-release `.deb`; report packaging problems on its AUR page. Package-managed
-installs should set `VOICESTUDIO_DISABLE_UPDATER=1` so `pacman` handles
-updates instead of the in-app updater.
+The upstream maintainer maintains `voicestudio-bin`, which repackages the
+stable release `.deb`, and `voicestudio-git`, which builds current development
+sources. Install one variant at a time. The Git package builds the Electron
+app, native desktop bridge and pinned OmniVoice GGUF runtime; it needs a
+native toolchain, network access and sufficient disk space for the build.
+Its recipe and build instructions live in
+[`packaging/aur`](../../packaging/aur/README.md).
+
+The Git-package launcher sets `VOICESTUDIO_DISABLE_UPDATER=1` so `pacman`
+handles application updates. Set the same variable for other package-managed
+installs. Model and Python runtime setup remain explicit in the app.
+
+### Nix / NixOS
+
+A community-maintained Nix flake (built by a non-blocking CI check) provides development shells,
+an FHS environment for NixOS and a Nix-built Linux x64 app. See the
+[Nix / NixOS guide](nix.md):
+
+```bash
+nix develop .#fhs   # recommended for NixOS; `nix develop` for the plain shell
+bun run dev
+```
+
+`nix run .` launches the Nix-built app from a checkout. Its first run installs
+uv's managed Python like the AppImage does, which on NixOS needs
+[nix-ld](https://github.com/nix-community/nix-ld). Its launcher sets
+`VOICESTUDIO_DISABLE_UPDATER=1`; update it with Nix.
 
 ## ChromeOS, iPad and other devices
 
@@ -145,7 +218,7 @@ There is no native ChromeOS or iPadOS app, and VoiceStudio does not run
 inside the browser alone: the models need a real backend.
 
 - **Chromebook with Linux development environment on x86-64:** install the
-  AppImage or `.deb` ([Install](#install-appimage-or-deb)). Expect CPU-only
+  AppImage or `.deb` ([Install](#install-snap-appimage-or-deb)). Expect CPU-only
   generation (the container has no GPU access on most devices) and enough RAM
   for the model you pick. ARM Chromebooks are not supported: the Linux builds
   are x86-64 only.
@@ -208,12 +281,14 @@ AppImage no longer apply. If the window stays blank or the terminal shows GPU
 process errors, start the app once with Chromium's GPU acceleration disabled:
 
 ```bash
-./VoiceStudio-Electron-*-linux-x64.AppImage --disable-gpu
+./VoiceStudio-*-linux-x64.AppImage --disable-gpu
 ```
 
 On Wayland sessions you can also try forcing X11 (XWayland) with
 `--ozone-platform=x11`. If either flag helps, report your distribution, desktop
-and GPU driver in a GitHub issue.
+and GPU driver in a GitHub issue. Other Chromium or Electron switches given to
+the AppImage, or to `voicestudio` without a command, also go to the app, except
+the command's own options such as `--version` and `--help`, which it runs itself.
 
 ## .deb ffprobe conflict
 
@@ -236,14 +311,15 @@ If `uv` times out fetching the python-build-standalone tarball or PyPI:
 # Use a faster Python source mirror (China only — verify a current mirror)
 export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
 
-# Use a PyPI mirror
+# Use a PyPI mirror (source checkouts that resolve packages themselves; the
+# locked dependency install downloads the wheel URLs pinned in uv.lock)
 export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Or skip the download entirely if you have a compatible system Python
 export UV_PYTHON_PREFERENCE=only-system
 
 # Be tolerant of slow links
-export UV_HTTP_TIMEOUT=120
+export UV_HTTP_TIMEOUT=900
 export UV_HTTP_RETRIES=5
 ```
 
@@ -251,6 +327,8 @@ Packaged setup already tries a Python download mirror and raises the uv
 network budget automatically; set these to force a specific mirror, or before
 `bun run setup:api` in a source checkout. See
 [troubleshooting](troubleshooting.md#first-run-setup-fails-on-a-restricted-network-githubpypi-blocked).
+If the dependency download is slow or stalls, see
+[First-run setup is slow or stalls on a download](troubleshooting.md#first-run-setup-is-slow-or-stalls-on-a-download).
 
 ## AMD GPU (ROCm)
 
@@ -264,34 +342,52 @@ on CPU until you opt into the ROCm variant.
 > **Running in Docker or Podman instead?** There's a prebuilt ROCm image —
 > `ghcr.io/debpalash/voicestudio:stable-rocm` — with GPU acceleration out of the
 > box; see [docker.md](docker.md#pull-and-run-amd-gpu--rocm). The rest of this
-> section is about source/desktop installs. (VoiceStudio has no ROCm path on
-Windows; see [windows.md](windows.md#gpu-support) for what a Radeon card can
-do there.)
+> section is about source/desktop installs. Windows has its own opt-in ROCm
+> setup; see [windows-rocm.md](windows-rocm.md).
+
+**Radeon RX 9000 series (RDNA4: RX 9060 / 9070 / 9070 XT, `gfx1200`/`gfx1201`)**
+is supported natively by the ROCm build below (torch 2.10.0 from the `rocm7.1`
+index includes both architectures), so it needs no `HSA_OVERRIDE_GFX_VERSION`.
+The host needs an `amdgpu` kernel driver new enough for RDNA4 (AMD's ROCm
+6.4.1+ driver, or a recent distribution kernel); `rocminfo` listing your card
+as `gfx1200`/`gfx1201` confirms it. Never remap an RDNA4 card onto `11.0.0`:
+RDNA3 kernels cannot run on it.
 
 Ways to opt in, in order of preference:
 
 **1. Packaged app (environment variable).** Install the ROCm userspace
 (`/opt/rocm` or `rocminfo` on PATH), then launch VoiceStudio once with
 `OMNIVOICE_TORCH_VARIANT=rocm` set, for example
-`OMNIVOICE_TORCH_VARIANT=rocm ./VoiceStudio-Electron-*-linux-x64.AppImage`.
-Runtime setup then reinstalls `torch`/`torchaudio` from the ROCm wheel index
-(`https://download.pytorch.org/whl/rocm6.4` by default) right after the
-dependency sync, matched to the app's pinned `torch==2.8.0` (the rocm6.2 index
+`OMNIVOICE_TORCH_VARIANT=rocm ./VoiceStudio-*-linux-x64.AppImage`.
+Once setup finishes, the choice is saved in `~/.config/omnivoice/env`, so later
+launches and app updates keep ROCm without the variable. To leave ROCm, launch
+once with `OMNIVOICE_TORCH_VARIANT=cpu`.
+Runtime setup then reinstalls `torch`/`torchaudio`/`torchvision` from the ROCm
+wheel index (`https://download.pytorch.org/whl/rocm7.1` by default) right after
+the frozen dependency sync. That sync skips the locked CUDA Torch wheels and
+their NVIDIA runtime packages instead of downloading them before replacing
+Torch. Shared dependencies, including `nvidia-ml-py` for hardware metadata,
+stay on the locked regular index. The sync preserves a matching ROCm overlay
+on resume or repair; switching from CUDA removes its old runtime packages,
+including after an earlier switch stopped before verification.
+The ROCm wheels are matched to the app's pinned `torch==2.10.0` (the rocm6.2 index
 only ever published up to torch 2.5.1). **Settings → Performance → GPU
 acceleration** reports which PyTorch build is installed. The option is ignored
-on macOS and Windows.
+on macOS; on Windows it selects the opt-in stack in
+[windows-rocm.md](windows-rocm.md).
 
 **2. Source checkout.** `OMNIVOICE_TORCH_VARIANT=rocm bun run setup:api` swaps
 torch right after `uv sync`; `bun run dev` then starts the backend from that
 environment, and `bun run dev:api` launches it without re-syncing, so the
-wheel is not reverted (#1665). Running `bun run setup:api` without the
-variable restores the lockfile's CUDA build — a hand-swapped ROCm wheel does
-not survive it. `OMNIVOICE_TORCH_INDEX=<url>` overrides the wheel
-index when you need a different ROCm version — e.g. AMD publishes newer
-driver-matched builds (7.2.x) at `repo.radeon.com` as a `--find-links` page
-rather than a PyPI-style index:
+wheel is not reverted (#1665).
+Running `bun run setup:api` again without `OMNIVOICE_TORCH_VARIANT` restores
+the lockfile's CUDA torch build, replacing any ROCm wheel you installed by
+hand. To choose another ROCm release, set `OMNIVOICE_TORCH_INDEX=<url>`; AMD
+publishes newer driver-matched 7.2.x wheels on `repo.radeon.com` as a
+`--find-links` page rather than a PyPI-compatible index, for example:
 ```bash
-uv pip install --reinstall torch==2.8.0 torchaudio==2.8.0 \
+uv pip install --reinstall-package torch --reinstall-package torchaudio \
+  --reinstall-package torchvision torch==2.10.0 torchaudio==2.10.0 torchvision==0.25.0 \
   --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/
 ```
 run that manually if you want a specific ROCm point release; the
@@ -304,31 +400,87 @@ keeps the default torch build and warns instead of breaking the install.
 
 ```bash
 # From the project directory (source install), into VoiceStudio's uv venv.
-# Matches the app's torch==2.8.0 pin — a different ROCm point release
-# (e.g. rocm6.2, rocm7.x) may not carry that exact torch build.
-uv pip install --reinstall torch torchaudio \
-  --index-url https://download.pytorch.org/whl/rocm6.4
+# Matches the app's torch==2.10.0 pin — a different ROCm point release
+# (e.g. rocm6.4, rocm7.2) may not carry that exact torch build.
+# Swap all three torch packages together: a CUDA torchvision left beside a
+# ROCm torch fails at generation time ("operator torchvision::nms does not
+# exist"). Keep PyPI as the main index: PyTorch's index has no Pillow 13, so
+# `--index-url` with `--reinstall` cannot resolve (#3158).
+uv pip install \
+  --reinstall-package torch --reinstall-package torchaudio --reinstall-package torchvision \
+  torch==2.10.0+rocm7.1 torchaudio==2.10.0+rocm7.1 torchvision==0.25.0+rocm7.1 \
+  --extra-index-url https://download.pytorch.org/whl/rocm7.1 \
+  --index-strategy unsafe-best-match
 ```
 
 Once a ROCm build of PyTorch is in the venv, detection is automatic —
 `get_best_device()` returns the GPU (ROCm-built PyTorch reports through
 `torch.cuda.is_available()`), and VoiceStudio auto-sets
-`HSA_OVERRIDE_GFX_VERSION` for consumer cards whose GFX ID isn't in the
-official ROCm support matrix. Relaunch and **Settings → Performance → GPU acceleration** should
+`HSA_OVERRIDE_GFX_VERSION` when your card's GFX ID is missing from the
+installed wheel's architecture list. The target comes from that list, not from
+a fixed table: the closest architecture of the same generation and the same or
+an older revision (gfx1152 → gfx1100, gfx1035 → gfx1030, gfx1201 → gfx1200 on
+a wheel that only ships gfx1200). It never crosses a generation, nor RDNA1/RDNA2
+(gfx101x/gfx103x) or Vega/CDNA within gfx9, so an RDNA4
+card on a wheel without any gfx12 target gets no override and a clear message. Relaunch and **Settings → Performance → GPU acceleration** should
 report the GPU device instead of `cpu`. Verify the wheel sees your card:
 
 ```bash
 uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
+Device enumeration does not prove that GPU work succeeds. VoiceStudio also
+runs a bounded GPU self-test in a child process. If that test fails, System
+check warns. The VoiceStudio (OmniVoice), PyTorch Whisper and WhisperX loaders
+follow this test's CPU fallback, so their routing reports the failure.
+Independent loaders, including CTranslate2/faster-whisper, ONNX, external
+servers and child processes, retain their own routing; the parent test does
+not verify them. A pending or inconclusive test does not disable acceleration.
+Explicitly forcing the GPU retains the choice with a warning only for loaders
+that honor that override; WhisperX still follows its existing CPU fallback.
+Missing-kernel warnings retain their architecture-specific recovery advice.
+These checks identify a failed test, not its hardware or driver cause.
+
 Notes:
 - ROCm is exercised far less than the default CUDA/MPS/CPU paths — it works,
   but expect rough edges on consumer cards and report what you hit.
 - Unsupported GFX (e.g. some consumer RDNA cards): if it still won't run, set
-  `HSA_OVERRIDE_GFX_VERSION` yourself (e.g. `export HSA_OVERRIDE_GFX_VERSION=11.0.0`)
-  to the nearest supported architecture before launching.
-- ZLUDA (CUDA-on-ROCm translation) can work but is unsupported here — prefer a
-  native ROCm wheel.
+  `HSA_OVERRIDE_GFX_VERSION` yourself to a supported architecture **of the same
+  generation** before launching (e.g. `export HSA_OVERRIDE_GFX_VERSION=11.0.0`
+  for a gfx11xx card, `10.3.0` for a gfx103x card; RDNA1 gfx101x cannot use
+  `10.3.0`). A remap across generations cannot
+  work, so RDNA4 (gfx12xx) cards need a ROCm build that lists them instead.
+  When the build lacks your card, VoiceStudio's GPU architecture notification
+  names the exact value to try, or says that no remap exists.
+- Engines on the GPU: every PyTorch engine that runs on an NVIDIA GPU also
+  claims ROCm (OmniVoice, IndexTTS, VoxCPM2, MOSS-TTS-Nano, CosyVoice,
+  dots.tts, Confucius4, PyTorch Whisper, FunASR, NeMo Parakeet). On a ROCm
+  host the one-click installs of VoxCPM2, MOSS-TTS-Nano, CosyVoice,
+  Confucius4, dots.tts and IndexTTS put the ROCm build of the engine's own
+  pinned torch in its venv, from the PyTorch ROCm index that publishes that
+  version (2.7 → `rocm6.3`, 2.8 → `rocm6.4`, 2.11 → `rocm7.2`). An install
+  made before this may still have a CUDA or CPU wheel. A user-selected
+  sidecar repair builds and verifies a separate environment, keeping the existing
+  installation available until the replacement succeeds. The previous environment
+  remains on disk until the engine is uninstalled. A custom `OMNIVOICE_TORCH_INDEX`
+  is used exactly as provided; it must carry
+  the sidecar’s pinned Torch and torchaudio versions. The installer estimates
+  disk space using the selected Torch wheel's downloaded and unpacked sizes,
+  in addition to the engine's normal estimate. Measurements of the published
+  Linux x86-64 Python 3.11 wheels on 2026-11-07 were 25.101 GiB for
+  [Torch 2.7.0](https://download.pytorch.org/whl/rocm6.3/torch/),
+  14.873 GiB for [2.8.0](https://download.pytorch.org/whl/rocm6.4/torch/)
+  and 18.999 GiB for [2.11.0](https://download.pytorch.org/whl/rocm7.2/torch/); the guard rounds up
+  and uses the largest measured value when the version is unknown. These are
+  estimates: custom wheels, cache locations and other dependencies can differ.
+  Vulkan
+  engines (OmniVoice GGUF, CosyVoice GGUF, whisper.cpp) need no ROCm at all.
+  Faster-Whisper and WhisperX use CTranslate2, whose stock build is
+  NVIDIA-only, so on Linux ROCm they stay on the CPU; use PyTorch Whisper,
+  which auto-detection already prefers on ROCm.
+- ZLUDA (CUDA-on-ROCm translation) is not used or supported: its PyTorch
+  support is incomplete and its cuDNN path can be slower than the CPU. Use
+  the native ROCm builds above.
 
 Tracking issue: [#124](https://github.com/debpalash/VoiceStudio/issues/124).
 

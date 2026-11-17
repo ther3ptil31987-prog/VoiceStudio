@@ -85,7 +85,11 @@ def _measure_vram_mb() -> float:
     (MM2-08). The parent can't see a child's VRAM, so we self-report it in the
     pong. Degrades to 0 on CPU / when torch isn't loaded yet — never raises."""
     try:
-        import torch  # already a dep inside the indextts venv
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
         mps = getattr(torch.backends, "mps", None)
@@ -279,6 +283,16 @@ def _bf16_probe() -> bool:
     return proc.returncode == 0
 
 
+def _rocm_rdna2(torch):
+    """RDNA 2 bf16 GEMM can crash rocBLAS even when Torch claims support (#2372)."""
+    if not getattr(getattr(torch, "version", None), "hip", None):
+        return False
+    try:
+        return str(torch.cuda.get_device_properties(0).gcnArchName).lower().startswith("gfx103")
+    except Exception:  # noqa: BLE001 - unknown ROCm architecture uses safe precision
+        return True
+
+
 def _torch_bf16_supported() -> bool:
     """Return whether this sidecar can safely enable IndexTTS 2.5 BF16."""
     try:
@@ -288,6 +302,8 @@ def _torch_bf16_supported() -> bool:
         if not (torch.cuda.is_available() and supported and supported()):
             return False
         if getattr(torch.version, "hip", None):
+            if _rocm_rdna2(torch):
+                return False
             # ROCm: the claim is necessary but not sufficient — verify it in
             # a child so a Tensile segfault fails only the probe (#2372) and
             # the model falls back to fp32 (the verified workaround was
@@ -480,6 +496,18 @@ def _handle_synthesize(msg: dict, stdout) -> None:
     # has already done any vector-vs-audio-vs-text emotion priority
     # arbitration; we just forward whichever keys it sent.
     infer_kw = _build_infer_kwargs(msg, ref_audio, is_v25=_model_version == "2.5")
+    if msg.get("seed") is not None:
+        # The parent's RNG state does not cross the process boundary. Seed
+        # after model loading so initialization cannot consume this request's RNG.
+        import random
+
+        import numpy as np
+        import torch
+
+        seed = int(msg["seed"])
+        random.seed(seed)
+        np.random.seed(seed % 2**32)
+        torch.manual_seed(seed)
 
     # IndexTTS2.infer() writes to a file; we route through tempfile so
     # cleanup is automatic on success and on exit.

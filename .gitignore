@@ -7,21 +7,21 @@ __pycache__/
 *.so
 *.egg
 *.egg-info/
-.venv/
+.venv
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 dist/
 build/
+.playwright-mcp
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Node / Turborepo / Tauri
+#  Node / Tauri
 # ─────────────────────────────────────────────────────────────────────────
 node_modules/
 node_modules
-.turbo/
 bun.lockb
-frontend/src-tauri/target/
+frontend/src-tauri/
 electron/.tmp-native-target/
 native/**/target*/
 
@@ -31,6 +31,7 @@ native/**/target*/
 .env
 .env.local
 .env.*.local
+**/supermetry-app.generated.json
 
 # ─────────────────────────────────────────────────────────────────────────
 #  OS junk
@@ -119,11 +120,15 @@ examples/data*
 examples/download*
 examples/exp*/
 omnivoice.zip
-frontend/src-tauri/binaries/ffmpeg
 
 # cuDNN 8 compat libs (auto-installed by scripts/setup_cudnn.py)
 cudnn8_compat/
 test-results/
+# Local benchmark output (scripts/bench/bench.py)
+bench-results/
+
+# Nix build symlinks
+/result
 
 # Research repos (local only)
 research/
@@ -183,3 +188,18 @@ backend/assets/samples/demo/dubbing/*.src.wav
 
 # Generated Windows MSI diagnostic logs and installer payloads
 /wix-diagnostic-artifacts/
+
+# Local working copies kept out of the repo: the vssaas account/sync contract
+# handoff (canonical in vssaas) and Microsoft Store listing text drafts.
+/account_login/
+/store-*-en.txt
+
+# Local Windows GGML/Vulkan runtime DLLs built beside the TTS executable.
+/bin/ggml-*.dll
+/bin/ggml.dll
+/bin/msvcp140*.dll
+/bin/vcomp140.dll
+/bin/vcruntime140*.dll
+
+# Per-user Visual Studio Code workspace settings.
+/.vscode/settings.json

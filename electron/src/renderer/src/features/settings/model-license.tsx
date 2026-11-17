@@ -1,3 +1,4 @@
+import { useQueries } from '@tanstack/react-query';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -17,14 +18,17 @@ import {
   LICENCE_DIALOG_SURFACE,
   LicenceSection,
   ModelLicenceView,
+  modelLicenceDetailsKey,
   useModelLicenceDetails,
 } from './model-licence-view';
 import {
   canAcknowledgeModelPlan,
   modelLicenseCategory,
   modelLicenseCategoryKey,
+  modelLicenseShortKey,
   modelLicenseUrl,
   type ModelLicenceAcceptance,
+  type ModelLicenceDetails,
   type ModelLicenseInfo,
   type ModelReviewPlan,
 } from './model-license-contract';
@@ -37,21 +41,41 @@ const blockerKeys: Record<string, string> = {
   evidence_revision_mismatch: 'modelLicense.blockerMismatch',
   upstream_access_unverified: 'modelLicense.blockerAccess',
   variant_provenance_unverified: 'modelLicense.blockerVariant',
-  remote_review_unsupported: 'modelLicense.blockerRemote',
 };
+
+/** Collapsible full terms for one dependency repo, mirroring the gate dialog. */
+function DependencyLicenceView({ repoId, open }: { repoId: string; open: boolean }) {
+  const { t } = useTranslation();
+  const details = useModelLicenceDetails(repoId, open);
+  return (
+    <LicenceSection title={repoId}>
+      {details.isError ? (
+        <p role="alert" className="text-sm text-destructive">
+          {t('modelLicense.detailsFailed')}
+        </p>
+      ) : (
+        <ModelLicenceView details={details.data} infoFallback={undefined} />
+      )}
+    </LicenceSection>
+  );
+}
 
 export function ModelLicense({
   repoId,
   label,
   info,
   acceptance,
-  target,
+  dependencies,
+  triggerLabel,
 }: {
   repoId: string;
   label: string;
   info?: ModelLicenseInfo;
   acceptance?: ModelLicenceAcceptance;
-  target: string;
+  /** Other gated repos the row's engines need, offered in the same dialog (#3855). */
+  dependencies?: ModelLicenceAcceptance[];
+  /** Localized action text; category-chip callers keep their existing trigger. */
+  triggerLabel?: string;
 }) {
   const { t } = useTranslation();
   const acknowledgementId = useId();
@@ -65,7 +89,7 @@ export function ModelLicense({
   const [acknowledged, setAcknowledged] = useState(false);
   const [failed, setFailed] = useState(false);
   const [completed, setCompleted] = useState(false);
-  const ready = canAcknowledgeModelPlan(plan, repoId, target, info?.registry_digest);
+  const ready = canAcknowledgeModelPlan(plan, repoId, info?.registry_digest);
 
   // A refreshed registry/selection invalidates the preview and acknowledgement.
   // Closing during preparation also makes its eventual response unusable.
@@ -82,7 +106,7 @@ export function ModelLicense({
       generation.current += 1;
       request.current?.abort();
     };
-  }, [repoId, target, info?.registry_digest]);
+  }, [repoId, info?.registry_digest]);
 
   const close = () => {
     if (busyRef.current === 'commit') return;
@@ -110,7 +134,7 @@ export function ModelLicense({
       const result = await apiJson<ModelReviewPlan>('/models/install/prepare', {
         method: 'POST',
         signal: request.current.signal,
-        body: JSON.stringify({ repo_id: repoId, target }),
+        body: JSON.stringify({ repo_id: repoId }),
       });
       if (generation.current === current) setPlan(result);
     } catch {
@@ -137,7 +161,6 @@ export function ModelLicense({
           plan_digest: plan.plan_digest,
           acknowledged_document_ids: plan.documents.map((document) => document.id),
           acknowledged: true,
-          target,
         }),
       });
       if (result.status !== 'verified') throw new Error('Unexpected reviewed-cache result');
@@ -162,6 +185,15 @@ export function ModelLicense({
   };
 
   const details = useModelLicenceDetails(repoId, open);
+  const dependencyDetails = useQueries({
+    queries: (dependencies ?? []).map((dependency) => ({
+      queryKey: modelLicenceDetailsKey(dependency.repo_id),
+      queryFn: () =>
+        apiJson<ModelLicenceDetails>(`/models/licenses/details/${encodeURI(dependency.repo_id)}`),
+      enabled: open,
+      staleTime: 0,
+    })),
+  });
   const currentInfo = details.data?.info ?? info;
   const currentAcceptance = details.data?.acceptance ?? acceptance;
   const sourceLink = (url: string | null | undefined, text: string) => {
@@ -181,7 +213,7 @@ export function ModelLicense({
       <p className="max-w-prose">{t('modelLicense.preview')}</p>
       <p className="max-w-prose text-muted-foreground">{t('modelLicense.disclaimer')}</p>
       <p className="break-all text-xs text-muted-foreground">
-        {repoId} · {t('common.backend')}: {target}
+        {repoId} · {t('common.backend')}: local
       </p>
       {blockers.length > 0 && (
         <div className="rounded-lg border border-warning/30 bg-warning/5 p-3">
@@ -207,7 +239,9 @@ export function ModelLicense({
               <p>
                 {component.credit} · {component.license}
               </p>
-              <p className="break-all font-mono text-xs">{component.revision || t('common.unknown')}</p>
+              <p className="break-all font-mono text-xs">
+                {component.revision || t('common.unknown')}
+              </p>
               <ul className="space-y-1 text-xs">
                 {component.artifacts.map((artifact) => (
                   <li key={artifact.path} className="break-all">
@@ -276,7 +310,7 @@ export function ModelLicense({
           <Button
             variant="outline"
             className="h-auto min-h-8"
-            disabled={Boolean(busy) || target !== 'local' || !currentInfo}
+            disabled={Boolean(busy) || !currentInfo}
             onClick={() => void prepare()}
           >
             <span className="whitespace-normal">{t('modelLicense.prepare')}</span>
@@ -292,13 +326,15 @@ export function ModelLicense({
         ref={trigger}
         size="sm"
         variant="outline"
-        className="gap-1.5"
+        className={cn('gap-1.5', triggerLabel && 'text-warning')}
         onClick={() => setOpen(true)}
         title={summary}
-        aria-label={`${t('modelLicense.label')}: ${summary}; ${label}`}
+        aria-label={triggerLabel ?? `${t('modelLicense.label')}: ${summary}; ${label}`}
       >
-        <span aria-hidden="true">{t('modelLicense.label')}:</span>
         <ModelLicenseIcon category={modelLicenseCategory(currentInfo?.license_category)} />
+        <span aria-hidden="true">
+          {triggerLabel ?? t(modelLicenseShortKey(currentInfo?.license_category))}
+        </span>
       </Button>
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : close())}>
         <DialogContent
@@ -315,25 +351,39 @@ export function ModelLicense({
             </DialogTitle>
             <DialogDescription className="break-all">{repoId}</DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            <ModelLicenceView
-              details={details.data}
-              infoFallback={info}
-              extra={verifiedInstall}
-            />
-            {details.isError && (
-              <p role="alert" className="mt-3 text-sm text-destructive">
-                {t('modelLicense.detailsFailed')}
-              </p>
-            )}
-          </div>
           <LicenceAcceptanceFooter
-            models={
-              currentAcceptance ? [toAcceptable(label, currentAcceptance)] : []
-            }
+            models={[
+              ...(currentAcceptance ? [toAcceptable(label, currentAcceptance)] : []),
+              ...(dependencies ?? []).map((dependency, index) => ({
+                ...toAcceptable(dependency.repo_id, dependency),
+                // Accepting records a fingerprint the user must have been able to read.
+                termsLoaded: dependencyDetails[index]?.isSuccess === true,
+              })),
+            ]}
             onClose={close}
             closeDisabled={busy === 'commit'}
-          />
+          >
+            <div className="space-y-3 p-4">
+              <ModelLicenceView
+                details={details.data}
+                infoFallback={info}
+                extra={verifiedInstall}
+              />
+              {details.isError && (
+                <p role="alert" className="mt-3 text-sm text-destructive">
+                  {t('modelLicense.detailsFailed')}
+                </p>
+              )}
+              {/* Every licence the engine needs is inspectable, not just listed (#3855). */}
+              {(dependencies ?? []).map((dependency) => (
+                <DependencyLicenceView
+                  key={dependency.repo_id}
+                  repoId={dependency.repo_id}
+                  open={open}
+                />
+              ))}
+            </div>
+          </LicenceAcceptanceFooter>
         </DialogContent>
       </Dialog>
     </>

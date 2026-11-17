@@ -33,7 +33,7 @@ describe('blank window fallback', () => {
   it('stays aligned with every renderer locale catalogue', () => {
     const directory = join(process.cwd(), 'src/renderer/src/i18n/locales');
     const locales = readdirSync(directory).filter((file) => file.endsWith('.json'));
-    expect(locales).toHaveLength(21);
+    expect(locales).toHaveLength(22);
     for (const file of locales) {
       const locale = file.slice(0, -5);
       const catalogue = JSON.parse(readFileSync(join(directory, file), 'utf8')) as {
@@ -111,6 +111,66 @@ describe('blank window fallback', () => {
 
     expect(() => windowEvents.emit('closed')).not.toThrow();
     expect(() => stop()).not.toThrow();
+  });
+
+  it.each([
+    ['app://voicestudio/index.html#/stories', 'app://voicestudio/index.html', undefined],
+    [
+      'app://voicestudio/index.html#/audiobook?tab=projects',
+      'app://voicestudio/index.html',
+      undefined,
+    ],
+    ['http://localhost:5173/#/stories', 'http://localhost:5173/', 'http://localhost:5173'],
+  ])(
+    'recovers the current workspace instead of returning Home: %s',
+    async (currentUrl, appUrl, devOrigin) => {
+      vi.useFakeTimers();
+      const contents = Object.assign(new EventEmitter(), {
+        isDestroyed: () => false,
+        getURL: () => currentUrl,
+        executeJavaScript: vi.fn().mockResolvedValue(false),
+      });
+      const loadURL = vi.fn().mockResolvedValue(undefined);
+      const win = Object.assign(new EventEmitter(), {
+        isDestroyed: () => false,
+        webContents: contents,
+        loadURL,
+      });
+      const stop = installBlankWindowGuard(win as never, appUrl, 'en-US', devOrigin);
+
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      expect(loadURL).toHaveBeenCalledExactlyOnceWith(currentUrl);
+      await vi.advanceTimersByTimeAsync(6_000 + 12_000);
+      expect(loadURL).toHaveBeenCalledTimes(3);
+      expect(loadURL.mock.calls.every(([url]) => url === currentUrl)).toBe(true);
+      stop();
+    },
+  );
+
+  it.each([
+    'https://other.example/#/stories',
+    'app://voicestudio.evil/index.html#/stories',
+    'about:blank',
+  ])('uses the known app document when the current URL is untrusted: %s', async (currentUrl) => {
+    vi.useFakeTimers();
+    const contents = Object.assign(new EventEmitter(), {
+      isDestroyed: () => false,
+      getURL: () => currentUrl,
+      executeJavaScript: vi.fn().mockResolvedValue(false),
+    });
+    const loadURL = vi.fn().mockResolvedValue(undefined);
+    const win = Object.assign(new EventEmitter(), {
+      isDestroyed: () => false,
+      webContents: contents,
+      loadURL,
+    });
+    const stop = installBlankWindowGuard(win as never, 'app://voicestudio/index.html', 'en-US');
+
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(loadURL).toHaveBeenCalledExactlyOnceWith('app://voicestudio/index.html');
+    stop();
   });
 });
 

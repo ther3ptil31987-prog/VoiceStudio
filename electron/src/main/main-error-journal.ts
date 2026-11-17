@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { renameSyncWithRetry } from './rename-retry';
 import { scrubText } from '../shared/utils/scrub';
 
 const MAX_RECORDS = 20;
@@ -17,21 +18,33 @@ export interface MainProcessErrorSource {
     event: 'uncaughtExceptionMonitor',
     listener: (error: Error, origin: NodeJS.UncaughtExceptionOrigin) => void,
   ): unknown;
-  on(event: 'unhandledRejection', listener: (reason: unknown) => void): unknown;
+  on(
+    event: 'unhandledRejection',
+    listener: (reason: unknown, promise?: Promise<unknown>) => void,
+  ): unknown;
   removeListener(
     event: 'uncaughtExceptionMonitor',
     listener: (error: Error, origin: NodeJS.UncaughtExceptionOrigin) => void,
   ): unknown;
-  removeListener(event: 'unhandledRejection', listener: (reason: unknown) => void): unknown;
+  removeListener(
+    event: 'unhandledRejection',
+    listener: (reason: unknown, promise?: Promise<unknown>) => void,
+  ): unknown;
 }
 
 function errorDetail(error: unknown): string {
-  if (error instanceof Error)
-    return scrubText(error.stack || `${error.name}: ${error.message}`).slice(0, MAX_DETAIL);
   try {
-    return scrubText(JSON.stringify(error)).slice(0, MAX_DETAIL);
+    if (error instanceof Error)
+      return scrubText(error.stack || `${error.name}: ${error.message}`).slice(0, MAX_DETAIL);
+    let detail: string;
+    try {
+      detail = JSON.stringify(error) ?? String(error);
+    } catch {
+      detail = String(error);
+    }
+    return scrubText(detail).slice(0, MAX_DETAIL);
   } catch {
-    return scrubText(String(error)).slice(0, MAX_DETAIL);
+    return '[unavailable error details]';
   }
 }
 
@@ -74,7 +87,7 @@ export class MainErrorJournal {
       mkdirSync(dirname(this.path), { recursive: true });
       const temporary = `${this.path}.tmp`;
       writeFileSync(temporary, JSON.stringify(this.records), { encoding: 'utf8', mode: 0o600 });
-      renameSync(temporary, this.path);
+      renameSyncWithRetry(temporary, this.path);
     } catch {
       /* preserve the original fatal error */
     }

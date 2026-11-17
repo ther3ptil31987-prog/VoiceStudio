@@ -1,6 +1,7 @@
-import { AudioWaveformIcon, GitCompareArrowsIcon, WrenchIcon } from 'lucide-react';
+import { AudioLinesIcon, AudioWaveformIcon, GitCompareArrowsIcon, WrenchIcon } from 'lucide-react';
 import { SecondarySidebar } from '@/components/workspace-sidebar';
 import { ConvertVoice } from './convert-voice';
+import { SoundEffects } from './sound-effects';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { CompareVoices } from './compare-voices';
 import { useEffect, useRef, useState } from 'react';
@@ -10,6 +11,7 @@ import { SparklesIcon, TargetIcon, ActivityIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { PipelineFailure } from '@/components/pipeline-failure';
+import { DisabledReason, firstReason } from '@/components/disabled-reason';
 import { apiJson, describeError } from '@/lib/api/client';
 import { LanguagePicker } from '@/features/clone/language-picker';
 import { LANG_CODES } from '@shared/utils/languages';
@@ -42,6 +44,7 @@ export function ToolsPage() {
   const { t } = useTranslation();
   const [comparing, setComparing] = useState(false);
   const [converting, setConverting] = useState(false);
+  const [effects, setEffects] = useState(false);
   const [selected, setSelected] = useState<Tool>(tools[0]);
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -59,9 +62,10 @@ export function ToolsPage() {
             <Button
               key={tool.id}
               className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
-              variant={!converting && !comparing && selected.id === tool.id ? 'secondary' : 'ghost'}
-              aria-pressed={!converting && !comparing && selected.id === tool.id}
+              variant={!effects && !converting && !comparing && selected.id === tool.id ? 'secondary' : 'ghost'}
+              aria-pressed={!effects && !converting && !comparing && selected.id === tool.id}
               onClick={() => {
+                setEffects(false);
                 setConverting(false);
                 setComparing(false);
                 setSelected(tool);
@@ -73,9 +77,10 @@ export function ToolsPage() {
           ))}
           <Button
             className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
-            variant={!converting && comparing ? 'secondary' : 'ghost'}
-            aria-pressed={!converting && comparing}
+            variant={!effects && !converting && comparing ? 'secondary' : 'ghost'}
+            aria-pressed={!effects && !converting && comparing}
             onClick={() => {
+              setEffects(false);
               setConverting(false);
               setComparing(true);
             }}
@@ -85,16 +90,30 @@ export function ToolsPage() {
           </Button>
           <Button
             className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
-            variant={converting ? 'secondary' : 'ghost'}
-            aria-pressed={converting}
-            onClick={() => setConverting(true)}
+            variant={!effects && converting ? 'secondary' : 'ghost'}
+            aria-pressed={!effects && converting}
+            onClick={() => {
+              setEffects(false);
+              setConverting(true);
+            }}
           >
             <AudioWaveformIcon />
             {t('convert.convert')}
           </Button>
+          <Button
+            className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
+            variant={effects ? 'secondary' : 'ghost'}
+            aria-pressed={effects}
+            onClick={() => setEffects(true)}
+          >
+            <AudioLinesIcon />
+            {t('sfx.title')}
+          </Button>
         </SecondarySidebar>
         <section className="min-w-0 flex-1 overflow-y-auto px-6 py-8">
-          {converting ? (
+          {effects ? (
+            <SoundEffects />
+          ) : converting ? (
             <ConvertVoice />
           ) : comparing ? (
             <CompareVoices />
@@ -178,6 +197,7 @@ function ToolForm({ tool }: { tool: Tool }) {
         {tool.id === 'probe' ? (
           <Input
             disabled={busy}
+            placeholder={t('tools.probe_placeholder')}
             value={text}
             onChange={(event) => {
               setText(event.target.value);
@@ -186,8 +206,14 @@ function ToolForm({ tool }: { tool: Tool }) {
           />
         ) : (
           <textarea
-            className="min-h-36 w-full resize-y rounded-lg border border-input bg-transparent p-3 leading-7 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            dir="auto"
+            className="min-h-36 w-full resize-y rounded-lg border border-input bg-transparent p-3 leading-7 outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
             disabled={busy}
+            placeholder={t(
+              tool.id === 'direction'
+                ? 'tools.placeholder_direction'
+                : 'tools.placeholder_rate_fit',
+            )}
             value={text}
             onChange={(event) => {
               setText(event.target.value);
@@ -197,9 +223,10 @@ function ToolForm({ tool }: { tool: Tool }) {
         )}
       </label>
       {tool.id === 'rate-fit' && (
-        <div className="flex flex-wrap items-end gap-4">
-          <label className="space-y-2 text-sm">
-            <span>{t('tools.slot_seconds')}</span>
+        // One row of equal-height fields with their labels on the same baseline.
+        <div className="grid grid-cols-[minmax(0,10rem)_minmax(0,16rem)] items-start gap-4 max-sm:grid-cols-1">
+          <label className="block space-y-2 text-sm">
+            <span className="block">{t('tools.slot_seconds')}</span>
             <Input
               type="number"
               min="0.1"
@@ -212,8 +239,8 @@ function ToolForm({ tool }: { tool: Tool }) {
               }}
             />
           </label>
-          <div className="space-y-2 text-sm">
-            <p>{t('tools.target_language')}</p>
+          <div role="group" aria-label={t('tools.target_language')} className="space-y-2 text-sm">
+            <p aria-hidden="true">{t('tools.target_language')}</p>
             <LanguagePicker
               value={language}
               options={options}
@@ -226,9 +253,23 @@ function ToolForm({ tool }: { tool: Tool }) {
           </div>
         </div>
       )}
-      <Button type="submit" disabled={busy || !valid}>
-        {t(busy ? 'common.loading' : 'tools.' + tool.action)}
-      </Button>
+      <DisabledReason
+        reason={firstReason([
+          [
+            !text.trim(),
+            t(
+              tool.id === 'probe' ? 'disabledReason.path_required' : 'disabledReason.text_required',
+            ),
+          ],
+          [!valid, t('disabledReason.slot_required')],
+        ])}
+      >
+        {(describedBy) => (
+          <Button type="submit" disabled={busy || !valid} aria-describedby={describedBy}>
+            {t(busy ? 'common.loading' : 'tools.' + tool.action)}
+          </Button>
+        )}
+      </DisabledReason>
       {error && <PipelineFailure fallback={error} onDismiss={() => setError(null)} />}
       {tool.id === 'probe' && (
         <Link to="/settings/media" className="block text-sm text-primary hover:underline">

@@ -17,6 +17,7 @@ const FALLBACK_COPY: Record<string, FallbackCopy> = {
   en: { title: 'Something went wrong', retry: 'Try again' },
   es: { title: 'algo salió mal', retry: 'Inténtalo de nuevo' },
   fr: { title: "Quelque chose s'est mal passé", retry: 'Réessayez' },
+  gl: { title: 'Erro', retry: 'Téntao de novo' },
   hi: { title: 'कुछ ग़लत हो गया', retry: 'पुनः प्रयास करें' },
   id: { title: 'Ada yang tidak beres', retry: 'Coba lagi' },
   it: { title: 'Qualcosa è andato storto', retry: 'Riprova' },
@@ -31,7 +32,7 @@ const FALLBACK_COPY: Record<string, FallbackCopy> = {
   tr: { title: 'Bir şeyler ters gitti', retry: 'Tekrar dene' },
   uk: { title: 'Щось пішло не так', retry: 'Спробуйте знову' },
   vi: { title: 'Đã xảy ra lỗi', retry: 'Thử lại' },
-  'zh-CN': { title: '出了点问题', retry: '再试一次' },
+  'zh-CN': { title: '出现了问题', retry: '再试一次' },
   'zh-TW': { title: '出了點問題', retry: '再試一次' },
 };
 
@@ -103,6 +104,21 @@ export function installBlankWindowGuard(
   // that began on an older page can never trigger recovery for a newer one.
   let generation = 0;
 
+  const recoveryUrl = () => {
+    try {
+      const current = contents.getURL();
+      if (!isTrustedRenderer(current, devOrigin)) return appUrl;
+      // The router stores the workspace in the hash. Keep that route while
+      // loading the known app document, so recovery does not send a working
+      // Stories/Audiobook session back to Home.
+      const target = new URL(appUrl);
+      target.hash = new URL(current).hash;
+      return target.href;
+    } catch {
+      return appUrl;
+    }
+  };
+
   const schedule = (delay: number) => {
     if (stopped || win.isDestroyed()) return;
     if (timer) clearTimeout(timer);
@@ -130,7 +146,7 @@ export function installBlankWindowGuard(
     reloads += 1;
     if (reloads <= MAX_RELOADS) {
       console.warn(`[window] empty renderer; reload ${reloads}/${MAX_RELOADS}`);
-      void win.loadURL(appUrl).catch(() => {});
+      void win.loadURL(recoveryUrl()).catch(() => {});
       schedule(RETRY_BASE_MS * reloads);
       return;
     }

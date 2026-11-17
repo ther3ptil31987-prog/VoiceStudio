@@ -61,11 +61,11 @@ A 6 GB card with nothing else loaded runs the default model on the GPU
 ([#2041](https://github.com/debpalash/VoiceStudio/issues/2041)). Disable
 the check with `OMNIVOICE_ASR_VRAM_PREFLIGHT=0`.
 
-The preflight sizes the weights; the generation workspace grows with the
-batch on top. If a transcribe still hits a CUDA out-of-memory, the engine
-steps the batch down (16 → 4 → 1, or 8 → 2 → 1 with word timestamps) and
-finishes on the CPU rather than dropping the chunk — no silent holes in a
-dub transcript.
+If a GPU run still runs out of memory (the preflight only sizes the model
+weights, not activations), the backend retries the same audio with smaller
+batches instead of failing: 16, then 4, then 1, or 8, then 2, then 1 when word
+timestamps are requested. If even batch size 1 does not fit, the pipeline moves
+to the CPU and finishes there, so no chunk is dropped.
 
 ## Quirks
 
@@ -77,6 +77,8 @@ dub transcript.
   [#1376](https://github.com/debpalash/VoiceStudio/issues/1376)).
 - Transcribes are time-bounded like every local engine:
   `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (default 120 s per dub chunk),
-  `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s whole-file).
+  `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s whole-file floor).
+  Whole files allow at least twice their duration; see
+  [timeout settings](../install/troubleshooting.md).
 
 Speed comparisons across engines live in [performance](../performance.md).

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from api.dependencies import require_admin
+from api.dependencies import require_admin, require_consumer
 from core.browser_guard import reject_cross_site_get
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
@@ -25,14 +25,14 @@ class PrepareRequest(BaseModel):
 
 class AcceptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    repo_id: str = Field(min_length=3, max_length=200, pattern=r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+    repo_id: str = Field(min_length=3, max_length=200, pattern=r"^[A-Za-z0-9][\w.-]*/[\w.-]+(?::[\w.-]+)?$")
     fingerprint: str = Field(pattern=r"^v2:[a-f0-9]{64}$")
     accepted: StrictBool
 
 
 class RevokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    repo_id: str = Field(min_length=3, max_length=200, pattern=r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+    repo_id: str = Field(min_length=3, max_length=200, pattern=r"^[A-Za-z0-9][\w.-]*/[\w.-]+(?::[\w.-]+)?$")
 
 
 class CommitRequest(BaseModel):
@@ -78,12 +78,13 @@ def _fetch_file(repo_id: str, revision: str, filename: str,
     if not local_only:
         resolved = resolve()
         token = token_for_endpoint(endpoint, resolved.token if resolved else None) or False
-    return hf_hub_download(repo_id=repo_id, revision=revision, filename=filename,
+    # A package record (`<repo>:<package>`) downloads from its Hub repo.
+    return hf_hub_download(repo_id=repo_id.split(":", 1)[0], revision=revision, filename=filename,
                            endpoint=endpoint, token=token, local_files_only=local_only,
                            cache_dir=cache_dir)
 
 
-@router.post("/models/install/prepare")
+@router.post("/models/install/prepare", dependencies=[Depends(require_consumer)])
 def prepare_model_install(req: PrepareRequest) -> dict:
     """Read bundled evidence only; never resolve/download model weights."""
     try:
@@ -92,7 +93,7 @@ def prepare_model_install(req: PrepareRequest) -> dict:
         raise _fail(exc) from exc
 
 
-@router.post("/models/install/commit")
+@router.post("/models/install/commit", dependencies=[Depends(require_consumer)])
 def commit_model_install(req: CommitRequest) -> dict:
     """Persist acknowledgement before a bounded exact-file reviewed transfer.
 
@@ -126,7 +127,7 @@ def export_model_receipt(plan_digest: str, response: Response) -> dict:
         raise _fail(exc) from exc
 
 
-@router.delete("/models/licenses/receipts/{plan_digest}")
+@router.delete("/models/licenses/receipts/{plan_digest}", dependencies=[Depends(require_admin)])
 def remove_model_receipt(plan_digest: str) -> dict:
     """Remove local acknowledgement only; keep files and historical evidence."""
     try:
@@ -136,7 +137,7 @@ def remove_model_receipt(plan_digest: str) -> dict:
         raise _fail(exc) from exc
 
 
-@router.post("/models/licenses/verify/{plan_digest}")
+@router.post("/models/licenses/verify/{plan_digest}", dependencies=[Depends(require_admin)])
 def verify_model_install(plan_digest: str) -> dict:
     """Explicit verification helper; legacy first-use/SDKs do not yet call it."""
     try:

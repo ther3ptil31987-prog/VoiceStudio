@@ -1,18 +1,21 @@
+import { ProjectHandoff } from './project-handoff';
 import { SecondarySidebar } from '@/components/workspace-sidebar';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
-import { AudioPreviewButton } from '@/components/audio-preview-button';
+import { PlayInDockButton } from '@/components/now-playing-dock';
+import { takePlaybackKind } from '@/lib/audio/playback-kind';
 import { PipelineFailure } from '@/components/pipeline-failure';
 import { ProfileAvatar } from '@/components/profile-avatar';
 import { getBridge } from '@/components/bridge';
 import {
   blankLongformDraft,
   editLongform,
+  replaceLongformDraft,
   longformSession,
   useLongformSession,
   type Mode,
 } from '../longform/longform-session';
 import { projectLibrary } from '../longform/project-library';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -29,7 +32,6 @@ import {
   ListIcon,
   MicIcon,
   PencilIcon,
-  SaveIcon,
   SearchIcon,
   TrashIcon,
 } from 'lucide-react';
@@ -45,6 +47,7 @@ import {
 import { useDeleteProfile } from '@/hooks/use-profiles';
 import { deleteHistoryItem } from '@/lib/api/history';
 import { Input } from '@/components/ui/input';
+import { VirtualGrid, VirtualList } from '@/components/virtual-list';
 import { apiJson, apiPath, describeError } from '@/lib/api/client';
 import { runRendererTask } from '@/lib/global-error-recovery';
 import { isImeComposing } from '@/lib/ime';
@@ -66,18 +69,16 @@ import {
   attachDubProject,
   detachDubProject,
 } from '../dub/dub-session';
-import { projectPayload, type DubProject } from './project-format';
-import { RenderDetails, renderRecipe, type RenderRecord } from './render-details';
+import type { DubProject } from './project-format';
+import { RenderDisclosure, renderRecipe, type RenderRecord } from './render-details';
 
-type LibraryKind =
-  | 'dub'
-  | 'stories'
-  | 'audiobooks'
-  | 'profiles'
-  | 'transcripts'
-  | 'history'
-  | 'exports';
-type Filter = 'all' | LibraryKind;
+import {
+  LIBRARY_KINDS,
+  countByFilter,
+  matchesFilter,
+  type Filter,
+  type LibraryKind,
+} from './library-filter';
 
 interface ExportRecord {
   id: string;
@@ -130,7 +131,6 @@ export function ProjectsPage() {
   const history = useHistory();
   const [transcripts, setTranscripts] = useState<TranscriptEntry[]>(loadTranscriptions);
   const [rename, setRename] = useState('');
-  const [name, setName] = useState(session.project?.name || session.filename);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [view, setView] = useState<'grid' | 'list'>('list');
@@ -144,10 +144,10 @@ export function ProjectsPage() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletedCount, setDeletedCount] = useState(0);
   const cancelDelete = useRef<HTMLButtonElement>(null);
+  const scrollRef = useRef<HTMLElement>(null);
   const [busy, setBusy] = useState(false);
   const pending = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
   const query = useQuery({
     queryKey: ['projects'],
     queryFn: ({ signal }) => apiJson<DubProject[]>('/projects', { signal }),
@@ -179,7 +179,6 @@ export function ProjectsPage() {
     pending.current = true;
     setBusy(true);
     setError(null);
-    setSaved(false);
     try {
       await work();
       await Promise.all([
@@ -193,18 +192,6 @@ export function ProjectsPage() {
       setBusy(false);
     }
   };
-  const save = (copy: boolean) =>
-    act(async () => {
-      const snapshot = session;
-      const payload = projectPayload(snapshot, name);
-      const id = copy ? undefined : snapshot.project?.id;
-      const result = await apiJson<{ id: string }>(
-        '/projects' + (id ? '/' + encodeURIComponent(id) : ''),
-        { method: id ? 'PUT' : 'POST', body: JSON.stringify(payload) },
-      );
-      attachDubProject(snapshot, { ...payload, id: result.id });
-      setSaved(true);
-    });
   const apply = () =>
     act(async () => {
       if (!confirm) return;
@@ -216,7 +203,7 @@ export function ProjectsPage() {
             (project) => project.id === confirm.id,
           );
           if (!project || longformSession.state.active) throw new Error('Project unavailable');
-          editLongform(project.mode, {
+          replaceLongformDraft(project.mode, {
             ...blankLongformDraft(),
             ...structuredClone(project.draft),
             projectId: project.id,
@@ -237,7 +224,6 @@ export function ProjectsPage() {
               ...session.project,
               name: rename.trim(),
             });
-            setName(rename.trim());
           }
         } else {
           const project = await apiJson<DubProject>(path);
@@ -326,7 +312,8 @@ export function ProjectsPage() {
         name: project.name,
         kind: project.mode === 'stories' ? 'stories' : 'audiobooks',
         projectKind: project.mode,
-        subtitle: t(project.mode === 'stories' ? 'nav.stories' : 'audiobook.title'),
+        // The type label already says Stories or Audiobooks; no second copy of it.
+        subtitle: '',
         updatedAt: timestamp(project.updatedAt),
       });
     }
@@ -383,10 +370,7 @@ export function ProjectsPage() {
         id: render.job_id,
         name: render.title || render.output,
         kind: render.type === 'story' ? 'stories' : 'audiobooks',
-        // Voice · speed · engine · length: what tells two renders of a book apart.
-        subtitle:
-          renderRecipe(render) ||
-          t(render.type === 'story' ? 'projects.story' : 'projects.audiobook'),
+        subtitle: renderRecipe(render),
         updatedAt: timestamp(render.created_at),
         render,
       });
@@ -403,22 +387,9 @@ export function ProjectsPage() {
     transcripts,
   ]);
 
-  const counts = useMemo(() => {
-    const next: Record<Filter, number> = {
-      all: rows.length,
-      dub: 0,
-      stories: 0,
-      audiobooks: 0,
-      profiles: 0,
-      transcripts: 0,
-      history: 0,
-      exports: 0,
-    };
-    for (const row of rows) next[row.kind]++;
-    return next;
-  }, [rows]);
+  const counts = useMemo(() => countByFilter(rows.map((row) => row.kind)), [rows]);
   const visible = rows.filter((row) => {
-    if (filter !== 'all' && row.kind !== filter) return false;
+    if (!matchesFilter(row.kind, filter)) return false;
     const term = search.trim().toLocaleLowerCase();
     return !term || `${row.name} ${row.subtitle}`.toLocaleLowerCase().includes(term);
   });
@@ -428,7 +399,7 @@ export function ProjectsPage() {
     label: string;
     icon: typeof FolderOpenIcon;
   }[] = [
-    { id: 'all', label: t('projects.all'), icon: FolderOpenIcon },
+    { id: 'all', label: t('projects.all_projects'), icon: FolderOpenIcon },
     { id: 'dub', label: t('projects.dub_projects'), icon: FilmIcon },
     { id: 'stories', label: t('projects.stories'), icon: AudioLinesIcon },
     { id: 'audiobooks', label: t('projects.audiobooks'), icon: BookOpenIcon },
@@ -467,6 +438,8 @@ export function ProjectsPage() {
       text: take.text,
       language: take.language || 'Auto',
       selectedProfileId: take.profile_id,
+      // Never carry the previous voice's transcript onto the reused take's voice.
+      refText: profiles.data?.find((profile) => profile.id === take.profile_id)?.ref_text ?? '',
       instruct: take.instruct || '',
     });
     await navigate({ to: '/clone' });
@@ -485,6 +458,20 @@ export function ProjectsPage() {
     <div className="flex h-full min-h-0 flex-col">
       <WorkspaceHeader>
         <h1 className="text-sm font-medium">{t('projects.title')}</h1>
+        <div className="ms-auto">
+          <ProjectHandoff
+            disabled={locked}
+            selection={
+              selectedRows.length === 1 && selectedRows[0].projectKind
+                ? {
+                    id: selectedRows[0].id,
+                    kind: selectedRows[0].projectKind,
+                    name: selectedRows[0].name,
+                  }
+                : undefined
+            }
+          />
+        </div>
       </WorkspaceHeader>
       <div className="flex min-h-0 flex-1 @max-[40rem]:flex-col">
         <SecondarySidebar
@@ -496,68 +483,33 @@ export function ProjectsPage() {
           {filterItems.map((item) => {
             const Icon = item.icon;
             return (
-              <Button
-                key={item.id}
-                className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
-                variant={filter === item.id ? 'secondary' : 'ghost'}
-                aria-pressed={filter === item.id}
-                onClick={() => {
-                  setFilter(item.id);
-                  setSelected(new Set());
-                }}
-              >
-                <Icon />
-                <span className="min-w-0 flex-1 truncate text-left">{item.label}</span>
-                <span className="rounded-md bg-background/45 px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground">
-                  {counts[item.id]}
-                </span>
-              </Button>
+              <Fragment key={item.id}>
+                {item.id === LIBRARY_KINDS[0] && (
+                  <p className="px-2.5 pt-3 pb-1 text-[11px] font-medium text-muted-foreground">
+                    {t('projects.library_group')}
+                  </p>
+                )}
+                <Button
+                  className="h-9 w-full justify-start gap-2.5 rounded-lg px-2.5 font-normal [&_svg]:text-muted-foreground"
+                  variant={filter === item.id ? 'secondary' : 'ghost'}
+                  aria-pressed={filter === item.id}
+                  onClick={() => {
+                    setFilter(item.id);
+                    setSelected(new Set());
+                  }}
+                >
+                  <Icon />
+                  <span className="min-w-0 flex-1 truncate text-left">{item.label}</span>
+                  <span className="rounded-md bg-background/45 px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground">
+                    {counts[item.id]}
+                  </span>
+                </Button>
+              </Fragment>
             );
           })}
         </SecondarySidebar>
-        <section className="min-w-0 flex-1 overflow-y-auto p-6">
+        <section ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto p-6">
           <div className="mx-auto max-w-6xl space-y-5">
-            {session.jobId && (
-              <form
-                className="space-y-3 rounded-xl border border-border/50 bg-card/35 p-4"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void save(false);
-                }}
-              >
-                <label htmlFor="project-name" className="text-sm font-medium">
-                  {t('sidebar.save_project')}
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  <Input
-                    id="project-name"
-                    value={name}
-                    onChange={(event) => setName(event.target.value)}
-                    disabled={locked}
-                    className="min-w-48 flex-1"
-                  />
-                  <Button type="submit" disabled={locked || !name.trim()}>
-                    <SaveIcon />
-                    {t('common.save')}
-                  </Button>
-                  {session.project && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={locked || !name.trim()}
-                      onClick={() => void save(true)}
-                    >
-                      {t('sidebar.save_new_project')}
-                    </Button>
-                  )}
-                </div>
-                {saved && (
-                  <p role="status" className="text-sm text-muted-foreground">
-                    {t('app.toast_project_saved')}
-                  </p>
-                )}
-              </form>
-            )}
             <div className="flex items-center gap-2">
               <div className="relative min-w-0 flex-1">
                 <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -663,249 +615,263 @@ export function ProjectsPage() {
                 {search ? t('projects.no_matches', { query: search }) : t('projects.empty')}
               </p>
             )}
-            <div
-              className={
-                view === 'grid'
-                  ? 'grid grid-cols-[repeat(auto-fill,minmax(min(280px,100%),1fr))] gap-3'
-                  : 'divide-y divide-border/50'
-              }
-            >
-              {visible.map((row) => {
-                const typeLabel = t(
-                  row.kind === 'dub'
-                    ? 'projects.dub_projects'
-                    : row.kind === 'stories'
-                      ? 'projects.stories'
-                      : row.kind === 'audiobooks'
-                        ? 'projects.audiobooks'
-                        : row.kind === 'profiles'
-                          ? 'projects.voice_profiles'
-                          : row.kind === 'transcripts'
-                            ? 'projects.transcripts'
-                            : row.kind === 'history'
-                              ? 'projects.history'
-                              : 'projects.exports',
-                );
-                return (
-                  <article
-                    key={row.key}
-                    className={
-                      view === 'grid'
-                        ? 'flex min-w-0 flex-col gap-4 rounded-xl border border-border/50 bg-card/35 p-4'
-                        : 'flex min-w-0 flex-wrap items-center gap-3 py-3'
-                    }
-                  >
-                    <div className="flex min-w-0 flex-1 items-center gap-3">
-                      <input
-                        type="checkbox"
-                        className="size-4 shrink-0 accent-primary"
-                        disabled={locked}
-                        aria-label={t('projects.select_item', { name: row.name })}
-                        checked={selected.has(row.key)}
-                        onChange={(event) => {
-                          const checked = event.target.checked;
-                          setSelected((current) => {
-                            const next = new Set(current);
-                            if (checked) next.add(row.key);
-                            else next.delete(row.key);
-                            return next;
-                          });
-                        }}
-                      />
-                      {row.profile ? (
-                        <ProfileAvatar name={row.profile.name} imageUrl={row.profile.image_url} />
-                      ) : (
-                        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground">
-                          {row.kind === 'dub' ? (
-                            <FilmIcon className="size-4" />
-                          ) : row.kind === 'audiobooks' ? (
-                            <BookOpenIcon className="size-4" />
-                          ) : row.kind === 'profiles' ? (
-                            <FingerprintIcon className="size-4" />
-                          ) : row.kind === 'transcripts' ? (
-                            <FileTextIcon className="size-4" />
-                          ) : row.kind === 'exports' ? (
-                            <DownloadIcon className="size-4" />
-                          ) : (
-                            <AudioLinesIcon className="size-4" />
-                          )}
-                        </div>
-                      )}
-                      <div className="min-w-0 flex-1">
-                        {row.projectKind ? (
-                          <Button
-                            className="h-auto max-w-full justify-start p-0 text-left font-medium whitespace-normal hover:bg-transparent"
-                            variant="ghost"
-                            disabled={locked}
-                            onClick={() =>
-                              setConfirm({
-                                id: row.id,
-                                kind: row.projectKind!,
-                                action: 'open',
-                              })
-                            }
-                          >
-                            <span className="line-clamp-2">{row.name}</span>
-                          </Button>
-                        ) : (
-                          <h2 className="line-clamp-2 text-sm font-medium">{row.name}</h2>
-                        )}
-                        <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-                          <span>{typeLabel}</span>
-                          {row.subtitle && <span>{row.subtitle}</span>}
-                          {row.updatedAt > 0 && (
-                            <span className="inline-flex items-center gap-1">
-                              <ClockIcon className="size-3" />
-                              {when(row.updatedAt)}
-                            </span>
-                          )}
-                        </p>
-                        {row.render && (
-                          <details className="mt-1.5">
-                            <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-                              {t('projects.render_details')}
-                            </summary>
-                            <div className="mt-2">
-                              <RenderDetails render={row.render} />
-                            </div>
-                          </details>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1">
-                      {row.profile && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void useProfile(row.profile!)}
-                        >
-                          {t('clone.select_profile')}
-                        </Button>
-                      )}
-                      {row.transcript && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => {
-                            const transcript = row.transcript!;
-                            patchCloneSettings({
-                              text: preferredTranscript(transcript),
-                              ...(transcript.language && transcript.language !== 'unknown'
-                                ? { language: transcript.language }
-                                : {}),
+            <div>
+              {(() => {
+                const renderRow = (row: (typeof visible)[number]) => {
+                  const typeLabel = t(
+                    row.kind === 'dub'
+                      ? 'projects.dub_projects'
+                      : row.kind === 'stories'
+                        ? 'projects.stories'
+                        : row.kind === 'audiobooks'
+                          ? 'projects.audiobooks'
+                          : row.kind === 'profiles'
+                            ? 'projects.voice_profiles'
+                            : row.kind === 'transcripts'
+                              ? 'projects.transcripts'
+                              : row.kind === 'history'
+                                ? 'projects.history'
+                                : 'projects.exports',
+                  );
+                  return (
+                    <article
+                      key={row.key}
+                      className={
+                        view === 'grid'
+                          ? 'flex min-w-0 flex-col gap-4 rounded-xl border border-border/50 bg-card/35 p-4'
+                          : 'flex min-w-0 flex-wrap items-center gap-3 py-3'
+                      }
+                    >
+                      <div className="flex min-w-0 flex-1 items-center gap-3">
+                        <input
+                          type="checkbox"
+                          className="size-4 shrink-0 accent-primary"
+                          disabled={locked}
+                          aria-label={t('projects.select_item', { name: row.name })}
+                          checked={selected.has(row.key)}
+                          onChange={(event) => {
+                            const checked = event.target.checked;
+                            setSelected((current) => {
+                              const next = new Set(current);
+                              if (checked) next.add(row.key);
+                              else next.delete(row.key);
+                              return next;
                             });
-                            runRendererTask('Open profile in voice cloning', () =>
-                              navigate({ to: '/clone' }),
-                            );
                           }}
-                        >
-                          <FileTextIcon />
-                          {t('clone.text_label')}
-                        </Button>
-                      )}
-                      {row.take && (
-                        <>
-                          <AudioPreviewButton
-                            src={apiPath('/audio/' + encodeURIComponent(row.take.audio_path))}
-                            source={'projects-take-' + row.take.id}
-                          />
+                        />
+                        {row.profile ? (
+                          <ProfileAvatar name={row.profile.name} imageUrl={row.profile.image_url} />
+                        ) : (
+                          <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground">
+                            {row.kind === 'dub' ? (
+                              <FilmIcon className="size-4" />
+                            ) : row.kind === 'audiobooks' ? (
+                              <BookOpenIcon className="size-4" />
+                            ) : row.kind === 'profiles' ? (
+                              <FingerprintIcon className="size-4" />
+                            ) : row.kind === 'transcripts' ? (
+                              <FileTextIcon className="size-4" />
+                            ) : row.kind === 'exports' ? (
+                              <DownloadIcon className="size-4" />
+                            ) : (
+                              <AudioLinesIcon className="size-4" />
+                            )}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          {row.projectKind ? (
+                            <Button
+                              className="h-auto max-w-full justify-start p-0 text-left font-medium whitespace-normal hover:bg-transparent"
+                              variant="ghost"
+                              disabled={locked}
+                              onClick={() =>
+                                setConfirm({
+                                  id: row.id,
+                                  kind: row.projectKind!,
+                                  action: 'open',
+                                })
+                              }
+                            >
+                              <span className="line-clamp-2">{row.name}</span>
+                            </Button>
+                          ) : (
+                            <h2 className="line-clamp-2 text-sm font-medium">{row.name}</h2>
+                          )}
+                          <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                            <span>{typeLabel}</span>
+                            {row.subtitle && <span>{row.subtitle}</span>}
+                            {row.updatedAt > 0 && (
+                              <span className="inline-flex items-center gap-1">
+                                <ClockIcon className="size-3" />
+                                {when(row.updatedAt)}
+                              </span>
+                            )}
+                          </p>
+                          {row.render ? <RenderDisclosure render={row.render} /> : null}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {row.profile && (
                           <Button
                             size="sm"
                             variant="outline"
-                            onClick={() => void reuseTake(row.take!)}
+                            onClick={() => void useProfile(row.profile!)}
                           >
-                            {t('clone.history_reuse')}
+                            {t('clone.select_profile')}
                           </Button>
-                        </>
-                      )}
-                      {row.export && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void reveal(row.export!)}
-                        >
-                          <FolderOpenIcon />
-                          {t('clone.reveal')}
-                        </Button>
-                      )}
-                      {row.render && (
-                        <AudioPreviewButton
-                          src={apiPath('/audio/' + encodeURIComponent(row.render.output))}
-                          source={'projects-render-' + row.render.job_id}
-                        />
-                      )}
-                      {row.projectKind && (
-                        <>
+                        )}
+                        {row.transcript && (
                           <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={t('sidebar.rename') + ' ' + row.name}
-                            disabled={locked}
+                            size="sm"
+                            variant="outline"
                             onClick={() => {
-                              setRename(row.name);
-                              setConfirm({
-                                id: row.id,
-                                kind: row.projectKind!,
-                                action: 'rename',
+                              const transcript = row.transcript!;
+                              patchCloneSettings({
+                                text: preferredTranscript(transcript),
+                                ...(transcript.language && transcript.language !== 'unknown'
+                                  ? { language: transcript.language }
+                                  : {}),
                               });
+                              runRendererTask('Open profile in voice cloning', () =>
+                                navigate({ to: '/clone' }),
+                              );
                             }}
                           >
-                            <PencilIcon />
+                            <FileTextIcon />
+                            {t('clone.text_label')}
                           </Button>
-                        </>
-                      )}
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t('common.delete') + ' ' + row.name}
-                        disabled={locked}
-                        onClick={() => requestDelete([row])}
-                      >
-                        <TrashIcon />
-                      </Button>
-                    </div>
-                    {row.projectKind &&
-                      confirm?.id === row.id &&
-                      confirm.kind === row.projectKind && (
-                        <div className="flex w-full flex-wrap items-center gap-3 rounded-lg bg-muted/40 p-3 text-sm">
-                          {confirm.action === 'rename' ? (
-                            <Input
-                              className="min-w-48 flex-1"
-                              autoFocus
-                              aria-label={t('stories.projectName')}
-                              value={rename}
-                              onChange={(event) => setRename(event.target.value)}
-                              disabled={locked}
-                              onKeyDown={(event) => {
-                                if (isImeComposing(event)) return;
-                                if (event.key === 'Enter' && rename.trim()) void apply();
-                                if (event.key === 'Escape') setConfirm(null);
-                              }}
+                        )}
+                        {row.take && (
+                          <>
+                            <PlayInDockButton
+                              src={apiPath('/audio/' + encodeURIComponent(row.take.audio_path))}
+                              source={'take-' + row.take.id}
+                              title={row.name}
+                              kind={takePlaybackKind(row.take.mode)}
+                              duration={row.take.duration_seconds}
                             />
-                          ) : (
-                            <span className="flex-1">
-                              {t('projectActions.open', { name: row.name })}
-                            </span>
-                          )}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => void reuseTake(row.take!)}
+                            >
+                              {t('clone.history_reuse')}
+                            </Button>
+                          </>
+                        )}
+                        {row.export && (
                           <Button
-                            variant="default"
-                            disabled={locked || (confirm.action === 'rename' && !rename.trim())}
-                            onClick={() => void apply()}
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void reveal(row.export!)}
                           >
-                            {t(
-                              confirm.action === 'rename'
-                                ? 'sidebar.rename_save'
-                                : 'common.confirm',
+                            <FolderOpenIcon />
+                            {t('clone.reveal')}
+                          </Button>
+                        )}
+                        {row.render && (
+                          <PlayInDockButton
+                            src={apiPath('/audio/' + encodeURIComponent(row.render.output))}
+                            source={'projects-render-' + row.render.job_id}
+                            title={row.name}
+                            kind={row.render.type === 'story' ? 'story' : 'audiobook'}
+                          />
+                        )}
+                        {row.projectKind && (
+                          <>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={t('sidebar.rename') + ' ' + row.name}
+                              disabled={locked}
+                              onClick={() => {
+                                setRename(row.name);
+                                setConfirm({
+                                  id: row.id,
+                                  kind: row.projectKind!,
+                                  action: 'rename',
+                                });
+                              }}
+                            >
+                              <PencilIcon />
+                            </Button>
+                          </>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t('common.delete') + ' ' + row.name}
+                          disabled={locked}
+                          onClick={() => requestDelete([row])}
+                        >
+                          <TrashIcon />
+                        </Button>
+                      </div>
+                      {row.projectKind &&
+                        confirm?.id === row.id &&
+                        confirm.kind === row.projectKind && (
+                          <div className="flex w-full flex-wrap items-center gap-3 rounded-lg bg-muted/40 p-3 text-sm">
+                            {confirm.action === 'rename' ? (
+                              <Input
+                                className="min-w-48 flex-1"
+                                autoFocus
+                                aria-label={t('stories.projectName')}
+                                value={rename}
+                                onChange={(event) => setRename(event.target.value)}
+                                disabled={locked}
+                                onKeyDown={(event) => {
+                                  if (isImeComposing(event)) return;
+                                  if (event.key === 'Enter' && rename.trim()) void apply();
+                                  if (event.key === 'Escape') setConfirm(null);
+                                }}
+                              />
+                            ) : (
+                              <span className="flex-1">
+                                {t('projectActions.open', { name: row.name })}
+                              </span>
                             )}
-                          </Button>
-                          <Button variant="ghost" disabled={busy} onClick={() => setConfirm(null)}>
-                            {t('common.cancel')}
-                          </Button>
-                        </div>
-                      )}
-                  </article>
+                            <Button
+                              variant="default"
+                              disabled={locked || (confirm.action === 'rename' && !rename.trim())}
+                              onClick={() => void apply()}
+                            >
+                              {t(
+                                confirm.action === 'rename'
+                                  ? 'sidebar.rename_save'
+                                  : 'common.confirm',
+                              )}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              disabled={busy}
+                              onClick={() => setConfirm(null)}
+                            >
+                              {t('common.cancel')}
+                            </Button>
+                          </div>
+                        )}
+                    </article>
+                  );
+                };
+                return view === 'grid' ? (
+                  <VirtualGrid
+                    items={visible}
+                    scrollRef={scrollRef}
+                    getKey={(row) => row.key}
+                    estimateRowSize={190}
+                    renderCard={renderRow}
+                  />
+                ) : (
+                  <VirtualList
+                    items={visible}
+                    scrollRef={scrollRef}
+                    getKey={(row) => row.key}
+                    estimateSize={72}
+                    rowClassName="border-b border-border/50 last:border-b-0"
+                    renderRow={renderRow}
+                  />
                 );
-              })}
+              })()}
             </div>
           </div>
         </section>

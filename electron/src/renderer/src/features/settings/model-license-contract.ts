@@ -178,6 +178,12 @@ export function modelLicenseCategoryKey(value?: string): string {
   return `modelLicense.category${category[0].toUpperCase()}${category.slice(1)}`;
 }
 
+/** The short visible chip text for a declared-licence category. */
+export function modelLicenseShortKey(value?: string): string {
+  const category = modelLicenseCategory(value);
+  return `modelLicense.short${category[0].toUpperCase()}${category.slice(1)}`;
+}
+
 /** Upstream data is inert text; external navigation accepts HTTPS only. */
 export function modelLicenseUrl(value?: string | null): string | null {
   if (!value) return null;
@@ -192,7 +198,6 @@ export function modelLicenseUrl(value?: string | null): string | null {
 export function canAcknowledgeModelPlan(
   plan: ModelReviewPlan | null,
   repoId: string,
-  target: string,
   registryDigest?: string,
 ): boolean {
   return Boolean(
@@ -201,8 +206,7 @@ export function canAcknowledgeModelPlan(
     plan.readiness === 'ready' &&
     plan.blockers.length === 0 &&
     plan.repo_id === repoId &&
-    plan.target === target &&
-    target === 'local' &&
+    plan.target === 'local' &&
     registryDigest &&
     plan.registry_digest === registryDigest &&
     plan.plan_id &&

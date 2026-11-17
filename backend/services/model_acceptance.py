@@ -31,7 +31,7 @@ _KEY_PREFIX = "model_licence_accepted:"
 # They count once, so users who already accepted are not asked twice.
 _LEGACY_ENGINE_ACCEPTANCE = {"supertone/supertonic-3": "supertonic3"}
 
-_REPO = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+\Z")
+_REPO = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+(?::[\w.-]+)?\Z")
 _cache_lock = threading.Lock()
 _cache: tuple[float, dict] | None = None
 

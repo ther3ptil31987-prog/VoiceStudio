@@ -315,3 +315,14 @@ def test_local_model_paths_are_recognised_by_syntax_not_the_filesystem(name):
 
 def test_org_name_is_a_registry_identity():
     assert ab._licence_repo("someone/unreviewed-ct2") == "someone/unreviewed-ct2"
+
+
+@pytest.mark.parametrize("faster_whisper", [False, True])
+def test_rooted_windows_path_is_local_independent_of_host(monkeypatch, faster_whisper):
+    from types import SimpleNamespace
+
+    # Python 3.13 Windows rejects a single leading slash as an absolute path.
+    # Isolate the backend's view rather than patching process-wide os.path.
+    monkeypatch.setattr(ab, "os", SimpleNamespace(path=SimpleNamespace(isabs=lambda name: False)))
+    assert ab._licence_repo("/models/whisper", faster_whisper=faster_whisper) is None
+    assert ab._licence_repo("Systran/faster-whisper-small", faster_whisper=faster_whisper) == "Systran/faster-whisper-small"

@@ -20,6 +20,8 @@ _REPO_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+")
 _PROGRAM_REPOS = {"0xShug0/audio.cpp", "zackees/ffmpeg_bins"}
 # A local checkout subdirectory and an SDK alias also match org/model syntax.
 _LOCAL_MODEL_PATHS = {"pretrained_models/Fun-CosyVoice3-0.5B"}
+_PHONE_RECORD_SOURCE = "mobile/contract/"
+_PHONE_ENGINE_PREFIX = "mobile:"
 _MODEL_ALIASES = {
     "moonshine/base": "UsefulSensors/moonshine-base",
     "moonshine/tiny": "UsefulSensors/moonshine-tiny",
@@ -80,7 +82,8 @@ def catalog_ids(value):
     """Include transitive pipeline dependencies, not only top-level models."""
     if isinstance(value, dict):
         if isinstance(value.get("repo_id"), str):
-            yield value["repo_id"]
+            # A package entry of a shared repository is recorded by its own id.
+            yield value["id"] if isinstance(value.get("id"), str) else value["repo_id"]
         for child in value.values():
             yield from catalog_ids(child)
     elif isinstance(value, list):
@@ -155,6 +158,15 @@ def validate(registry, catalog, source_ids=()):
                 errors.append(f"{rid}: unsupported {field} assessment")
         if record.get("data_kind", "production") != "production":
             errors.append(f"{rid}: test/illustrative data is not production evidence")
+        phone_only = str(record.get("configured_at", "")).startswith(_PHONE_RECORD_SOURCE)
+        for engine in record.get("engines") or []:
+            has_phone_prefix = isinstance(engine, str) and engine.startswith(_PHONE_ENGINE_PREFIX)
+            if not isinstance(engine, str) or has_phone_prefix != phone_only:
+                requirement = "must" if phone_only else "must not"
+                errors.append(
+                    f"{rid}: engine {engine!r} {requirement} start with "
+                    f"{_PHONE_ENGINE_PREFIX!r}"
+                )
         try:
             _component(record)
         except (ModelTermsError, KeyError, TypeError) as exc:

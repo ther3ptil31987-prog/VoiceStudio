@@ -1,81 +1,239 @@
-/**
- * The shared bug-report document builder.
- *
- * `composeBugReportUrl` is what the Electron app files reports with
- * (`electron/src/renderer/src/components/report-bug.tsx`), while the Tauri app
- * uses `bugReport.js::openBugReport`. The two build their own `## Error`
- * sections, and only the Tauri one carried the backend error class — so #1800's
- * fix was lost in the app that ships as of v0.5.4.
- *
- * #1800: an unclassified backend failure renders one fixed floor message, so a
- * dozen unrelated faults arrive as byte-identical reports. The exception class
- * name is the only thing separating them. Issue #2177 is what that looks like
- * WITH the line present (v0.5.3, Tauri); an Electron report of the same failure
- * carries the message and a stack of minified bundle frames and nothing else.
- */
-import { describe, expect, it } from 'vitest';
-import { composeBugReportUrl } from './bugReportDocument';
+import { describe, expect, test } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { MAX_MSG_CHARS, composeBugReportUrl } from './bugReportDocument';
 
-const bodyOf = (options) => decodeURIComponent(composeBugReportUrl(options));
+function issueParams(opts) {
+  return new URL(composeBugReportUrl(opts)).searchParams;
+}
+const issueBody = (opts) => issueParams(opts).get('body');
 
-describe('composeBugReportUrl', () => {
-  it('records the backend error class so identical messages differ (#1800)', () => {
-    const error = new Error('Generation failed. Check the selected engine and try again.');
-    error.errorClass = 'MemoryError';
-    expect(bodyOf({ error })).toContain('Backend error class: MemoryError');
-  });
-
-  it('reads the class from an ApiError payload', () => {
-    // The Electron client keeps the parsed 500 body on `payload` rather than
-    // lifting `error_class` onto the error itself (lib/api/client.ts).
-    const error = new Error('VoiceStudio hit an internal error');
-    error.payload = { detail: 'VoiceStudio hit an internal error', error_class: 'RuntimeError' };
-    expect(bodyOf({ error })).toContain('Backend error class: RuntimeError');
-  });
-
-  it('prefers an explicit errorClass over the payload', () => {
-    const error = new Error('boom');
-    error.errorClass = 'ValueError';
-    error.payload = { error_class: 'RuntimeError' };
-    expect(bodyOf({ error })).toContain('Backend error class: ValueError');
-    expect(bodyOf({ error })).not.toContain('RuntimeError');
-  });
-
-  it('omits the class line when the failure carries none', () => {
-    expect(bodyOf({ error: new Error('plain failure') })).not.toContain('Backend error class');
-  });
-
-  it('ignores a non-string class instead of stringifying an object', () => {
-    const error = new Error('boom');
-    error.payload = { error_class: { name: 'RuntimeError' } };
-    expect(bodyOf({ error })).not.toContain('Backend error class');
-  });
-
-  it('scrubs the class the way every other reported field is scrubbed', () => {
-    const error = new Error('load failed');
-    error.errorClass = 'Err/Users/alice/secret';
-    const body = bodyOf({ error });
-    expect(body).not.toContain('/Users/alice');
-  });
-
-  // ── the surrounding contract must not move ────────────────────────────────
-
-  it('still renders the error section and scrubs the message', () => {
-    const body = bodyOf({ error: new Error('cannot open /Users/alice/voice.wav') });
-    expect(body).toContain('## Error');
-    expect(body).toContain('cannot open ~/voice.wav');
-    expect(body).not.toContain('/Users/alice');
-  });
-
-  it('still seeds the title with the error message', () => {
-    expect(bodyOf({ error: new Error('synthesis exploded') })).toContain(
-      '[Bug] synthesis exploded',
+describe('backend exception class', () => {
+  test('taken from errorClass on the error', () => {
+    expect(issueBody({ error: { message: 'm', errorClass: 'ValueError' } })).toMatch(
+      /^Backend error class: ValueError$/m,
     );
   });
+  test('falls back to the parsed 500 body', () => {
+    const error = { message: 'm', payload: { error_class: 'TimeoutError' } };
+    expect(issueBody({ error })).toContain('Backend error class: TimeoutError');
+  });
+  test('error_type outranks the taxonomy label', () => {
+    const error = { message: 'm', payload: { error_type: 'MemoryError', error_class: 'UNKNOWN' } };
+    const body = issueBody({ error });
+    expect(body).toContain('Backend error class: MemoryError');
+    expect(body).not.toContain('UNKNOWN');
+  });
+  test('errorClass outranks anything in the payload', () => {
+    const error = { message: 'm', errorClass: 'Own', payload: { error_type: 'Other' } };
+    const body = issueBody({ error });
+    expect(body).toContain('Own');
+    expect(body).not.toContain('Other');
+  });
+  test('absent or malformed values print nothing', () => {
+    const variants = [
+      {},
+      { errorClass: 5 },
+      { errorClass: ['x'] },
+      { payload: { error_type: false, error_class: {} } },
+      { payload: { error_type: '' } },
+    ];
+    for (const extra of variants) {
+      expect(issueBody({ error: { message: 'm', ...extra } })).not.toContain('Backend error class');
+    }
+  });
+  test('home-directory paths inside the class are scrubbed', () => {
+    const body = issueBody({ error: { message: 'm', errorClass: 'Boom/Users/bob/key' } });
+    expect(body).not.toContain('/Users/bob');
+  });
+});
 
-  it('builds a report with no error at all', () => {
-    const body = bodyOf({ ctx: '**Version:** `0.5.4`' });
+describe('failure topic', () => {
+  test('flat payload value is shown', () => {
+    const body = issueBody({
+      error: { message: 'm', payload: { docs_topic: 'MODEL_CACHE_CORRUPT' } },
+    });
+    expect(body).toContain('MODEL_CACHE_CORRUPT');
+  });
+  test('nested detail value is shown', () => {
+    const error = { message: 'm', payload: { detail: { docs_topic: 'NO_AUDIO_TRACK' } } };
+    expect(issueBody({ error })).toContain('NO_AUDIO_TRACK');
+  });
+  test('non-string topics are skipped', () => {
+    const body = issueBody({
+      error: { message: 'm', payload: { docs_topic: 3, detail: 'plain' } },
+    });
+    expect(body).not.toContain('Backend failure topic');
+  });
+});
+
+describe('rest of the document', () => {
+  test('user paths in the message are shortened and seed the title', () => {
+    const params = issueParams({ error: { message: 'missing /Users/carol/take1.wav' } });
+    expect(params.get('body')).toContain('missing ~/take1.wav');
+    expect(params.get('title')).toBe('[Bug] missing ~/take1.wav');
+  });
+  test('no error means no error section', () => {
+    const body = issueBody({});
     expect(body).not.toContain('## Error');
     expect(body).toContain('## Environment');
   });
+});
+
+test('opens a report when a truncated message ends in half an emoji', () => {
+  const message = `${'x'.repeat(MAX_MSG_CHARS - 1)}\u{1F600} tail`;
+  expect(() => composeBugReportUrl({ error: new Error(message) })).not.toThrow();
+  expect(() => composeBugReportUrl({ title: 'lone \uD83D' })).not.toThrow();
+});
+
+describe('credential query privacy in the live report builder', () => {
+  test.each([
+    'pin',
+    '%70in',
+    'p%69%6e',
+    'api%5Fkey',
+    '%74oken',
+    'pass%77ord',
+    'auth%2Dtoken',
+    '%61%63%63%65%73%73%5F%74%6F%6B%65%6E',
+  ])('redacts %s from both error titles and crash-log bodies', (name) => {
+    const raw = `Request: http://h/?${name}=481516&view=models&page=2`;
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    for (const field of ['title', 'body']) {
+      expect(params.get(field)).not.toContain('481516');
+      expect(params.get(field)).toContain(`${name}=***REDACTED***`);
+    }
+    expect(params.get('body')).toContain('view=models');
+    expect(params.get('body')).toContain('page=2');
+  });
+
+  test('keeps ordinary parameters and does not decode names twice', () => {
+    const raw = 'http://192.0.2.1/?spin=481516&pin_code=481516&key=short&%2570in=481516&x=%GG';
+    expect(issueBody({ crashSection: [raw] })).toContain(raw);
+  });
+
+  test('redacts every duplicate credential, including short named API keys', () => {
+    const raw = 'http://192.0.2.1/?pin=481516&%70in=151623&api_key=short&view=models';
+    const body = issueBody({ crashSection: [raw] });
+    for (const secret of ['481516', '151623', 'short']) expect(body).not.toContain(secret);
+    expect(body).toContain('view=models');
+  });
+
+  test.each([
+    "pass%77ord='orchid-river-72'",
+    'pass%77ord="orchid-river-72"',
+    "password='orchid-river-72'",
+    "pass%77ord='orchid-river-72",
+    "pass%77ord='prefix\\'orchid-river-72'",
+  ])('redacts the entire quoted credential %s', (query) => {
+    const raw = `Request: http://192.0.2.1/?${query}&view=models`;
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    expect(params.get('title')).not.toContain('orchid-river-72');
+    expect(params.get('body')).not.toContain('orchid-river-72');
+    expect(params.get('body')).toContain('***REDACTED***');
+  });
+
+  test('keeps quotes surrounding an unquoted URL credential', () => {
+    expect(issueBody({ crashSection: ["Request: 'http://h/?pin=1234' next"] })).toContain(
+      "Request: 'http://h/?pin=***REDACTED***' next",
+    );
+  });
+
+  test.each(
+    [
+      ['password', 'PRIVATE_FIXTURE', '"'],
+      ['%70in', '482916', '"'],
+      ['password', 'PRIVATE_FIXTURE', "'"],
+      ['%70in', '482916', "'"],
+    ].flatMap((row) => [1, 3, 7].map((depth) => [...row, depth])),
+  )('redacts log-escaped %s (%s, quote %s, depth %s)', (name, secret, quote, depth) => {
+    const marker = '\\'.repeat(depth) + quote;
+    const raw = `https://h/?${name}=${marker}${secret}${marker}&x=1`;
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    expect(params.get('title')).not.toContain(secret);
+    expect(params.get('body')).not.toContain(secret);
+    expect(params.get('body')).toContain(`${name}=***REDACTED***&x=1`);
+  });
+
+  test.each(
+    [
+      ['api_key', "'"],
+      ['api%5Fkey', "'"],
+      ['api_key', '"'],
+      ['api%5Fkey', '"'],
+    ].flatMap((row) => [false, true].map((leading) => [...row, leading])),
+  )(
+    'redacts a quote inside the raw URL credential %s (%s, leading quoted %s)',
+    (name, quote, leading) => {
+      const prefix = leading ? `${quote}prefix${quote}` : 'prefix';
+      const raw = `https://h/?${name}=${prefix}${quote}PRIVATE_FIXTURE${quote}&x=1`;
+      const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+      expect(params.get('title')).not.toContain('PRIVATE_FIXTURE');
+      expect(params.get('body')).not.toContain('PRIVATE_FIXTURE');
+      expect(params.get('body')).toContain('&x=1');
+    },
+  );
+
+  test.each([
+    "Request: 'http://h/?pin=1234', status=500\nTraceback: decoder failed",
+    '{"request":"http://h/?pin=1234"}\nTraceback: decoder failed',
+    '{"request":"http://h/?pin=1234","status":500}\nTraceback: decoder failed',
+  ])('preserves the comma/brace-delimited log tail for %s', (raw) => {
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    expect(params.get('title')).not.toContain('1234');
+    expect(params.get('body')).toContain(raw.replace('1234', '***REDACTED***'));
+  });
+
+  test('an outer URL quote does not expose internal credential punctuation', () => {
+    const raw =
+      "Request: 'https://h/?api_key=prefix',PRIVATE_FIXTURE'&x=1', status=500\nTraceback: decoder failed";
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    expect(params.get('title')).not.toContain('PRIVATE_FIXTURE');
+    expect(params.get('body')).not.toContain('PRIVATE_FIXTURE');
+    for (const piece of ['&x=1', 'status=500', 'Traceback: decoder failed'])
+      expect(params.get('body')).toContain(piece);
+  });
+
+  test.each([
+    "prefix'],PRIVATE_FIXTURE'&x=1",
+    "prefix']]],PRIVATE_FIXTURE'&x=1",
+    "prefix']},PRIVATE_FIXTURE'&x=1",
+    'prefix\'],"status":PRIVATE_FIXTURE\'&x=1',
+    "prefix'],PRIVATE_FIXTURE'?continue=1",
+    "prefix'],PRIVATE_FIXTURE'",
+  ])('opaque key punctuation cannot close the quoted report URL: %s', (value) => {
+    const raw = `Request: 'https://h/?api_key=${value}', status=500\nTraceback: decoder failed`;
+    const params = issueParams({ error: { message: raw }, crashSection: [raw] });
+    expect(params.get('title')).not.toContain('PRIVATE_FIXTURE');
+    expect(params.get('body')).not.toContain('PRIVATE_FIXTURE');
+    expect(params.get('body')).toContain('status=500');
+    expect(params.get('body')).toContain('Traceback: decoder failed');
+  });
+
+  test('JSON URL fields keep unrelated string fields and other URLs', () => {
+    const raw = JSON.stringify({
+      request: 'https://h/?api_key=PRIVATE_FIXTURE',
+      status: 'decoder failed',
+      other: 'https://h/?view=models',
+    });
+    expect(issueBody({ crashSection: [raw] })).toContain(
+      raw.replace('PRIVATE_FIXTURE', '***REDACTED***'),
+    );
+  });
+
+  test('finishes malformed-query scrubbing within a process bound', () => {
+    const source = pathToFileURL(resolve('src/shared/utils/scrub.js')).href;
+    const script = `import {scrubText} from ${JSON.stringify(source)};
+      for (const value of ['?'.repeat(100000),'&'+'?!'.repeat(50000),
+        '"https://h/?view=models'.repeat(5000),
+        JSON.stringify(Object.fromEntries(Array.from({length:5000},(_,i)=>[i,'https://h/?view=models'])))]) {
+        if (scrubText(value)!==value) throw new Error('benign input changed');
+      }
+      const quote=String.fromCharCode(39);
+      const value='Request: '+quote+'https://h/?api_key=prefix'+quote+']'.repeat(100000)+',PRIVATE_FIXTURE'+quote+'&x=1'+quote+', status=500';
+      const out=scrubText(value);
+      if(out.includes('PRIVATE_FIXTURE') || !out.includes('status=500')) throw new Error('opaque quote boundary');`;
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 5000 });
+  }, 10000);
 });

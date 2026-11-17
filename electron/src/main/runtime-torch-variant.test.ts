@@ -54,15 +54,20 @@ async function fixture() {
   const bundle = join(root, 'bundle');
   const project = join(root, 'runtime');
   await mkdir(join(bundle, 'backend'), { recursive: true });
+  await mkdir(join(bundle, 'config'), { recursive: true });
   await mkdir(join(bundle, 'frontend', 'dist'), { recursive: true });
   await mkdir(join(bundle, 'omnivoice'));
+  await mkdir(join(bundle, 'scripts'));
   for (const file of [
     'pyproject.toml',
     'README.md',
     'LICENSE',
     'backend/main.py',
+    'config/app.json',
     'frontend/dist/index.html',
     'omnivoice/__init__.py',
+    'scripts/windows-rocm-recipe.json',
+    'scripts/smoke_windows_rocm.py',
   ]) {
     await writeFile(join(bundle, file), file);
   }
@@ -200,7 +205,7 @@ describe('CPU-only runtime install', () => {
 
     const calls = run.mock.calls.map(([, args]) => args);
     const syncIndex = calls.findIndex((args) => args[0] === 'sync');
-    const pipIndex = calls.findIndex((args) => args[0] === 'pip');
+    const pipIndex = calls.findIndex((args) => args[0] === 'pip' && args[1] === 'install');
     expect(syncIndex).toBeGreaterThanOrEqual(0);
     expect(pipIndex).toBeGreaterThan(syncIndex);
     const sync = calls[syncIndex]!;
@@ -218,6 +223,16 @@ describe('CPU-only runtime install', () => {
       ...CPU_TORCH_ARGS,
     ]);
     expect(CPU_TORCH_ARGS.join(' ')).toContain('download.pytorch.org/whl/cpu');
+  });
+  it('asks a Mac for 5 GiB too: its wheels carry no CUDA libraries', async () => {
+    host('darwin', 'arm64');
+    const { bundle, project } = await fixture();
+    vi.mocked(statfs).mockResolvedValueOnce({ bavail: 4 * 1024 ** 3, bsize: 1 } as Awaited<
+      ReturnType<typeof statfs>
+    >);
+    await expect(
+      installRuntime(bundle, project, 'uv', vi.fn(), new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'ENOSPC', requiredGib: 5 });
   });
   it('needs 5 GiB instead of 9 GiB and says so', async () => {
     host('win32', 'x64');
@@ -252,7 +267,7 @@ describe('CPU-only runtime install', () => {
     await interpreter(project);
     let repaired = false;
     const run = vi.fn(async (command: string, args: string[]) => {
-      if (args[0] === 'pip') repaired = true;
+      if (args[0] === 'pip' && args[1] === 'install') repaired = true;
       if (!repaired && command === runtimePython(project) && args[0] === '-c') {
         if (String(args[1]).includes('torch')) throw new Error('missing libtorch_cpu');
       }
@@ -260,7 +275,7 @@ describe('CPU-only runtime install', () => {
     await installRuntime(bundle, project, 'uv', run, new AbortController().signal);
     const sync = run.mock.calls.find(([, args]) => args[0] === 'sync')?.[1];
     expect(sync).not.toContain('--reinstall-package');
-    const pip = run.mock.calls.find(([, args]) => args[0] === 'pip')?.[1];
+    const pip = run.mock.calls.find(([, args]) => args[0] === 'pip' && args[1] === 'install')?.[1];
     expect(pip).toEqual(expect.arrayContaining(['--reinstall-package', 'torch', 'torchaudio']));
   });
 });

@@ -62,12 +62,12 @@ Two more fallback chains run at load time:
   process fast-fails with no traceback, so the engine is reported unavailable
   up front and selection falls through to pytorch-whisper, which uses torch's
   own cuDNN 9 ([#1371](https://github.com/debpalash/VoiceStudio/issues/1371)).
-- On Linux kernels that refuse an executable stack, CTranslate2's native
-  library (4.4.0 and older — what whisperx 3.4.5 pins on Python 3.11) is
-  rejected with "cannot enable executable stack". VoiceStudio now clears that
-  one ELF flag in place on first probe and the engine loads normally; if the
-  library cannot be written (a read-only bundle), the engine reports itself
-  unavailable with the repair command instead of crashing
+- **Kernel refuses executable stacks.** CTranslate2 4.4.0 and older ship
+  libraries that request an executable stack, which some Linux kernels reject
+  at load time (whisperx pins one of these versions on Python 3.11). VoiceStudio
+  clears that flag in the library file automatically the first time it probes
+  the engine. If the file is read-only, the engine is reported unavailable
+  along with the `patchelf --clear-execstack <library>` command to run once
   ([#692](https://github.com/debpalash/VoiceStudio/issues/692)).
 - A partially-installed environment (interrupted sync, antivirus quarantine)
   can break WhisperX's deep import chain (whisperx → pyannote →
@@ -78,7 +78,7 @@ Two more fallback chains run at load time:
   PATH lookup ([#479](https://github.com/debpalash/VoiceStudio/issues/479)).
 - Transcribes are time-bounded: each dub chunk by
   `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (default 120 s), whole files by
-  `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s). Raise them for very
-  long files on slow hardware.
+  the larger of `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s) and twice
+  the audio duration. See [timeout settings](../install/troubleshooting.md).
 
 Speed comparisons across engines live in [performance](../performance.md).

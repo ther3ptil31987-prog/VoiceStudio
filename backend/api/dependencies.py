@@ -13,8 +13,10 @@ Currently exposed:
 - `require_native_access`: true-loopback-only access to the host filesystem;
   unlike `require_loopback`, it is never bypassed by server mode.
 - `ws_remote_authorized`: whether a WebSocket handshake from a non-loopback
-  client carries the remote API key (Wave 2.3) — used by WS endpoints that
-  keep their own inline loopback guards.
+  client carries the remote API key (Wave 2.3).
+- `require_ws_access`: the shared WebSocket admission gate every WS endpoint
+  awaits before `accept()` — cross-site origin rejection, then the
+  loopback/trusted-network/remote-credential check.
 """
 
 import os
@@ -26,13 +28,56 @@ from core.auth import (
     PrincipalKind,
     is_local_host,
     is_loopback,
+    presents_valid_credential,
     principal_for,
     remote_api_key,
 )
 from core.browser_guard import reject_cross_site_get
-from core.csrf import SAFE_HTTP_METHODS, cookie_csrf_allowed
+from core.csrf import SAFE_HTTP_METHODS, cookie_csrf_allowed, origin_allowed
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+#: Header the MCP server stamps on the in-process requests it makes on behalf
+#: of an HTTP MCP caller (``mcp_server.py``) without proven admin credentials.
+#: The caller or a separate HTTP backend may itself use loopback; that address
+#: alone must not make the delegated request an administrator. It only *reduces*
+#: privilege — it makes this gate skip its loopback short-circuit — so a client
+#: that sends it by hand gains nothing (#4128).
+DELEGATED_CALLER_HEADER = "x-omnivoice-delegated"
+
+
+def _is_delegated_caller(request) -> bool:
+    """Whether the MCP server marked this request as a remote caller's errand.
+
+    Read through ``headers`` so the gate keeps working with the minimal request
+    stubs the tests use; a missing or blank header is the privileged default.
+    """
+    headers = getattr(request, "headers", None) or {}
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return False
+    value = getter(DELEGATED_CALLER_HEADER, "")
+    return str(value or "").strip().lower() in _TRUTHY
+
+
+def _delegated_presents_admin_credential(request) -> bool:
+    """Credential check for a delegated request, ignoring its peer address.
+
+    :func:`_request_presents_admin_credential` reads the canonical principal,
+    which resolves a loopback peer to ``LOOPBACK`` before any credential is
+    looked at — so it can never approve the MCP bridge's forged 127.0.0.1 peer.
+    For a delegated request use the credential's own capability and transport,
+    including cookie CSRF for mutations, rather than the forged peer's trust.
+    """
+    from core.auth import credential_principal
+
+    principal = credential_principal(request)
+    if principal is None:
+        return False
+    if (principal.transport in {CredentialTransport.COOKIE, CredentialTransport.LEGACY_COOKIE}
+            and str(getattr(request, "method", "GET")).upper() not in SAFE_HTTP_METHODS):
+        return cookie_csrf_allowed(request)
+    return True
 
 
 def _server_mode() -> bool:
@@ -218,6 +263,41 @@ async def require_admin(request: Request) -> None:
     check_admin(request)
 
 
+_CONSUMER_GENERATION_ATTR = "_vs_consumer_generation"
+
+
+def consumer_generation(endpoint):
+    """Mark a mutating route as "run a generation", open to consumers.
+
+    Routers guarded by :func:`require_consumer_reads_admin_writes` keep editing
+    and deleting stored content admin-only. Routes that merely run a job
+    (translate, dub, batch submit, convert, capture, ...) are what PIN-paired
+    phones and consumer clients call, so they opt in individually here instead
+    of weakening the router guard. Apply below the ``@router.<verb>`` line.
+    """
+    setattr(endpoint, _CONSUMER_GENERATION_ATTR, True)
+    return endpoint
+
+
+async def require_consumer_reads_admin_writes(request: Request) -> None:
+    """Keep shared content readable and generation runnable; edits are admin.
+
+    PIN-paired phones need metadata, saved audio and the ability to start
+    generations on desktop too. Mutations of stored content (edit/delete/
+    import) require admin unless the route is marked
+    :func:`consumer_generation`. Lazy GET synthesis has its own media-action
+    gate because it also writes state.
+    """
+    route = request.scope.get("route")
+    endpoint = getattr(route, "endpoint", None)
+    if request.method.upper() in SAFE_HTTP_METHODS or getattr(
+        endpoint, _CONSUMER_GENERATION_ATTR, False
+    ):
+        require_consumer(request)
+    else:
+        check_admin(request)
+
+
 def check_admin(request: Request) -> None:
     """Gate RCE/filesystem-capable admin routers.
 
@@ -230,16 +310,26 @@ def check_admin(request: Request) -> None:
     Read-only requests retain the bare-Docker bootstrap behaviour until an API
     key is configured. Share PINs and trusted CIDRs are consumption credentials;
     neither authorizes this gate.
+
+    MCP re-entry preserves the original HTTP peer in-process, but HTTP callers
+    or a separate HTTP backend can themselves use loopback. Requests without
+    proven administrator credentials carry :data:`DELEGATED_CALLER_HEADER`
+    so that address cannot confer implicit administrator rights (#4128).
     """
     host = request.client.host if request.client else None
-    if is_loopback(host):
+    delegated = _is_delegated_caller(request)
+    if is_loopback(host) and not delegated:
         return
     if _server_mode():
         method = str(getattr(request, "method", "GET")).upper()
         read_only = method in SAFE_HTTP_METHODS
         if read_only and not _admin_credential_configured(request):
             return
-        if _request_presents_admin_credential(request):
+        if (
+            _delegated_presents_admin_credential(request)
+            if delegated
+            else _request_presents_admin_credential(request)
+        ):
             return
     _admin_gate_403()
 
@@ -260,6 +350,56 @@ def require_admin_action(request: Request) -> None:
         request,
         side_effectful_get=True,
     ):
+        return
+    _admin_gate_403()
+
+
+def require_admin_media_action(request: Request) -> None:
+    """Admin gate for a side-effectful GET that a browser media element triggers.
+
+    ``<audio>``/``<video>`` requests cannot carry the CSRF marker header, so
+    :func:`require_admin_action` would refuse even a same-origin
+    cookie-authenticated admin. This variant keeps the cross-site GET
+    rejection and still requires a real admin credential from remote callers —
+    a bare-server anonymous GET is refused exactly as before — while letting
+    header API keys and same-origin admin sessions through.
+    """
+    reject_cross_site_get(request)
+    host = request.client.host if request.client else None
+    if is_loopback(host):
+        return
+    if _server_mode() and presents_valid_credential(request):
+        return
+    _admin_gate_403()
+
+
+async def require_admin_diagnostics(request: Request) -> None:
+    """Admin gate for the runtime-log and crash-diagnostic family.
+
+    :func:`check_admin` deliberately keeps *read-only* requests open in server
+    mode while no credential is configured, so an operator can finish the bare
+    Docker bootstrap. That exemption is about discovery, not about the runtime
+    log: these routes return host paths, log contents, recent errors and crash
+    records, and ``docs/install/docker.md`` already tells users that
+    diagnostics require the administrator API key. This gate therefore keeps no
+    bare-server read exemption.
+
+    Shaped like :func:`require_admin_media_action` on purpose:
+    ``/system/logs/stream`` is consumed by an ``EventSource``, which cannot
+    attach the CSRF marker header, so genuine loopback passes and every other
+    peer must present a valid credential (API key or admin session). A share PIN
+    is a consumption credential and does not satisfy this.
+
+    ``async`` for the same reason as :func:`require_admin`: the work is pure
+    in-memory checks, and a sync dependency would be dispatched through the
+    shared worker pool, where a saturated pool delays the log stream behind
+    whatever blocked sync route filled it (#2594 class).
+    """
+    reject_cross_site_get(request)
+    host = request.client.host if request.client else None
+    if is_loopback(host):
+        return
+    if _server_mode() and presents_valid_credential(request):
         return
     _admin_gate_403()
 
@@ -313,3 +453,42 @@ def ws_remote_authorized(websocket) -> bool:
         PrincipalKind.API_KEY,
         PrincipalKind.ADMIN_SESSION,
     }
+
+
+async def require_ws_access(websocket) -> bool:
+    """The shared admission check every WebSocket endpoint awaits before accept().
+
+    Returns True when the handshake may be accepted; on refusal the socket is
+    already closed with code 1008 (policy violation) and the caller returns.
+
+    The share PIN never covers WebSockets (its gate is HTTP-only) and the API-key
+    middleware is inert without ``OMNIVOICE_API_KEY``, so this protocol-level
+    guard is what actually protects a stream — a browser on any page can reach
+    loopback regardless of that page's own origin.
+
+    Order matters, and neither step may be reordered:
+
+    1. Cross-site rejection. If the handshake carries an ``Origin`` it must be
+       this backend's own origin, the desktop renderer, or an entry in
+       ``OMNIVOICE_ALLOWED_ORIGINS``. Native clients (no ``Origin``) and
+       configured/same-origin browser UIs keep working (``core.csrf``).
+    2. Loopback/trusted/credential check. Refuse anything not from
+       127.0.0.1/::1/localhost or a configured trusted network, unless the
+       handshake proves a remote credential. Wave 2.3 (remote backend): a
+       non-loopback client presenting ``OMNIVOICE_API_KEY`` (bearer, session, or
+       legacy query/cookie) is the thin-client dictation case — the mic lives on
+       the user's machine, the GPU here — and is allowed through.
+
+    Deliberately a plain function, not a ``Depends(...)``: FastAPI's WebSocket
+    dependency injection differs across versions, and the check must run before
+    ``accept()`` so a refusal is a close frame rather than an accepted socket.
+    """
+    origin = websocket.headers.get("origin")
+    if origin and not origin_allowed(websocket):
+        await websocket.close(code=1008, reason="browser origin not allowed")
+        return False
+    host = websocket.client.host if websocket.client else None
+    if not is_local_host(host) and not ws_remote_authorized(websocket):
+        await websocket.close(code=1008, reason="loopback origin required")
+        return False
+    return True

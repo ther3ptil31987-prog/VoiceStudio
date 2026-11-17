@@ -8,6 +8,7 @@ import {
 } from '@shared/utils/aec/pcm';
 import {
   classifySherpaFinal,
+  joinDictationText,
   sherpaSummaryTail,
 } from '@shared/utils/captureProtocol';
 import type { TranscriptEntry } from '@shared/utils/transcriptionsStore';
@@ -236,7 +237,7 @@ export class LiveDictation {
     }
     if (message.type === 'partial') {
       this.publish({
-        text: [...this.committed, message.text || ''].filter(Boolean).join(' '),
+        text: joinDictationText([...this.committed, message.text || '']),
       });
       return;
     }
@@ -245,8 +246,11 @@ export class LiveDictation {
     const kind = message.final_kind === undefined ? 'summary' : classifySherpaFinal(message);
     const text = message.refined_text || message.text || '';
     if (kind === 'utterance') {
-      this.committed.push(text);
-      this.publish({ text: this.committed.join(' ') });
+      // Silence arrives as empty finals; committing them would add a separator per pause (#3154).
+      const clean = text.trim();
+      if (!clean) return;
+      this.committed.push(clean);
+      this.publish({ text: joinDictationText(this.committed) });
       try {
         this.onResult(message);
       } catch {
@@ -256,7 +260,7 @@ export class LiveDictation {
     }
     if (kind === 'ignore') return;
     const tail = sherpaSummaryTail(message.text || '', this.committed);
-    this.publish({ text: text || this.committed.join(' ') });
+    this.publish({ text: text || joinDictationText(this.committed) });
     try {
       if (tail)
         this.onResult(

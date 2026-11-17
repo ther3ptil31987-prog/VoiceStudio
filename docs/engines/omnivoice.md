@@ -52,6 +52,9 @@ The env var overrides the persisted UI choice.
   ROCm/HIP devices through its `cuda` API, while VoiceStudio's engine matrix
   reports the hardware as ROCm. An installed speech recognizer can supply
   missing reference transcripts for cloning.
+- On Intel Arc (XPU) the model runs bfloat16: float16 sounded choppy there,
+  and float32 is too slow because the Arc matrix units only speed up 16-bit
+  math. `OMNIVOICE_XPU_DTYPE` overrides it. On the CPU it runs float32.
 - Output is 24 kHz mono; the shared mastering chain (highpass + compressor)
   is tuned for this rate and applied automatically.
 - Cloning takes a short reference clip (`ref_audio`); 3–10 seconds is the
@@ -59,6 +62,9 @@ The env var overrides the persisted UI choice.
   has none, VoiceStudio uses an already-installed speech recognizer on first
   use and saves the result to the profile. This includes the catalogue’s
   Whisper Turbo CT2 build; cloning does not require a second Transformers copy.
+  In Voice Cloning, a reference transcript you type also accompanies a selected
+  saved voice and overrides its stored transcript for that generation. Leaving
+  the field blank keeps the stored transcript or automatic transcription path.
   The model-level Whisper fallback
   also requires cached weights; it never downloads another ASR during cloning.
   It reuses any installed snapshot of the configured PyTorch Whisper model

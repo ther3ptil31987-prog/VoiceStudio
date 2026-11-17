@@ -38,14 +38,24 @@ approval), [Windows](../install/windows.md), [Linux](../install/linux.md),
 | GPT-SoVITS | [gpt-sovits](gpt-sovits.md) | external server | ✅ | its own API server |
 | Sherpa-ONNX | [sherpa-onnx](sherpa-onnx.md) | CUDA · CPU | — | `pip install sherpa-onnx` + model dir |
 | IndexTTS 2.5 | [indextts](indextts.md) | CUDA · CPU | ✅ + emotion | one-click sidecar install |
-| OmniVoice GGUF | [omnivoice-gguf](omnivoice-gguf.md) | CUDA · MPS · CPU | ✅ | bundled binary |
+| OmniVoice GGUF | [omnivoice-gguf](omnivoice-gguf.md) | CUDA · MPS · CPU | ✅ | native binary bundled in the desktop installers (not Intel Mac) |
 | Supertonic-3 | [supertonic3](supertonic3.md) | CPU | — (7 preset voices) | `uv sync --extra supertonic` + license |
 | MOSS-TTS-v1.5 (8B) | [moss-tts-v15](moss-tts-v15.md) | CUDA · CPU | ✅ | clone + env var |
-| dots.tts (2B) | [dots-tts](dots-tts.md) | CUDA · CPU (not Windows) | ✅ | clone + env var |
-| OmniVoice (subprocess) | [omnivoice-subprocess](omnivoice-subprocess.md) | CUDA · MPS · CPU | ✅ | opt-in pick off MPS; automatic via default OmniVoice on MPS |
+| dots.tts (2B) | [dots-tts](dots-tts.md) | CUDA · CPU (not Windows; use audio.cpp dots.tts) | ✅ | clone + env var |
+| OmniVoice (subprocess) | [omnivoice-subprocess](omnivoice-subprocess.md) | CUDA · MPS · CPU | ✅ | opt-in off MPS; automatic through default OmniVoice on MPS |
 | PocketTTS (Kyutai) | [pockettts](pockettts.md) | CPU (not Intel Mac) | ✅ | `uv sync --extra pockettts` + license |
 | Confucius4-TTS | [confucius4-tts](confucius4-tts.md) | CUDA · CPU | ✅ | clone + env var |
+| Ming-3.0-tts (0.5B) | [ming-tts](ming-tts.md) | NVIDIA CUDA only | ✅ | one-click install (Linux) or clone + env var |
 | audio.cpp (Breeze-TTS-2) | [audio-cpp](audio-cpp.md) | CPU + Vulkan/Metal/CUDA/HIP/ROCm where compiled | ✅ + voice design | prebuilt binary + env var (weights research/non-commercial) |
+| audio.cpp (dots.tts SOAR) | [audio-cpp](audio-cpp.md#dotstts) | CPU + Vulkan/Metal/CUDA/HIP/ROCm where compiled, incl. Windows | ✅ | runtime + weights from Model Catalogue (Apache-2.0) |
+| CosyVoice 3 GGUF | [cosyvoice-gguf](cosyvoice-gguf.md) | CPU + Vulkan (native runtime build) | ✅ reference cloning + instruct | user-built native runtime + model catalogue |
+| Qwen3-TTS Base (CUDA adapter) | [mlx-audio](mlx-audio.md) | NVIDIA CUDA only | ✅ (reference + transcript) | local checkpoint + `VOICESTUDIO_QWEN_CUDA_MODEL` + `faster-qwen3-tts` |
+
+## Sound effects (not speech)
+
+| Engine | Guide | Runs on | Enabled by |
+|---|---|---|---|
+| MOSS-SoundEffect v2.0 | [moss-soundeffect](moss-soundeffect.md) | CUDA (NVIDIA) only | Install button on Tools → Sound effects (desktop and web only; Apache-2.0) |
 
 ### Reference clip length
 
@@ -76,6 +86,7 @@ an engine runs in its own environment.
 | Faster-Whisper (isolated) | [faster-whisper-isolated](faster-whisper-isolated.md) | CUDA · CPU | unattended batches | opt-in pick |
 | MLX Whisper | [mlx-whisper](mlx-whisper.md) | Apple Silicon | Mac default | `pip install mlx-whisper` |
 | PyTorch Whisper | [pytorch-whisper](pytorch-whisper.md) | CUDA · MPS · CPU | ROCm hosts | installed by default |
+| whisper.cpp | [whisper-cpp](whisper-cpp.md) | CPU · Vulkan · CUDA · Metal | AMD GPUs, native CLI | your own `whisper-cli` + GGML model |
 | Parakeet TDT (NeMo) | [nemo-parakeet](nemo-parakeet.md) | CUDA · CPU | 25 languages, fast CPU | separate venv (never the app's) |
 | Parakeet TDT (MLX) | [parakeet-mlx](parakeet-mlx.md) | Apple Silicon | dictation, 25 EU languages | default on mac-ARM source installs |
 | Moonshine | [moonshine](moonshine.md) | CPU | edge/low-power, no timestamps | `pip install` (see guide) |

@@ -86,10 +86,6 @@ describe('administrator credential hygiene static guard', () => {
       .filter(({ source }) => source.includes('new WebSocket('))
       .map(({ file, source }) => ({ file, authenticated: source.includes('authenticatedWsUrl') }));
 
-    expect(constructors).toEqual([
-      { file: 'components/CaptureWidget.jsx', authenticated: true },
-      { file: 'hooks/useDubLivePreview.js', authenticated: true },
-      { file: 'hooks/useRealtimeEvents.js', authenticated: true },
-    ]);
+    expect(constructors.filter(({ authenticated }) => !authenticated)).toEqual([]);
   });
 });

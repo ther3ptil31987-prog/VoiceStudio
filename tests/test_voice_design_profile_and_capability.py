@@ -91,6 +91,18 @@ def test_a_locked_design_take_is_not_cloned_once_edited():
     assert _gen()._resolve_profile_conditioning(row, instruct="female")["ref_audio_path"] is None
 
 
+def test_a_locked_design_take_wins_over_any_seed():
+    # #3265: the lock keeps the design's own seed (42 here), so a request that
+    # repeats the locked take's seed must not read as a design edit.
+    row = _design_row(is_locked=1, locked_audio_path="locked.wav")
+    for seed in (7, 42, 1234):
+        cond = _gen()._resolve_profile_conditioning(row, seed=seed)
+        assert cond["ref_audio_path"].endswith("locked.wav")
+        assert not cond["diverged"]
+    # Only a new description moves a locked design voice off its take.
+    assert _gen()._resolve_profile_conditioning(row, instruct="female", seed=7)["diverged"]
+
+
 def test_a_clone_profile_keeps_its_reference_with_a_style_instruct():
     row = _design_row(kind="clone", instruct="", ref_audio_path="clip.wav")
     cond = _gen()._resolve_profile_conditioning(row, instruct="whisper", seed=9)
@@ -104,8 +116,10 @@ def test_catalogue_reports_voice_design_support():
     entries = {e["id"]: e for e in _tts().list_backends(include_hidden=True)}
     assert entries["omnivoice"]["supports_voice_design"] is True
     assert entries["voxcpm2"]["supports_voice_design"] is True
+    if "omnivoice-gguf" in entries:  # #4080
+        assert entries["omnivoice-gguf"]["supports_voice_design"] is True
     for bid in ("indextts2", "moss-tts-v15", "dots-tts", "confucius4-tts",
-                "supertonic3", "omnivoice-gguf", "gpt-sovits", "moss-tts-nano"):
+                "supertonic3", "gpt-sovits", "moss-tts-nano"):
         if bid in entries:
             assert entries[bid]["supports_voice_design"] is False, bid
     for bid, entry in entries.items():

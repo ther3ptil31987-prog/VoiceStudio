@@ -12,29 +12,39 @@ import { setWorkspace } from '@/lib/store/workspace';
 import { openTake } from '@/lib/store/takes';
 import { selectCloneProfile } from '@/lib/store/reference';
 import { patchCloneSettings } from '@/lib/store/clone-settings';
+import { SETTINGS_ENTRIES } from '@/features/settings/settings-index';
 import { cn } from '@/lib/utils';
 import { Kbd } from '@/components/ui/kbd';
 import { isMac } from '@/components/bridge';
 import { KeyboardCheatsheet } from '@/components/keyboard-cheatsheet';
+import { useTheme } from '@/hooks/use-theme';
+import { formatRelative } from '@/features/clone/format';
+import { commandMatches, recentTakes, takeLength, type CommandItem } from './command-palette-items';
 import {
   AudioLinesIcon,
+  BlocksIcon,
   BookOpenIcon,
+  BoxesIcon,
+  CrownIcon,
   FilmIcon,
   FolderIcon,
   HistoryIcon,
   HomeIcon,
   LayersIcon,
   LibraryIcon,
+  ListPlusIcon,
   MicIcon,
+  MoonIcon,
   PhoneCallIcon,
   PlayIcon,
   SettingsIcon,
+  SunIcon,
   KeyboardIcon,
   UsersRoundIcon,
   WandSparklesIcon,
+  WorkflowIcon,
   WrenchIcon,
   XIcon,
-  type LucideIcon,
 } from 'lucide-react';
 import {
   designDraftFromTake,
@@ -44,17 +54,9 @@ import {
   writeDraft,
 } from '@/features/design/design-draft';
 
-interface CommandItem {
-  id: string;
-  label: string;
-  group: string;
-  icon: LucideIcon;
-  shortcut?: string;
-  run: () => void | Promise<void>;
-}
-
 export function CommandPalette() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const { theme, setTheme } = useTheme();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -107,6 +109,7 @@ export function CommandPalette() {
     {
       id: 'home',
       label: t('app.name'),
+      keywords: [t('nav.home'), 'home'],
       group: workspaceGroup,
       icon: HomeIcon,
       run: () => navigate({ to: '/' }),
@@ -114,6 +117,7 @@ export function CommandPalette() {
     {
       id: 'clone',
       label: t('nav.clone'),
+      keywords: [t('nav.clone_short'), 'clone', 'cloning'],
       group: workspaceGroup,
       icon: AudioLinesIcon,
       run: () => navigate({ to: '/clone' }),
@@ -121,6 +125,7 @@ export function CommandPalette() {
     {
       id: 'stories',
       label: t('nav.stories'),
+      keywords: [t('stories.newStory'), t('projects.title'), 'story', 'new project'],
       group: workspaceGroup,
       icon: AudioLinesIcon,
       run: () => navigate({ to: '/stories' }),
@@ -128,6 +133,7 @@ export function CommandPalette() {
     {
       id: 'dub',
       label: t('nav.dub'),
+      keywords: [t('dubWorkspace.title'), 'dubbing', 'video', 'translate'],
       group: workspaceGroup,
       icon: FilmIcon,
       run: () => navigate({ to: '/dub' }),
@@ -135,6 +141,7 @@ export function CommandPalette() {
     {
       id: 'batch',
       label: t('nav.batch_dub'),
+      keywords: ['batch', 'queue'],
       group: workspaceGroup,
       icon: LayersIcon,
       run: () => navigate({ to: '/batch' }),
@@ -142,6 +149,7 @@ export function CommandPalette() {
     {
       id: 'voices',
       label: `${t('nav.persona')} · ${t('nav.saved')}`,
+      keywords: ['voices', 'profiles', 'saved', 'personas'],
       group: workspaceGroup,
       icon: UsersRoundIcon,
       run: () => {
@@ -152,6 +160,7 @@ export function CommandPalette() {
     {
       id: 'gallery',
       label: `${t('nav.persona')} · ${t('nav.gallery')}`,
+      keywords: ['gallery', 'community', 'presets'],
       group: workspaceGroup,
       icon: LibraryIcon,
       run: () => navigate({ to: '/gallery' }),
@@ -159,20 +168,31 @@ export function CommandPalette() {
     {
       id: 'transcriptions',
       label: t('nav.transcribe'),
+      keywords: [t('nav.dictation'), 'transcribe', 'dictation', 'speech to text'],
       group: workspaceGroup,
       icon: MicIcon,
       run: () => navigate({ to: '/transcriptions' }),
     },
     {
-      id: 'calls',
+      id: 'workflows',
       label: t('workflows.title'),
       group: workspaceGroup,
+      icon: WorkflowIcon,
+      keywords: ['workflow', 'automation'],
+      run: () => navigate({ to: '/workflows' }),
+    },
+    {
+      id: 'calls',
+      label: t('calls.title'),
+      group: workspaceGroup,
       icon: PhoneCallIcon,
+      keywords: ['calls', 'phone'],
       run: () => navigate({ to: '/calls' }),
     },
     {
       id: 'design',
       label: t('designWorkspace.title'),
+      keywords: [t('nav.design'), 'design', 'voice design'],
       group: workspaceGroup,
       icon: WandSparklesIcon,
       run: () => navigate({ to: '/design' }),
@@ -180,6 +200,7 @@ export function CommandPalette() {
     {
       id: 'audiobook',
       label: t('audiobook.title'),
+      keywords: ['audiobook', 'book', 'new project'],
       group: workspaceGroup,
       icon: BookOpenIcon,
       run: () => navigate({ to: '/audiobook' }),
@@ -188,6 +209,7 @@ export function CommandPalette() {
       id: 'projects',
       label: t('projects.title'),
       group: workspaceGroup,
+      keywords: ['projects', 'new project'],
       icon: FolderIcon,
       run: () => navigate({ to: '/projects' }),
     },
@@ -196,11 +218,45 @@ export function CommandPalette() {
       label: t('tools.title'),
       group: workspaceGroup,
       icon: WrenchIcon,
+      keywords: ['tools', 'compare', 'convert'],
       run: () => navigate({ to: '/tools' }),
+    },
+    {
+      id: 'integrations',
+      label: t('integrationCatalog.title'),
+      group: workspaceGroup,
+      icon: BlocksIcon,
+      keywords: ['integrations', 'mcp', 'n8n', 'twilio', 'api'],
+      run: () => navigate({ to: '/integrations' }),
+    },
+    {
+      id: 'pro',
+      label: t('proPage.title'),
+      group: workspaceGroup,
+      icon: CrownIcon,
+      keywords: ['pro', 'upgrade', 'license'],
+      run: () => navigate({ to: '/pro' }),
+    },
+    {
+      id: 'models',
+      label: t('modelSettings.models'),
+      group: workspaceGroup,
+      icon: BoxesIcon,
+      keywords: [t('nav.settings'), 'models', 'engines', 'download'],
+      run: () => navigate({ to: '/settings/models' }),
+    },
+    {
+      id: 'theme',
+      label: theme === 'dark' ? t('app.switch_to_light') : t('app.switch_to_dark'),
+      group: workspaceGroup,
+      icon: theme === 'dark' ? SunIcon : MoonIcon,
+      keywords: [t('preferences.theme'), 'theme', 'dark', 'light', 'mode'],
+      run: () => setTheme(theme === 'dark' ? 'light' : 'dark'),
     },
     {
       id: 'shortcuts',
       label: t('keyboard.title'),
+      keywords: ['shortcuts', 'keyboard'],
       group: workspaceGroup,
       icon: KeyboardIcon,
       shortcut: '?',
@@ -212,12 +268,14 @@ export function CommandPalette() {
       group: workspaceGroup,
       icon: SettingsIcon,
       shortcut: `${modifier} ,`,
+      keywords: ['settings', 'preferences'],
       run: () => navigate({ to: '/settings' }),
     },
     {
       id: 'takes',
       label: t('clone.history_title'),
       group: workspaceGroup,
+      keywords: ['history', 'takes'],
       icon: HistoryIcon,
       run: () => {
         setWorkspace({ libraryOpen: true, libraryTab: 'takes' });
@@ -228,24 +286,26 @@ export function CommandPalette() {
       ? [
           {
             id: 'generate',
-            label: t('clone.synthesize'),
+            // While a take renders, a new one joins the queue.
+            label: generation.isGenerating ? t('generationQueue.add') : t('clone.synthesize'),
             group: actionGroup,
-            icon: PlayIcon,
+            icon: generation.isGenerating ? ListPlusIcon : PlayIcon,
             shortcut: `${modifier} ↵`,
             run: () => generation.generate(),
           },
         ]
-      : generation.isGenerating
-        ? [
-            {
-              id: 'cancel',
-              label: t('clone.cancel_generation'),
-              group: actionGroup,
-              icon: XIcon,
-              run: () => generation.cancel(),
-            },
-          ]
-        : []),
+      : []),
+    ...(generation.isGenerating
+      ? [
+          {
+            id: 'cancel',
+            label: t('clone.cancel_generation'),
+            group: actionGroup,
+            icon: XIcon,
+            run: () => generation.cancel(),
+          },
+        ]
+      : []),
     ...(profiles.data ?? []).map((profile) => ({
       id: 'voice-' + profile.id,
       label: profile.name,
@@ -261,6 +321,9 @@ export function CommandPalette() {
               attrs: restored.attrs,
               seed: restored.seed,
               profileId: restored.profileId,
+              description: restored.description,
+              picks: restored.picks,
+              mapped: restored.mapped,
             }),
           );
           patchCloneSettings({ language: restored.language });
@@ -271,26 +334,38 @@ export function CommandPalette() {
         await navigate({ to: '/clone' });
       },
     })),
-    ...(history.data ?? [])
-      .filter((item) => item.mode === 'clone' || item.mode === 'design')
-      .map((item) => ({
-        id: 'take-' + item.id,
-        label: item.text,
-        group: takeGroup,
-        icon: item.mode === 'design' ? WandSparklesIcon : HistoryIcon,
-        run: async () => {
-          openTake(item);
-          if (item.mode === 'design') {
-            writeDraft(designDraftFromTake(item));
-            await navigate({ to: '/design' });
-          } else {
-            await navigate({ to: '/clone' });
-          }
-        },
-      })),
+    ...recentTakes(history.data ?? []).map((item): CommandItem => ({
+      id: 'take-' + item.id,
+      label: item.text,
+      detail: [formatRelative(item.created_at, i18n.language), takeLength(item.duration_seconds)]
+        .filter(Boolean)
+        .join(' · '),
+      group: takeGroup,
+      icon: item.mode === 'design' ? WandSparklesIcon : HistoryIcon,
+      run: async () => {
+        openTake(item);
+        if (item.mode === 'design') {
+          writeDraft(designDraftFromTake(item));
+          await navigate({ to: '/design' });
+        } else {
+          await navigate({ to: '/clone' });
+        }
+      },
+    })),
   ];
-  const items = source
-    .filter((item) => item.label.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
+  // Settings pages are searchable but stay out of the default list.
+  const needle = query.trim().toLocaleLowerCase();
+  const settingsItems: CommandItem[] = needle
+    ? SETTINGS_ENTRIES.map((entry) => ({
+        id: `settings-${entry.label}`,
+        label: t(entry.label),
+        group: t('nav.settings'),
+        icon: SettingsIcon,
+        run: () => navigate({ to: entry.to }),
+      }))
+    : [];
+  const items = [...source, ...settingsItems]
+    .filter((item) => commandMatches(item, query))
     .slice(0, 30);
   const run = (index: number) => {
     const item = items[index];
@@ -366,7 +441,14 @@ export function CommandPalette() {
                     onClick={() => run(index)}
                   >
                     <Icon className="size-4 shrink-0 text-muted-foreground transition-colors duration-150 group-hover:text-foreground" />
-                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    <span className="min-w-0 flex-1 truncate" title={item.label}>
+                      {item.label}
+                    </span>
+                    {item.detail && (
+                      <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                        {item.detail}
+                      </span>
+                    )}
                     {item.shortcut && <Kbd>{item.shortcut}</Kbd>}
                   </button>
                 </div>

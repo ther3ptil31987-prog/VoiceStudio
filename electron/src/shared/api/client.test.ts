@@ -7,6 +7,7 @@ import {
   wsUrl,
 } from './client';
 import { ADMIN_SESSION_STORAGE_KEY, CSRF_HEADER_NAME } from './authSession';
+import i18n from 'i18next';
 
 describe('apiFetch PIN header', () => {
   let realFetch: typeof globalThis.fetch;
@@ -229,6 +230,28 @@ describe('apiFetch 401 routing', () => {
     expect((authEvent() as any).detail.mode).toBe('pin');
   });
 
+  it('sends a PIN lockout (429) back to the PIN form with the wait', async () => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: new Headers({ 'Retry-After': '61' }),
+        text: async () => JSON.stringify({ detail: 'Too many wrong PINs. Try again later.' }),
+      }),
+    ) as any;
+    const { apiFetch } = await import('./client');
+    await expect(apiFetch('/system/info')).rejects.toBeTruthy();
+    expect((authEvent() as any).detail).toEqual({ mode: 'pin', retryAfter: 61 });
+  });
+
+  it('does not treat another 429 as a PIN lockout', async () => {
+    globalThis.fetch = stubStatus(429, 'Too Many Requests', 'rate limited');
+    const { apiFetch } = await import('./client');
+    await expect(apiFetch('/system/info')).rejects.toBeTruthy();
+    expect(authEvent()).toBeUndefined();
+  });
+
   const stub403 = (detail: string) => stubStatus(403, 'Forbidden', detail);
 
   it('dispatches ov:auth-required {mode:"apikey"} on an admin-gate 403 (#1525)', async () => {
@@ -365,6 +388,57 @@ describe('apiFetch 404 from a non-VoiceStudio server (#1385)', () => {
     // backend never answers 404 with an `error` key, only `detail`.
     const err = await thrownBy(JSON.stringify({ error: 'Not Found' }));
     expect(err.message).toMatch(/not a VoiceStudio backend/);
+  });
+});
+
+describe('apiFetch gateway page from a proxy or CDN (#3219)', () => {
+  // Cloudflare answers a slow origin with its own 524 page. Echoing it put a
+  // whole HTML document in the error; the backend may still be rendering.
+  let realFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  const thrownBy = async (status: number, body: string, headers: Record<string, string> = {}) => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({
+        ok: false,
+        status,
+        statusText: '',
+        headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+        text: async () => body,
+      }),
+    ) as any;
+    const { apiFetch } = await import('./client');
+    try {
+      await apiFetch('/generate');
+    } catch (e) {
+      return e as Error;
+    }
+    throw new Error('expected apiFetch to throw');
+  };
+  const page =
+    '<!DOCTYPE html><html><head><title>example.com | 524: A timeout occurred</title></head></html>';
+
+  it('explains a Cloudflare 524 page instead of echoing its HTML', async () => {
+    const t = vi.spyOn(i18n, 't').mockReturnValue('Proxy gave up' as any);
+    const err = await thrownBy(524, page);
+    expect(err.message).toBe('Proxy gave up');
+    expect(t).toHaveBeenCalledWith('tts_errors.proxy_gateway_error', { status: 524 });
+  });
+
+  it("keeps a backend-marked 504's own text", async () => {
+    const err = await thrownBy(504, 'upstream said no', { 'x-omnivoice-backend': '1' });
+    expect(err.message).toMatch(/504 : upstream said no/);
+  });
+
+  it("keeps the backend's JSON detail on a 503", async () => {
+    const err = await thrownBy(503, JSON.stringify({ detail: 'Model is loading' }));
+    expect(err.message).toMatch(/Model is loading/);
   });
 });
 

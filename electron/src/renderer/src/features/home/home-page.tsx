@@ -1,8 +1,22 @@
+import { HomeRecentProjects, type HomeRecentProject } from './home-recent-projects';
 import { HomeFeatureIcon } from './home-feature-icon';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { getBridge } from '@/components/bridge';
 import { runRendererTask } from '@/lib/global-error-recovery';
 import { HomeContributors } from './home-contributors';
+import {
+  PROFILE_CLICKS_TO_UNLOCK,
+  clickedProfiles,
+  heroHiddenFor,
+  hideHeroFor,
+  recordProfileClick,
+} from './home-hero-egg';
+import { HomeChristmas, PixelSnow, currentHomeSeason } from './home-season';
+import { ExternalLink } from '@/components/external-link';
+import { releaseNotesUrl } from '@/components/setup-extras';
+import { appVersion } from '@/components/bridge';
+import { useState } from 'react';
+import { ConfirmDialog } from '@/features/clone/confirm-dialog';
 import './home-page.css';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { ProfileAvatar } from '@/components/profile-avatar';
@@ -11,8 +25,12 @@ import { useProfiles } from '@/hooks/use-profiles';
 import { brandArtwork } from '@/lib/brand';
 import { patchCloneSettings } from '@/lib/store/clone-settings';
 import { selectCloneProfile } from '@/lib/store/reference';
-import { blankLongformDraft, editLongform } from '@/features/longform/longform-session';
-import { projectLibrary, type LongformProject } from '@/features/longform/project-library';
+import {
+  blankLongformDraft,
+  replaceLongformDraft,
+  longformSession,
+} from '@/features/longform/longform-session';
+import { projectLibrary } from '@/features/longform/project-library';
 import { openDubProject } from '@/features/dub/dub-session';
 import type { DubProject } from '@/features/projects/project-format';
 import { Link, useNavigate } from '@tanstack/react-router';
@@ -24,13 +42,7 @@ import {
   restoreDesignProfile,
   writeDraft,
 } from '@/features/design/design-draft';
-import {
-  ArrowRightIcon,
-  AudioLinesIcon,
-  BookOpenIcon,
-  FilmIcon,
-  FolderOpenIcon,
-} from 'lucide-react';
+import { ArrowRightIcon, ArrowUpRightIcon, EyeOffIcon, FolderOpenIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 interface Destination {
@@ -61,15 +73,23 @@ const iconTones: Record<string, string> = {
     'bg-fuchsia-100 text-fuchsia-700 ring-fuchsia-300/60 dark:bg-fuchsia-400/15 dark:text-fuchsia-300 dark:ring-fuchsia-300/30',
   '/transcriptions':
     'bg-cyan-100 text-cyan-700 ring-cyan-300/60 dark:bg-cyan-400/15 dark:text-cyan-200 dark:ring-cyan-300/30',
-  '/calls':
+  '/workflows':
     'bg-indigo-100 text-indigo-700 ring-indigo-300/60 dark:bg-indigo-400/15 dark:text-indigo-300 dark:ring-indigo-300/30',
   '/tools':
     'bg-slate-100 text-slate-700 ring-slate-300/60 dark:bg-slate-300/15 dark:text-slate-200 dark:ring-slate-300/30',
 };
 
+type LongformRecent = Extract<HomeRecentProject, { kind: 'longform' }>;
+
 export function HomePage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const version = appVersion();
+  const season = currentHomeSeason();
+  const [heroHidden, setHeroHidden] = useState(() => heroHiddenFor(version));
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [pendingLongform, setPendingLongform] = useState<LongformRecent | null>(null);
+  const [profileClicks, setProfileClicks] = useState(() => clickedProfiles().length);
   const { data: profiles = [] } = useProfiles();
   const { data: exports = [] } = useQuery({
     queryKey: ['export-history'],
@@ -121,7 +141,7 @@ export function HomePage() {
       description: t('homeUi.transcribe'),
     },
     {
-      to: '/calls',
+      to: '/workflows',
       label: t('workflows.title'),
       description: t('workflows.description'),
     },
@@ -148,23 +168,39 @@ export function HomePage() {
   ]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, 4);
-  const openProject = async (
-    item: { kind: 'dub'; project: DubProject } | { kind: 'longform'; project: LongformProject },
-  ) => {
+  const openProject = async (item: HomeRecentProject) => {
     if (item.kind === 'dub') {
       const project = await apiJson<DubProject>('/projects/' + encodeURIComponent(item.project.id));
       if (openDubProject(project)) await navigate({ to: '/dub' });
       return;
     }
-    editLongform(item.project.mode, {
-      ...blankLongformDraft(),
-      ...structuredClone(item.project.draft),
-      projectId: item.project.id,
-    });
+    if (longformSession.state.active) {
+      setProjectError(t('audiobook.blocked.busy'));
+      return;
+    }
+    // Same rule as the Stories/Audiobook project list: opening replaces the
+    // working draft, so ask first. Cancelling leaves the draft untouched.
+    setPendingLongform(item);
+  };
+  const openLongformProject = async (item: LongformRecent) => {
+    if (longformSession.state.active) {
+      setProjectError(t('audiobook.blocked.busy'));
+      return;
+    }
+    if (
+      !replaceLongformDraft(item.project.mode, {
+        ...blankLongformDraft(),
+        ...structuredClone(item.project.draft),
+        projectId: item.project.id,
+      })
+    )
+      return;
+    setProjectError(null);
     await navigate({
       to: item.project.mode === 'stories' ? '/stories' : '/audiobook',
     });
   };
+  /** Open a saved voice in its original creation workflow and restore settings. */
   const useProfile = async (profile: (typeof profiles)[number]) => {
     if (profile.kind === 'design') {
       const current = readDraft();
@@ -174,6 +210,9 @@ export function HomePage() {
           attrs: restored.attrs,
           seed: restored.seed,
           profileId: restored.profileId,
+          description: restored.description,
+          picks: restored.picks,
+          mapped: restored.mapped,
         }),
       );
       patchCloneSettings({ language: restored.language });
@@ -185,6 +224,21 @@ export function HomePage() {
   };
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {projectError && (
+        <p role="alert" className="text-sm text-destructive">
+          {projectError}
+        </p>
+      )}
+      <ConfirmDialog
+        open={pendingLongform !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingLongform(null);
+        }}
+        title={pendingLongform?.project.name ?? ''}
+        description={t('projectActions.open', { name: pendingLongform?.project.name ?? '' })}
+        destructive
+        onConfirm={() => (pendingLongform ? openLongformProject(pendingLongform) : undefined)}
+      />
       <WorkspaceHeader>
         <h1 className="text-sm font-medium">{t('nav.home')}</h1>
         <Link
@@ -198,57 +252,100 @@ export function HomePage() {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="home-content mx-auto w-full max-w-6xl">
           <section aria-labelledby="home-new-projects">
-            <div className="home-heading relative isolate overflow-hidden">
-              <img
-                src={brandArtwork}
-                alt=""
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-y-0 right-0 -z-10 h-full w-1/2 object-cover object-right opacity-25 [mask-image:linear-gradient(90deg,transparent,black)]"
-              />
-              <div className="home-heading-row">
-                <div className="home-heading-copy">
-                  <h2
-                    id="home-new-projects"
-                    className="flex flex-wrap items-center gap-x-3 gap-y-2 text-3xl font-semibold tracking-[-0.035em]"
-                  >
-                    <Tooltip>
-                      <TooltipTrigger
-                        render={
-                          <a
-                            href="https://voicestudio.sh"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="rounded-md transition-colors hover:text-primary focus-visible:outline-2 focus-visible:outline-ring"
-                            onClick={(event) => {
-                              const browser = getBridge()?.browser;
-                              if (!browser) return;
-                              event.preventDefault();
-                              event.currentTarget.focus();
-                              runRendererTask('Preview official website', () =>
-                                browser.open('https://voicestudio.sh'),
-                              );
-                            }}
-                          />
-                        }
-                      >
-                        {t('homeUi.title')}
-                      </TooltipTrigger>
-                      <TooltipContent surface="theme" side="bottom">
-                        {t('siteBrowser.preview')}
-                      </TooltipContent>
-                    </Tooltip>
-                  </h2>
-                  <p className="mt-3 max-w-[80ch] text-sm leading-relaxed text-foreground/65">
-                    {t('homeUi.subtitle')}
-                  </p>
+            {heroHidden ? (
+              <h2 id="home-new-projects" className="sr-only">
+                {t('homeUi.title')}
+              </h2>
+            ) : (
+              <div
+                className="home-heading relative isolate overflow-hidden"
+                data-season={season ?? undefined}
+              >
+                {season && <PixelSnow />}
+                <img
+                  src={brandArtwork}
+                  alt=""
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-y-0 right-0 -z-10 h-full w-1/2 object-cover object-right opacity-25 [mask-image:linear-gradient(90deg,transparent,black)]"
+                />
+                <div className="home-heading-row">
+                  <div className="home-heading-copy">
+                    <h2
+                      id="home-new-projects"
+                      className="flex flex-wrap items-center gap-x-3 gap-y-2 text-3xl font-semibold tracking-[-0.035em]"
+                    >
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <a
+                              href="https://voicestudio.sh"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="rounded-md transition-colors hover:text-primary focus-visible:outline-2 focus-visible:outline-ring"
+                              onClick={(event) => {
+                                const browser = getBridge()?.browser;
+                                if (!browser) return;
+                                event.preventDefault();
+                                event.currentTarget.focus();
+                                runRendererTask('Preview official website', () =>
+                                  browser.open('https://voicestudio.sh'),
+                                );
+                              }}
+                            />
+                          }
+                        >
+                          {t('homeUi.title')}
+                        </TooltipTrigger>
+                        <TooltipContent surface="theme" side="bottom">
+                          {t('siteBrowser.preview')}
+                        </TooltipContent>
+                      </Tooltip>
+                    </h2>
+                    <p className="mt-3 max-w-[80ch] text-sm leading-relaxed text-foreground/65">
+                      {t('homeUi.subtitle')}
+                    </p>
+                    <div className="home-hero-meta">
+                      {version && (
+                        <ExternalLink
+                          href={releaseNotesUrl(version, getBridge()?.app?.isDev ?? true)}
+                          variant="link"
+                          showIcon={false}
+                          className="home-whats-new"
+                        >
+                          <span className="tabular-nums">{t('app.version', { version })}</span>
+                          <span aria-hidden="true">·</span>
+                          {t('update.whats_new')}
+                          <ArrowUpRightIcon aria-hidden="true" />
+                        </ExternalLink>
+                      )}
+                      {version && profileClicks >= PROFILE_CLICKS_TO_UNLOCK && (
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          className="home-hero-hide"
+                          title={t('homeUi.hideThanks')}
+                          onClick={() => {
+                            hideHeroFor(version);
+                            setHeroHidden(true);
+                          }}
+                        >
+                          <EyeOffIcon aria-hidden="true" />
+                          {t('homeUi.hideUntilUpdate')}
+                        </Button>
+                      )}
+                      {season === 'christmas' && <HomeChristmas />}
+                    </div>
+                  </div>
+                  <HomeContributors
+                    onProfileOpen={(href) => setProfileClicks(recordProfileClick(href))}
+                  />
                 </div>
-                <HomeContributors />
               </div>
-            </div>
+            )}
             {[destinations.slice(0, 3), destinations.slice(3)].map((group, groupIndex) => (
               <div
                 key={groupIndex}
-                className={`home-destinations grid grid-cols-1 gap-3 @xl:grid-cols-2 @3xl:grid-cols-3 ${groupIndex === 0 ? 'home-destinations--primary' : 'home-destinations--secondary'}`}
+                className={`home-destinations grid grid-cols-1 gap-3 @xl:grid-cols-2 @3xl:grid-cols-3 @xl:[&>:last-child:nth-child(odd)]:col-span-2 @3xl:[&>:last-child:nth-child(odd)]:col-span-1 ${groupIndex === 0 ? 'home-destinations--primary' : 'home-destinations--secondary'}`}
               >
                 {group.map(({ to, label, description }) => (
                   <Link
@@ -338,55 +435,7 @@ export function HomePage() {
             </section>
           )}
 
-          {recentProjects.length > 0 && (
-            <section className="mt-8">
-              <div className="mb-2 flex items-center justify-between px-1">
-                <h2 className="flex items-center gap-2 text-sm font-medium">
-                  <FolderOpenIcon className="size-4 text-muted-foreground" />
-                  {t('projects.title')}
-                </h2>
-                <Link
-                  to="/projects"
-                  className="text-xs text-muted-foreground hover:text-foreground"
-                >
-                  {t('projects.all')}
-                </Link>
-              </div>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-2">
-                {recentProjects.map((item) => {
-                  const Icon =
-                    item.kind === 'dub'
-                      ? FilmIcon
-                      : item.project.mode === 'stories'
-                        ? AudioLinesIcon
-                        : BookOpenIcon;
-                  const label =
-                    item.kind === 'dub'
-                      ? t('projects.dub_projects')
-                      : t(item.project.mode === 'stories' ? 'nav.stories' : 'audiobook.title');
-                  return (
-                    <button
-                      key={item.kind + ':' + item.project.id}
-                      type="button"
-                      className="group flex min-w-0 items-center gap-3 rounded-xl border border-border/50 bg-card/20 px-3 py-2.5 text-left outline-none transition-colors hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={() => void openProject(item)}
-                    >
-                      <Icon className="size-4 shrink-0 text-primary" />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium">
-                          {item.project.name}
-                        </span>
-                        <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                          {label}
-                        </span>
-                      </span>
-                      <ArrowRightIcon className="size-3.5 shrink-0 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+          <HomeRecentProjects items={recentProjects} onOpen={openProject} />
 
           {profiles.length > 0 && (
             <section className="mt-8">

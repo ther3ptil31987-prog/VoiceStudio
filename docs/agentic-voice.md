@@ -1,6 +1,6 @@
 # Agentic voice: VoiceStudio as a TTS/STT provider
 
-VoiceStudio exposes a **local speech platform**—OpenAI-compatible batch audio,
+VoiceStudio exposes a **local speech platform**—OpenAI-compatible audio generation and streaming,
 a versioned transcription WebSocket, and MCP—so any agent framework that
 speaks to OpenAI's audio endpoints can use your local VoiceStudio for speech —
 in your own cloned voice, with nothing leaving your machine. You bring the
@@ -21,6 +21,35 @@ its TTS/STT at VoiceStudio.
 > Answering **inbound** calls with a spoken greeting is available as an opt-in
 > integration: see [Twilio](integrations/twilio.md).
 
+## Stream speech as it is synthesized
+
+Send `response_format: "pcm"` and `stream_format: "audio"` to
+`POST /v1/audio/speech`. The body is mono, 24 kHz signed 16-bit little-endian
+PCM. Use `stream_format: "sse"` for base64 `speech.audio.delta` events and a
+final `speech.audio.done` event. A generation failure after audio has started
+terminates a raw stream or emits an SSE `error` event.
+
+The API uses the same saved voice IDs, engine selection and generation options
+as regular speech requests. For example, an OpenAI Python client configured
+with your VoiceStudio base URL can play chunks as they arrive.
+
+```python
+with client.audio.speech.with_streaming_response.create(
+    model="omnivoice",
+    voice="your-voice-profile-id",
+    input="The first sentence can play immediately. The next one follows as it is ready.",
+    response_format="pcm",
+    stream_format="audio",
+) as response:
+    for chunk in response.iter_bytes():
+        play_pcm(chunk)  # Queue the bytes in your 24 kHz mono PCM player.
+```
+
+VoiceStudio normally synthesizes PCM one sentence at a time, so the first
+audio can arrive before synthesis of the later sentences. Supported Qwen3-TTS
+Base engines can also emit audio while generating a single sentence. Container formats and PCM
+requests with an explicit `duration` are rendered as a whole before delivery.
+
 ## The endpoints
 
 VoiceStudio's service root is `http://localhost:3900` (or your
@@ -36,7 +65,7 @@ service root: `http://localhost:3900/.well-known/voicestudio-speech`.
 | `WS /v1/audio/transcriptions/stream` | Live partial/final STT from PCM or WebM. |
 | `GET /v1/models`, `GET /v1/models/{id}` | OpenAI's model list: the OpenAI aliases above, every installed TTS engine, and the active STT engine. |
 | `GET /.well-known/voicestudio-speech` | Machine-readable transport discovery. |
-| `GET /v1/audio/voices` | List available voices (VoiceStudio extension). Each profile has its `voice_id` and `name`; `addressable_by_name: true` means the name works as `voice`. A profile named like an OpenAI voice or `default` keeps that word's built-in meaning, so call it by id. |
+| `GET /v1/audio/voices` | List available voices (VoiceStudio extension). Each voice has its `voice_id` (also as `id`, the field Open WebUI reads) and `name`; `addressable_by_name: true` means the name works as `voice`. A profile named like an OpenAI voice, `default`, or exactly like another profile's id keeps that meaning, so call it by id. |
 
 Speech `response_format` returns exactly the format asked for:
 

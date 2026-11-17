@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -35,7 +36,7 @@ def _clear_installed_repo_memo():
 @pytest.fixture(scope="module")
 def client():
     from main import app
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 50000))
 
 
 @contextlib.contextmanager
@@ -321,6 +322,40 @@ class TestEndpoints:
             )
         _assert_409(r)
 
+    def test_reference_transcript_uses_installed_model_when_selection_missing(self, client):
+        """#2929/#2678: the selected engine's weights are absent but another
+        speech-to-text model is installed. generate transcribes through it, so
+        the clone preview must not answer asr_model_missing."""
+        from services import asr_backend
+
+        with _offline_asr_missing(cached=False), \
+             patch.object(asr_backend, "asr_model_missing_error",
+                          side_effect=lambda **kw: {"error": "asr_model_missing"}), \
+             patch.object(asr_backend, "_installed_reference_fallbacks",
+                          return_value=[object()]), \
+             patch.object(asr_backend, "transcribe_reference",
+                          return_value="hello there"):
+            r = client.post(
+                "/transcribe",
+                data={"mode": "reference"},
+                files={"audio": ("t.wav", b"RIFF0000WAVE", "audio/wav")},
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["text"].strip().lower().startswith("hello")
+
+    def test_reference_transcript_409_when_nothing_installed(self, client):
+        from services import asr_backend
+
+        with _offline_asr_missing(cached=False), \
+             patch.object(asr_backend, "_installed_reference_fallbacks", return_value=[]), \
+             patch.object(asr_backend, "dictation_model_id", return_value=None):
+            r = client.post(
+                "/transcribe",
+                data={"mode": "reference"},
+                files={"audio": ("t.wav", b"RIFF0000WAVE", "audio/wav")},
+            )
+        _assert_409(r)
+
     def test_dub_legacy_transcribe_409(self, client, tmp_path):
         from api.routers import dub_core
         wav = tmp_path / "audio.wav"
@@ -440,6 +475,8 @@ class TestEndpoints:
         job = {"id": "j4", "audio_path": str(wav)}
         backend = MagicMock()
         backend.id = "fake-asr"
+        unloaded = threading.Event()
+        backend.unload.side_effect = lambda *a, **k: unloaded.set()
         with patch.object(dub_core, "_get_job", return_value=job), \
              patch.object(asr_backend, "load_active_asr_backend",
                           return_value=backend), \
@@ -448,6 +485,10 @@ class TestEndpoints:
         assert r.status_code == 200
         assert "Transcription failed. Check the selected ASR engine and try again." in r.text
         assert str(wav) not in r.text
+        # The stream's `finally` hands unload() to the GPU pool
+        # fire-and-forget by design (it blocks, and runs under GeneratorExit),
+        # so it lands after the response closes. Wait on an Event it sets.
+        assert unloaded.wait(10.0), "ASR backend was never unloaded"
         backend.unload.assert_called_once()
 
 

@@ -22,12 +22,34 @@ copy or export text, delete an entry, and send text to the cloning script.
 The secondary pane is labeled **History** so its saved-result list stays distinct
 from the Transcribe workspace and its recording actions.
 
+For a selected result, **Save plain text** saves the full displayed transcript
+without dates, language headers or timestamps. **Save SRT** saves UTF-8 SubRip
+captions from the original recognition segments, preserving their real timings.
+Cleaned text is not substituted into timed captions. If any spoken segment has
+missing or invalid timings, SRT is unavailable and the page explains why; plain
+text remains available. Desktop opens Save As; the web app downloads the file.
+The existing **Export** action keeps its dated history format and metadata.
+New REST and buffered-dictation results preserve an explicit recognition-timing
+flag in history. Sherpa and basic Moonshine clip-duration spans do not qualify
+as subtitle timings. Older saved results without that flag keep their text and
+history exports, but cannot export SRT; transcribe again with an engine that
+supplies real segment timings to create timed captions.
+
 The empty workspace now leads with Start dictation and Upload audio. History-only
 search/export/clear controls stay hidden until a transcription exists, and backend
 failures appear once with direct Retry and Dismiss actions.
 
 Recordings use the existing capture/cleanup helpers. Playback uses Vidstack.
-Pending HTTP requests abort when leaving the workspace. Refinement settings,
+A file transcription keeps running when you leave the workspace: only Cancel
+aborts it, the result is always saved to History, and a toast links back when it
+finishes or fails while you are on another page. A renderer reload still ends it.
+
+In accurate mode, **Identify speakers** (off by default) asks `/transcribe` to
+label who spoke each segment (API callers can also pass `num_speakers`). It uses
+the same speaker model as dubbing. Labels appear in the segment list and in exports;
+an export with cleaned-up text keeps that text and adds the labelled segments
+below it. If the speaker model is missing or fails, the transcript is still
+saved without labels and a warning explains why. Refinement settings,
 native dictation and target-app delivery are described below. Cross-application
 history migration remains separate parity work.
 
@@ -36,7 +58,7 @@ the main window or recorder loads. Only the trusted VoiceStudio top-level origin
 receives audio capture; camera, embedded-frame and foreign-origin requests are
 denied. The operating system's microphone permission remains authoritative.
 
-Dictation model settings now expose optional LLM cleanup, filler removal, self-corrections and technical-term preservation. Upload/record transcription reads the saved master setting; if settings are unavailable, it safely keeps raw transcription. Raw text remains in history, with any refined text stored separately and available in an expandable section with Copy. Reference-audio ASR continues to use raw transcription. Cleanup failure notes reuse the shared Tauri status mapping.
+Dictation model settings now expose optional LLM cleanup, filler removal, self-corrections and technical-term preservation. Without any LLM, every dictated result is cleaned locally and deterministically before it is typed: hesitations ("uh", "umm", and in English "um"/"er") and English stutters on short words ("the the") are removed, all-caps output from the streaming models is sentence-cased, English "i" becomes "I", stray spaces before punctuation are dropped (French keeps its space before ? ! ; :), and pieces of Chinese or Japanese dictation join without spaces. **Text cleanup → Spoken punctuation** (off by default, English) turns "comma", "period", "full stop", "question mark", "exclamation mark", "colon", "semicolon", "new line" and "new paragraph" into the symbols; with a streaming model a command spoken on its own after a pause is dropped rather than typed. File transcription, MCP/CLI calls and voice-clone reference transcripts keep the words as spoken; only hotkey dictation is cleaned. Upload/record transcription reads the saved master setting; if settings are unavailable, it safely keeps raw transcription. Raw text remains in history, with any refined text stored separately and available in an expandable section with Copy. Reference-audio ASR continues to use raw transcription. Cleanup failure notes reuse the shared Tauri status mapping.
 
 Transcriptions now exposes microphone and mono/stereo selection using the exact
 same RecordingInputs component as reference recording. Controls are disabled

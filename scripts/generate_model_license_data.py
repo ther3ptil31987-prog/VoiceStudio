@@ -11,13 +11,16 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
+from services.model_catalogue import model_key  # noqa: E402
 from services.model_licenses import disclosure, digest, load_registry  # noqa: E402
 
 
 def generate(root: Path = ROOT) -> dict:
     registry = load_registry(root / "backend/config/model_licenses.json")
     catalog = yaml.safe_load((root / "backend/config/models.yaml").read_text(encoding="utf-8"))
-    offered = {m["repo_id"] for m in catalog["models"]}
+    # Catalogue identity: a package entry's own ``id`` (``<repo>:<package>``),
+    # else its repo, so package licence records are marked as offered.
+    offered = {model_key(m) for m in catalog["models"]}
     return {
         "schema_version": 1, "registry_version": registry["registry_version"],
         "registry_digest": digest(registry), "inventory_source_commit": registry["source_commit"],

@@ -35,8 +35,11 @@ Engine availability depends on installed models, hardware, and configured provid
 - **MOSS-TTS-v1.5** — [Guide](engines/moss-tts-v15.md)
 - **dots.tts** — [Guide](engines/dots-tts.md)
 - **Confucius4-TTS** — [Guide](engines/confucius4-tts.md)
+- ming-tts — [Guide](engines/ming-tts.md)
 - pockettts
 - audiocpp — [Guide](engines/audio-cpp.md)
+- audiocpp-dots — [Guide](engines/audio-cpp.md)
+- CosyVoice 3 GGUF — [Vulkan setup](engines/cosyvoice-gguf.md)
 
 ## Transcription
 

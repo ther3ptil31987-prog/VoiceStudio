@@ -308,7 +308,7 @@ def batch_job_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(b, "DATA_DIR", str(tmp_path))
 
-    async def _fake_run_transcribe_guarded(pool, fn, what=None):
+    async def _fake_run_transcribe_guarded(pool, fn, what=None, **kwargs):
         # Bypass real ASR entirely — the engine-selection gate under test
         # runs right after transcription, before translate/generate.
         return (
@@ -417,51 +417,51 @@ def test_batch_respects_applies_own_mastering(
     assert mastering_calls == []
 
 
-def test_batch_remote_target_renders_segments_without_loading_local_tts(
-    batch_job_env, monkeypatch, tmp_path,
+def test_batch_engine_contention_fails_instead_of_exporting_silence(
+    batch_job_env, fake_registry, no_omnivoice_model_manager, monkeypatch,
 ):
-    """A selected worker owns Batch TTS; this process only assembles the WAVs."""
-    import soundfile as sf
-
-    from worker.routing import Decision
+    from services.model_manager import GpuPoolBusyError
 
     b, make_job = batch_job_env
-    decision = Decision(remote=True, worker_id="remote-1", label="Render box")
-    preflight = []
-    calls = []
+    fake = fake_registry("fake-batch-busy")
+    monkeypatch.setenv("OMNIVOICE_TTS_BACKEND", fake.id)
+    monkeypatch.setattr("services.model_manager.generate_timeout_s", lambda *a, **k: 0.05)
+    monkeypatch.setattr(b, "_BUSY_BACKOFF_S", (0.01,))
 
-    async def fake_preflight(engine, routed, **kwargs):
-        preflight.append((engine, routed, kwargs))
+    def busy(self, text, **kwargs):
+        raise GpuPoolBusyError("MLX-Audio is already generating speech.", retry_after=1)
 
-    async def reject_local_load(**_kwargs):
-        raise AssertionError("remote Batch must not load local TTS weights")
+    monkeypatch.setattr(fake, "generate", busy)
+    job = make_job("busy-job")
+    with pytest.raises(RuntimeError, match="silent gap.*already generating speech"):
+        asyncio.run(b._run_batch_pipeline("busy-job", job))
 
-    remote_wav = tmp_path / "remote-segment.wav"
-    sf.write(remote_wav, torch.full((24_000,), 0.1).numpy(), 24_000)
+    assert not job.get("outputs")
+    assert not job.get("warnings")
 
-    async def fake_run(op, **kwargs):
-        calls.append((op, kwargs))
-        assert kwargs["remote"].operation == "batch_segments"
-        assert kwargs["remote"].params["segments"][0]["text"] == "hola"
-        assert kwargs["remote"].params["input_seconds"] == pytest.approx(1.0)
-        return {0: str(remote_wav)}, 24_000
 
-    async def keep_audio(audio, _sample_rate, **_kwargs):
-        return audio
+def test_batch_segment_waits_for_busy_engine_then_succeeds(
+    batch_job_env, fake_registry, no_omnivoice_model_manager, monkeypatch,
+):
+    from services.model_manager import GpuPoolBusyError
 
-    monkeypatch.setattr(b, "active_backend_id", lambda: "remote-engine")
-    monkeypatch.setattr(b.gpu_gateway, "decide", lambda _op: decision)
-    monkeypatch.setattr(b.gpu_gateway, "preflight", fake_preflight)
-    monkeypatch.setattr(b.gpu_gateway, "run", fake_run)
-    monkeypatch.setattr(b, "resolve_generation_backend", reject_local_load)
-    monkeypatch.setattr("services.watermark.mark_synthetic_async", keep_audio)
+    b, make_job = batch_job_env
+    fake = fake_registry("fake-batch-busy-then-free")
+    monkeypatch.setenv("OMNIVOICE_TTS_BACKEND", fake.id)
+    monkeypatch.setattr(b, "_BUSY_BACKOFF_S", (0.01,))
+    real_generate = fake.generate
+    attempts = []
 
-    job = make_job("jobRemote", voice_id=None)
-    asyncio.run(b._run_batch_pipeline("jobRemote", job))
+    def flaky(self, text, **kwargs):
+        attempts.append(text)
+        if len(attempts) < 3:
+            raise GpuPoolBusyError("MLX-Audio is already generating speech.", retry_after=1)
+        return real_generate(self, text, **kwargs)
 
-    assert preflight == [
-        ("remote-engine", decision, {"operation": "batch_segments"})
-    ]
-    assert len(calls) == 1
-    assert "en" in job.get("outputs", {})
-    assert not remote_wav.exists(), "consumed remote line artifacts must be removed"
+    monkeypatch.setattr(fake, "generate", flaky)
+    job = make_job("busy-then-free")
+    asyncio.run(b._run_batch_pipeline("busy-then-free", job))
+
+    assert len(attempts) == 3
+    assert not job.get("warnings")
+    assert job.get("outputs")

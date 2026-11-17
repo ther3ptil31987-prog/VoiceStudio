@@ -11,6 +11,7 @@ import {
   usePlaybackSeek,
 } from '@/lib/audio/playback-clock';
 import { cn } from '@/lib/utils';
+import { formatClock } from './media-clock';
 import {
   StudioMediaPlayer,
   audioSource,
@@ -28,14 +29,12 @@ export interface WaveformPlayerProps {
   height?: number;
   showWaveform?: boolean;
   compact?: boolean;
+  /** Known clip length in seconds, shown until the audio's own metadata loads. */
+  durationHint?: number;
   onEnded?: () => void;
   onCanPlay?: MediaPlayerProps['onCanPlay'];
   playerRef?: React.RefObject<MediaPlayerInstance | null>;
   className?: string;
-}
-export function formatClock(seconds: number): string {
-  const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-  return Math.floor(safe / 60) + ':' + String(Math.floor(safe % 60)).padStart(2, '0');
 }
 export function waveColors(el: HTMLElement): { waveColor: string; progressColor: string } {
   const probe = document.createElement('span');
@@ -49,6 +48,40 @@ export function waveColors(el: HTMLElement): { waveColor: string; progressColor:
   return { waveColor: muted, progressColor: primary };
 }
 
+/**
+ * The URL WaveSurfer must be given for a media element Vidstack already loaded.
+ * WaveSurfer compares it to `media.currentSrc`, which is always absolute; a
+ * relative `/api/audio/...` path never matches, so WaveSurfer swaps the element
+ * onto its own blob URL behind Vidstack and the play button and clock go stale.
+ */
+export function waveformUrl(src: string, base = document.baseURI): string {
+  try {
+    return new URL(src, base).href;
+  } catch {
+    return src;
+  }
+}
+
+/** The media's duration once known; until then the caller's hint (e.g. the take's stored length). */
+export function displayDuration(duration: number, hint?: number): number {
+  if (Number.isFinite(duration) && duration > 0) return duration;
+  return hint != null && Number.isFinite(hint) && hint > 0 ? hint : 0;
+}
+
+/** Keep controls aligned with the concrete audio element even if provider state is stale. */
+export function subscribeMediaPaused(
+  media: HTMLMediaElement,
+  onPaused: (paused: boolean) => void,
+): () => void {
+  const sync = () => onPaused(media.paused);
+  const events = ['play', 'playing', 'pause', 'ended', 'emptied'] as const;
+  sync();
+  for (const event of events) media.addEventListener(event, sync);
+  return () => {
+    for (const event of events) media.removeEventListener(event, sync);
+  };
+}
+
 export const WaveformPlayer = memo(function WaveformPlayer({
   src,
   source = 'output',
@@ -57,6 +90,7 @@ export const WaveformPlayer = memo(function WaveformPlayer({
   showWaveform = true,
   height = 44,
   compact = false,
+  durationHint,
   onEnded,
   onCanPlay,
   playerRef: externalPlayerRef,
@@ -89,6 +123,7 @@ export const WaveformPlayer = memo(function WaveformPlayer({
         src={src}
         height={height}
         compact={compact}
+        durationHint={durationHint}
         media={media}
         player={player}
         source={source}
@@ -101,6 +136,7 @@ function WaveformControls({
   src,
   height,
   compact,
+  durationHint,
   media,
   player,
   source,
@@ -109,6 +145,7 @@ function WaveformControls({
   src: string;
   height: number;
   compact: boolean;
+  durationHint?: number;
   media: HTMLMediaElement | null;
   player: React.RefObject<MediaPlayerInstance | null>;
   source: string;
@@ -119,17 +156,24 @@ function WaveformControls({
   const waveform = useRef<WaveSurfer | null>(null);
   const rangeEnd = useRef<number | null>(null);
   const [waveReady, setWaveReady] = useState(false);
-  const paused = useMediaState('paused');
+  const providerPaused = useMediaState('paused');
+  const [mediaPaused, setMediaPaused] = useState(true);
+  const paused = media ? mediaPaused : providerPaused;
   const canPlay = useMediaState('canPlay');
-  const duration = useMediaState('duration');
+  const mediaDuration = useMediaState('duration');
+  const duration = displayDuration(mediaDuration, durationHint);
   const time = useMediaState('currentTime');
   const error = useMediaState('error');
   const seek = usePlaybackSeek(source);
   useEffect(() => {
+    if (!media) return;
+    return subscribeMediaPaused(media, setMediaPaused);
+  }, [media]);
+  useEffect(() => {
     resetPlaybackClock(source);
     return () => resetPlaybackClock(source);
   }, [source, src]);
-  useEffect(() => publishPlaybackClock(source, time, duration), [duration, source, time]);
+  useEffect(() => publishPlaybackClock(source, time, mediaDuration), [mediaDuration, source, time]);
   useEffect(() => {
     if (!seek || !player.current) return;
     player.current.currentTime = seek.time;
@@ -147,7 +191,7 @@ function WaveformControls({
     const ws = WaveSurfer.create({
       container: container.current,
       media,
-      url: src,
+      url: waveformUrl(src),
       height,
       ...waveColors(container.current),
       cursorWidth: 1,
@@ -188,7 +232,7 @@ function WaveformControls({
       </Button>
       {error ? (
         <p role="status" className="flex-1 text-xs text-muted-foreground">
-          {t('player.missing')}
+          {t('player.unavailable')}
         </p>
       ) : (
         <div className="relative min-w-0 flex-1" style={{ height }}>
@@ -196,10 +240,10 @@ function WaveformControls({
           <input
             type="range"
             min={0}
-            max={Number.isFinite(duration) && duration > 0 ? duration : 1}
+            max={duration > 0 ? duration : 1}
             step="0.01"
             value={Number.isFinite(time) ? time : 0}
-            disabled={!duration}
+            disabled={!mediaDuration}
             aria-label={t('player.seek')}
             className={cn(
               'absolute inset-0 h-full w-full cursor-pointer accent-primary focus-visible:outline-2 focus-visible:outline-primary',
@@ -212,7 +256,7 @@ function WaveformControls({
           />
         </div>
       )}
-      <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">
+      <span className="shrink-0 text-right font-mono text-xs whitespace-nowrap text-muted-foreground tabular-nums">
         {formatClock(time)} / {formatClock(duration)}
       </span>
     </>
